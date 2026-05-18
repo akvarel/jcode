@@ -1319,11 +1319,8 @@ async fn run_hero_screenshot_capture(output_dir: &Path) -> Result<()> {
     let manifest_path = output_dir.join("manifest.json");
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .context("failed to serialize hero frame manifest")?;
-    std::fs::write(
-        &manifest_path,
-        manifest_json,
-    )
-    .with_context(|| format!("failed to save {}", manifest_path.display()))?;
+    std::fs::write(&manifest_path, manifest_json)
+        .with_context(|| format!("failed to save {}", manifest_path.display()))?;
     println!(
         "{}",
         serde_json::json!({
@@ -3633,38 +3630,6 @@ fn spawn_desktop_font_system_loader() -> JoinHandle<FontSystem> {
     std::thread::spawn(create_desktop_font_system)
 }
 
-fn prewarm_desktop_text_renderer(
-    font_system: &mut FontSystem,
-    swash_cache: &mut SwashCache,
-    text_atlas: &mut TextAtlas,
-    text_renderer: &mut TextRenderer,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    size: PhysicalSize<u32>,
-) {
-    let app = SingleSessionApp::new(None);
-    let key = single_session_text_key_for_tick_with_scroll(&app, size, 0, 0.0);
-    let buffers = single_session_text_buffers_from_key(&key, size, font_system);
-    let text_areas = single_session_text_areas_for_app_with_scroll(&app, &buffers, size, 0, 0.0);
-    if text_areas.is_empty() {
-        return;
-    }
-    if let Err(error) = text_renderer.prepare(
-        device,
-        queue,
-        font_system,
-        text_atlas,
-        Resolution {
-            width: size.width,
-            height: size.height,
-        },
-        text_areas,
-        swash_cache,
-    ) {
-        eprintln!("jcode-desktop: failed to prewarm text renderer: {error:?}");
-    }
-}
-
 fn desktop_scroll_benchmark_app() -> SingleSessionApp {
     desktop_scroll_benchmark_app_with_turns(320)
 }
@@ -5616,6 +5581,7 @@ struct Canvas<'window> {
     primitive_vertices_cache: Vec<Vertex>,
     primitive_frame_vertices: Vec<Vertex>,
     needs_initial_frame: bool,
+    first_render_completed: bool,
     defer_initial_text_frame: bool,
     single_session_text_cache_key: Option<u64>,
     single_session_text_key: Option<SingleSessionTextKey>,
@@ -5745,7 +5711,7 @@ impl<'window> Canvas<'window> {
         startup_trace.mark("primitive pipeline ready");
         let hero_mask_renderer = HeroMaskRenderer::new(&device, format);
         startup_trace.mark("hero mask pipeline ready");
-        let mut font_system = font_system_loader
+        let font_system = font_system_loader
             .take()
             .and_then(|loader| loader.join().ok())
             .unwrap_or_else(create_desktop_font_system);
@@ -5757,18 +5723,9 @@ impl<'window> Canvas<'window> {
             None,
         );
         startup_trace.mark("text renderer ready");
-        let mut swash_cache = SwashCache::new();
-        let mut text_renderer = text_renderer;
-        prewarm_desktop_text_renderer(
-            &mut font_system,
-            &mut swash_cache,
-            &mut text_atlas,
-            &mut text_renderer,
-            &device,
-            &queue,
-            size,
-        );
-        startup_trace.mark("text renderer prewarmed");
+        let swash_cache = SwashCache::new();
+        let text_renderer = text_renderer;
+        startup_trace.mark("text renderer prewarm deferred");
         Ok(Self {
             surface,
             device,
@@ -5793,6 +5750,7 @@ impl<'window> Canvas<'window> {
             primitive_vertices_cache: Vec::new(),
             primitive_frame_vertices: Vec::new(),
             needs_initial_frame: true,
+            first_render_completed: false,
             defer_initial_text_frame: true,
             single_session_text_cache_key: None,
             single_session_text_key: None,
@@ -5835,6 +5793,7 @@ impl<'window> Canvas<'window> {
         self.primitive_vertices_cache_key = None;
         self.primitive_vertices_cache.clear();
         self.primitive_frame_vertices.clear();
+        self.first_render_completed = false;
         self.text_needs_prepare = true;
         self.config.width = size.width;
         self.config.height = size.height;
@@ -6191,7 +6150,7 @@ impl<'window> Canvas<'window> {
         let key = app.welcome_hero_text();
         if self.welcome_hero_reveal_key.as_deref() != Some(key.as_str()) {
             self.welcome_hero_reveal_key = Some(key);
-            self.welcome_hero_reveal_started_at = Some(now);
+            self.welcome_hero_reveal_started_at = None;
         }
 
         let elapsed = self
@@ -6516,7 +6475,15 @@ impl<'window> Canvas<'window> {
         );
         frame_profile.checkpoint("primitive_upload");
 
-        let hero_mask_spec = if welcome_hero_reveal_active
+        let welcome_hero_runtime_mask_visible = matches!(
+            app,
+            DesktopApp::SingleSession(single_session)
+                if single_session.is_welcome_timeline_visible() && welcome_hero_uses_runtime_mask
+        );
+        let defer_hero_mask_this_frame =
+            !self.first_render_completed && welcome_hero_runtime_mask_visible;
+        let hero_mask_spec = if welcome_hero_runtime_mask_visible
+            && !defer_hero_mask_this_frame
             && let DesktopApp::SingleSession(single_session) = app
         {
             welcome_hero_runtime_mask_spec_for_total_lines(
@@ -6583,6 +6550,13 @@ impl<'window> Canvas<'window> {
         frame_profile.checkpoint("queue_submit");
         frame.present();
         frame_profile.checkpoint("present");
+        if welcome_hero_runtime_mask_visible
+            && self.welcome_hero_reveal_started_at.is_none()
+            && (!welcome_hero_uses_runtime_mask || hero_mask_prepared)
+        {
+            self.welcome_hero_reveal_started_at = Some(Instant::now());
+        }
+        self.first_render_completed = true;
         let frame_wall = frame_profile.total_duration();
         let frame_cpu = frame_profile.cpu_duration();
         let context = DesktopFrameContext {
@@ -6600,7 +6574,9 @@ impl<'window> Canvas<'window> {
         };
         self.frame_profiler.observe(frame_profile, context);
         Ok(DesktopRenderFrameResult {
-            animation_active: animation_active || defer_text_this_frame,
+            animation_active: animation_active
+                || defer_text_this_frame
+                || defer_hero_mask_this_frame,
             frame_wall,
             frame_cpu,
             context,
