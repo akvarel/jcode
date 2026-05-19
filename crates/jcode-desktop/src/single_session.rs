@@ -116,25 +116,90 @@ pub(crate) struct SingleSessionApp {
     pub(crate) model_picker: ModelPickerState,
     pub(crate) session_switcher: SessionSwitcherState,
     pub(crate) stdin_response: Option<StdinResponseState>,
-    welcome_name: Option<String>,
+    welcome: SingleSessionWelcomeState,
+    composer: SingleSessionComposerState,
+    selection: SingleSessionSelectionState,
+    runtime: SingleSessionRuntimeState,
+    tool: SingleSessionToolState,
+    view: SingleSessionViewState,
+}
+
+#[derive(Clone, Debug)]
+struct SingleSessionWelcomeState {
+    name: Option<String>,
     recovery_session_count: usize,
-    queued_drafts: Vec<(String, Vec<(String, String)>)>,
-    selection_anchor: Option<SelectionPoint>,
-    selection_focus: Option<SelectionPoint>,
-    draft_selection_anchor: Option<SelectionPoint>,
-    draft_selection_focus: Option<SelectionPoint>,
-    input_undo_stack: Vec<(String, usize)>,
-    session_handle: Option<DesktopSessionHandle>,
-    active_tool_message_index: Option<usize>,
-    active_tool_input_buffer: String,
-    reload_phase: ReloadPhase,
-    inline_widget_opened_at: Option<Instant>,
     // True for the fresh-start chat that owns the welcome hero as visual UI.
     // The hero must stay out of `body_styled_lines()` so it never becomes part
     // of the persisted/rendered transcript text.
-    welcome_timeline: bool,
-    welcome_hero_phrase_index: usize,
+    timeline: bool,
+    hero_phrase_index: usize,
+}
+
+impl SingleSessionWelcomeState {
+    fn new(has_session: bool) -> Self {
+        let name = desktop_welcome_name();
+        let hero_phrase_index = welcome_phrase_index(&name);
+        Self {
+            name,
+            recovery_session_count: 0,
+            timeline: !has_session,
+            hero_phrase_index,
+        }
+    }
+
+    fn reset_fresh(&mut self) {
+        *self = Self::new(false);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SingleSessionComposerState {
+    queued_drafts: Vec<(String, Vec<(String, String)>)>,
+    input_undo_stack: Vec<(String, usize)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SingleSessionSelectionState {
+    anchor: Option<SelectionPoint>,
+    focus: Option<SelectionPoint>,
+    draft_anchor: Option<SelectionPoint>,
+    draft_focus: Option<SelectionPoint>,
+}
+
+#[derive(Clone, Debug)]
+struct SingleSessionRuntimeState {
+    session_handle: Option<DesktopSessionHandle>,
+    reload_phase: ReloadPhase,
+}
+
+impl Default for SingleSessionRuntimeState {
+    fn default() -> Self {
+        Self {
+            session_handle: None,
+            reload_phase: ReloadPhase::Stable,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SingleSessionToolState {
+    active_message_index: Option<usize>,
+    input_buffer: String,
+}
+
+#[derive(Clone, Debug)]
+struct SingleSessionViewState {
+    inline_widget_opened_at: Option<Instant>,
     text_scale: f32,
+}
+
+impl Default for SingleSessionViewState {
+    fn default() -> Self {
+        Self {
+            inline_widget_opened_at: None,
+            text_scale: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -813,9 +878,7 @@ fn hash_text_cache_fingerprint<H: Hasher>(text: &str, hasher: &mut H) {
 
 impl SingleSessionApp {
     pub(crate) fn new(session: Option<workspace::SessionCard>) -> Self {
-        let welcome_timeline = session.is_none();
-        let welcome_name = desktop_welcome_name();
-        let welcome_hero_phrase_index = welcome_phrase_index(&welcome_name);
+        let welcome = SingleSessionWelcomeState::new(session.is_some());
         Self {
             session,
             draft: String::new(),
@@ -835,22 +898,12 @@ impl SingleSessionApp {
             model_picker: ModelPickerState::default(),
             session_switcher: SessionSwitcherState::default(),
             stdin_response: None,
-            welcome_name,
-            recovery_session_count: 0,
-            queued_drafts: Vec::new(),
-            selection_anchor: None,
-            selection_focus: None,
-            draft_selection_anchor: None,
-            draft_selection_focus: None,
-            input_undo_stack: Vec::new(),
-            session_handle: None,
-            active_tool_message_index: None,
-            active_tool_input_buffer: String::new(),
-            reload_phase: ReloadPhase::Stable,
-            inline_widget_opened_at: None,
-            welcome_timeline,
-            welcome_hero_phrase_index,
-            text_scale: 1.0,
+            welcome,
+            composer: SingleSessionComposerState::default(),
+            selection: SingleSessionSelectionState::default(),
+            runtime: SingleSessionRuntimeState::default(),
+            tool: SingleSessionToolState::default(),
+            view: SingleSessionViewState::default(),
         }
     }
 
@@ -865,9 +918,9 @@ impl SingleSessionApp {
             && self.streaming_response.is_empty()
             && self.error.is_none()
         {
-            self.welcome_timeline = false;
+            self.welcome.timeline = false;
         } else if !replacing_with_session {
-            self.welcome_timeline = true;
+            self.welcome.timeline = true;
         }
         self.detail_scroll = 0;
     }
@@ -877,6 +930,7 @@ impl SingleSessionApp {
         self.detail_scroll = 0;
         self.messages.clear();
         self.streaming_response.clear();
+        self.status = None;
         self.status_kind = None;
         self.error = None;
         self.stdin_response = None;
@@ -884,15 +938,15 @@ impl SingleSessionApp {
         self.show_help = false;
         self.show_session_info = false;
         self.is_processing = false;
-        self.active_tool_message_index = None;
-        self.active_tool_input_buffer.clear();
-        self.reload_phase = ReloadPhase::Stable;
-        self.inline_widget_opened_at = None;
-        self.welcome_timeline = false;
+        self.tool.active_message_index = None;
+        self.tool.input_buffer.clear();
+        self.runtime.reload_phase = ReloadPhase::Stable;
+        self.view.inline_widget_opened_at = None;
+        self.welcome.timeline = false;
     }
 
     pub(crate) fn set_recovery_session_count(&mut self, count: usize) {
-        self.recovery_session_count = count;
+        self.welcome.recovery_session_count = count;
     }
 
     pub(crate) fn reset_fresh_session(&mut self) {
@@ -914,19 +968,12 @@ impl SingleSessionApp {
         self.model_picker = ModelPickerState::default();
         self.session_switcher = SessionSwitcherState::default();
         self.stdin_response = None;
-        self.welcome_name = desktop_welcome_name();
-        self.welcome_hero_phrase_index = welcome_phrase_index(&self.welcome_name);
-        self.recovery_session_count = 0;
-        self.queued_drafts.clear();
-        self.clear_selection();
-        self.clear_draft_selection();
-        self.input_undo_stack.clear();
-        self.session_handle = None;
-        self.active_tool_message_index = None;
-        self.active_tool_input_buffer.clear();
-        self.reload_phase = ReloadPhase::Stable;
-        self.inline_widget_opened_at = None;
-        self.welcome_timeline = true;
+        self.welcome.reset_fresh();
+        self.composer = SingleSessionComposerState::default();
+        self.selection = SingleSessionSelectionState::default();
+        self.runtime = SingleSessionRuntimeState::default();
+        self.tool = SingleSessionToolState::default();
+        self.view.inline_widget_opened_at = None;
     }
 
     pub(crate) fn status_title(&self) -> String {
@@ -971,7 +1018,7 @@ impl SingleSessionApp {
     }
 
     fn mark_inline_widget_opened(&mut self) {
-        self.inline_widget_opened_at = Some(Instant::now());
+        self.view.inline_widget_opened_at = Some(Instant::now());
     }
 
     fn close_inline_widgets(&mut self) {
@@ -1017,7 +1064,7 @@ impl SingleSessionApp {
 
         #[cfg(not(test))]
         {
-            let Some(opened_at) = self.inline_widget_opened_at else {
+            let Some(opened_at) = self.view.inline_widget_opened_at else {
                 return 1.0;
             };
             let raw = (opened_at.elapsed().as_secs_f32()
@@ -1056,12 +1103,13 @@ impl SingleSessionApp {
 
     #[cfg(test)]
     pub(crate) fn queued_draft_count(&self) -> usize {
-        self.queued_drafts.len()
+        self.composer.queued_drafts.len()
     }
 
     #[cfg(test)]
     pub(crate) fn queued_draft_messages(&self) -> Vec<String> {
-        self.queued_drafts
+        self.composer
+            .queued_drafts
             .iter()
             .map(|(message, _)| message.clone())
             .collect()
@@ -1134,7 +1182,7 @@ impl SingleSessionApp {
             KeyInput::ToggleSessionInfo => {
                 self.toggle_read_only_inline_widget(InlineWidgetKind::SessionInfo)
             }
-            KeyInput::RefreshSessions if self.recovery_session_count > 0 => {
+            KeyInput::RefreshSessions if self.welcome.recovery_session_count > 0 => {
                 KeyOutcome::RestoreCrashedSessions
             }
             KeyInput::RefreshSessions => KeyOutcome::Redraw,
@@ -1143,7 +1191,7 @@ impl SingleSessionApp {
                 KeyOutcome::Redraw
             }
             KeyInput::ResetTextScale => {
-                self.text_scale = 1.0;
+                self.view.text_scale = 1.0;
                 KeyOutcome::Redraw
             }
             KeyInput::CancelGeneration => {
@@ -1266,19 +1314,19 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn text_scale(&self) -> f32 {
-        self.text_scale
+        self.view.text_scale
     }
 
     pub(crate) fn has_active_selection(&self) -> bool {
-        self.selection_anchor.is_some()
-            || self.selection_focus.is_some()
-            || self.draft_selection_anchor.is_some()
-            || self.draft_selection_focus.is_some()
+        self.selection.anchor.is_some()
+            || self.selection.focus.is_some()
+            || self.selection.draft_anchor.is_some()
+            || self.selection.draft_focus.is_some()
     }
 
     fn adjust_text_scale(&mut self, direction: i8) {
         let delta = direction as f32 * SINGLE_SESSION_TEXT_SCALE_STEP;
-        self.text_scale = (self.text_scale + delta)
+        self.view.text_scale = (self.view.text_scale + delta)
             .clamp(SINGLE_SESSION_MIN_TEXT_SCALE, SINGLE_SESSION_MAX_TEXT_SCALE);
     }
 
@@ -1329,7 +1377,7 @@ impl SingleSessionApp {
                 self.model_picker.close();
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 Some(KeyOutcome::Redraw)
             }
             KeyInput::ModelPickerMove(delta) => {
@@ -1346,13 +1394,13 @@ impl SingleSessionApp {
                     self.model_picker.close();
                     self.draft.clear();
                     self.draft_cursor = 0;
-                    self.input_undo_stack.clear();
+                    self.composer.input_undo_stack.clear();
                     return Some(KeyOutcome::Redraw);
                 };
                 self.model_picker.close();
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 Some(KeyOutcome::SetModel(model))
             }
             KeyInput::RefreshSessions => {
@@ -1516,7 +1564,7 @@ impl SingleSessionApp {
         self.stdin_response = None;
         self.body_scroll_lines = 0.0;
         self.show_help = false;
-        self.welcome_timeline = false;
+        self.welcome.timeline = false;
         self.session_switcher.close();
         self.set_status(SingleSessionStatus::Info(format!("resumed {title}")));
         KeyOutcome::Redraw
@@ -1663,8 +1711,8 @@ impl SingleSessionApp {
             {
                 return vec![styled_line(status.clone(), SingleSessionLineStyle::Status)];
             }
-            if self.recovery_session_count > 0 {
-                return welcome_recovery_styled_lines(self.recovery_session_count);
+            if self.welcome.recovery_session_count > 0 {
+                return welcome_recovery_styled_lines(self.welcome.recovery_session_count);
             }
             return Vec::new();
         }
@@ -1730,13 +1778,14 @@ impl SingleSessionApp {
                 }
                 let tool_messages = &self.messages[group_start..message_index];
                 let group_contains_active_tool = self
-                    .active_tool_message_index
+                    .tool
+                    .active_message_index
                     .is_some_and(|index| (group_start..message_index).contains(&index));
                 if tool_messages.len() > 1 && !group_contains_active_tool {
                     append_tool_group_summary(&mut lines, tool_messages);
                 } else {
                     for (offset, tool_message) in tool_messages.iter().enumerate() {
-                        let is_active_tool = self.active_tool_message_index
+                        let is_active_tool = self.tool.active_message_index
                             == Some(group_start.saturating_add(offset));
                         append_chat_message_lines(
                             &mut lines,
@@ -1744,7 +1793,7 @@ impl SingleSessionApp {
                             &mut user_turn,
                             is_active_tool,
                             if is_active_tool {
-                                Some(self.active_tool_input_buffer.as_str())
+                                Some(self.tool.input_buffer.as_str())
                             } else {
                                 None
                             },
@@ -1792,8 +1841,8 @@ impl SingleSessionApp {
             .hash(&mut hasher);
         hash_messages_cache_fingerprint(&self.messages, &mut hasher);
         hash_text_cache_fingerprint(&self.streaming_response, &mut hasher);
-        self.active_tool_message_index.hash(&mut hasher);
-        hash_text_cache_fingerprint(&self.active_tool_input_buffer, &mut hasher);
+        self.tool.active_message_index.hash(&mut hasher);
+        hash_text_cache_fingerprint(&self.tool.input_buffer, &mut hasher);
         self.status.hash(&mut hasher);
         self.error.hash(&mut hasher);
         self.show_help.hash(&mut hasher);
@@ -1805,11 +1854,11 @@ impl SingleSessionApp {
         self.session_switcher.filter.hash(&mut hasher);
         self.session_switcher.selected.hash(&mut hasher);
         self.stdin_response.hash(&mut hasher);
-        self.welcome_name.hash(&mut hasher);
-        self.recovery_session_count.hash(&mut hasher);
-        self.welcome_timeline.hash(&mut hasher);
-        self.welcome_hero_phrase_index.hash(&mut hasher);
-        self.text_scale.to_bits().hash(&mut hasher);
+        self.welcome.name.hash(&mut hasher);
+        self.welcome.recovery_session_count.hash(&mut hasher);
+        self.welcome.timeline.hash(&mut hasher);
+        self.welcome.hero_phrase_index.hash(&mut hasher);
+        self.view.text_scale.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -1830,8 +1879,8 @@ impl SingleSessionApp {
             })
             .hash(&mut hasher);
         hash_messages_cache_fingerprint(&self.messages, &mut hasher);
-        self.active_tool_message_index.hash(&mut hasher);
-        hash_text_cache_fingerprint(&self.active_tool_input_buffer, &mut hasher);
+        self.tool.active_message_index.hash(&mut hasher);
+        hash_text_cache_fingerprint(&self.tool.input_buffer, &mut hasher);
         self.status.hash(&mut hasher);
         self.error.hash(&mut hasher);
         self.show_help.hash(&mut hasher);
@@ -1843,20 +1892,20 @@ impl SingleSessionApp {
         self.session_switcher.filter.hash(&mut hasher);
         self.session_switcher.selected.hash(&mut hasher);
         self.stdin_response.hash(&mut hasher);
-        self.welcome_name.hash(&mut hasher);
-        self.recovery_session_count.hash(&mut hasher);
-        self.welcome_timeline.hash(&mut hasher);
-        self.welcome_hero_phrase_index.hash(&mut hasher);
-        self.text_scale.to_bits().hash(&mut hasher);
+        self.welcome.name.hash(&mut hasher);
+        self.welcome.recovery_session_count.hash(&mut hasher);
+        self.welcome.timeline.hash(&mut hasher);
+        self.welcome.hero_phrase_index.hash(&mut hasher);
+        self.view.text_scale.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 
     pub(crate) fn welcome_hero_text(&self) -> String {
-        handwritten_welcome_phrase(self.welcome_hero_phrase_index).to_string()
+        handwritten_welcome_phrase(self.welcome.hero_phrase_index).to_string()
     }
 
     pub(crate) fn is_welcome_timeline_visible(&self) -> bool {
-        self.welcome_timeline
+        self.welcome.timeline
             && !self.show_help
             && !self.show_session_info
             && !self.session_switcher.open
@@ -1888,46 +1937,46 @@ impl SingleSessionApp {
             DesktopSessionEvent::Reloading { .. } => {
                 self.set_status(SingleSessionStatus::ServerReloading);
                 self.is_processing = true;
-                self.reload_phase = ReloadPhase::AwaitingReconnect;
+                self.runtime.reload_phase = ReloadPhase::AwaitingReconnect;
             }
             DesktopSessionEvent::Reloaded { session_id } => {
                 self.live_session_id = Some(session_id);
                 self.set_status(SingleSessionStatus::ServerReconnected);
                 self.is_processing = true;
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
             }
             DesktopSessionEvent::SessionStarted { session_id } => {
                 self.live_session_id = Some(session_id);
                 self.set_status(SingleSessionStatus::Connected);
             }
             DesktopSessionEvent::TextDelta(text) => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.streaming_response.push_str(&text);
                 self.set_status(SingleSessionStatus::Receiving);
             }
             DesktopSessionEvent::TextReplace(text) => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.streaming_response = text;
                 self.set_status(SingleSessionStatus::Receiving);
             }
             DesktopSessionEvent::ToolStarted { name } => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.collapse_active_tool_message();
-                self.active_tool_input_buffer.clear();
+                self.tool.input_buffer.clear();
                 self.set_status(SingleSessionStatus::ToolPreparing(name.clone()));
                 self.messages
                     .push(SingleSessionMessage::tool(format!("▾ {name} preparing")));
-                self.active_tool_message_index = Some(self.messages.len().saturating_sub(1));
+                self.tool.active_message_index = Some(self.messages.len().saturating_sub(1));
             }
             DesktopSessionEvent::ToolExecuting { name } => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.set_status(SingleSessionStatus::ToolUsing(name.clone()));
                 self.replace_active_tool_header(&format!("▾ {name} running"));
             }
             DesktopSessionEvent::ToolInput { delta } => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.append_active_tool_input(&delta);
             }
@@ -1936,7 +1985,7 @@ impl SingleSessionApp {
                 summary,
                 is_error,
             } => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.set_status(SingleSessionStatus::ToolFinished {
                     name: name.clone(),
@@ -1945,7 +1994,7 @@ impl SingleSessionApp {
                 let marker = if is_error { "failed" } else { "done" };
                 let line = format!("▾ {name} {marker}: {summary}");
                 self.flush_active_tool_input_to_message();
-                if let Some(index) = self.active_tool_message_index
+                if let Some(index) = self.tool.active_message_index
                     && let Some(message) = self.messages.get_mut(index)
                     && message.role == SingleSessionRole::Tool
                 {
@@ -1953,7 +2002,7 @@ impl SingleSessionApp {
                         merge_tool_finish_with_existing_context(&message.content, &line);
                 } else {
                     self.messages.push(SingleSessionMessage::tool(line));
-                    self.active_tool_message_index = Some(self.messages.len().saturating_sub(1));
+                    self.tool.active_message_index = Some(self.messages.len().saturating_sub(1));
                 }
             }
             DesktopSessionEvent::ModelChanged {
@@ -2000,7 +2049,7 @@ impl SingleSessionApp {
                 is_password,
                 tool_call_id,
             } => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.set_status(SingleSessionStatus::InteractiveInputRequested);
                 self.close_inline_widgets();
                 let raw_prompt = prompt.trim();
@@ -2022,7 +2071,7 @@ impl SingleSessionApp {
                 )));
             }
             DesktopSessionEvent::Done => {
-                if self.reload_phase == ReloadPhase::AwaitingReconnect {
+                if self.runtime.reload_phase == ReloadPhase::AwaitingReconnect {
                     self.set_status(SingleSessionStatus::ServerReloading);
                     self.is_processing = true;
                     return;
@@ -2030,19 +2079,19 @@ impl SingleSessionApp {
                 self.finish_streaming_response();
                 self.is_processing = false;
                 self.stdin_response = None;
-                self.session_handle = None;
-                self.active_tool_message_index = None;
-                self.active_tool_input_buffer.clear();
+                self.runtime.session_handle = None;
+                self.tool.active_message_index = None;
+                self.tool.input_buffer.clear();
                 self.set_status(SingleSessionStatus::Ready);
             }
             DesktopSessionEvent::Error(error) => {
-                self.reload_phase = ReloadPhase::Stable;
+                self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.is_processing = false;
                 self.stdin_response = None;
-                self.session_handle = None;
-                self.active_tool_message_index = None;
-                self.active_tool_input_buffer.clear();
+                self.runtime.session_handle = None;
+                self.tool.active_message_index = None;
+                self.tool.input_buffer.clear();
                 self.set_status(SingleSessionStatus::Error);
                 self.error = Some(error);
             }
@@ -2050,11 +2099,11 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn set_session_handle(&mut self, handle: DesktopSessionHandle) {
-        self.session_handle = Some(handle);
+        self.runtime.session_handle = Some(handle);
     }
 
     pub(crate) fn cancel_generation(&mut self) -> bool {
-        let Some(handle) = &self.session_handle else {
+        let Some(handle) = &self.runtime.session_handle else {
             return false;
         };
         match handle.cancel() {
@@ -2067,7 +2116,7 @@ impl SingleSessionApp {
                 self.error = Some(format!("{error:#}"));
                 self.is_processing = false;
                 self.stdin_response = None;
-                self.session_handle = None;
+                self.runtime.session_handle = None;
                 true
             }
         }
@@ -2237,7 +2286,7 @@ impl SingleSessionApp {
             "/help" | "/?" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 self.show_help = true;
                 self.model_picker.close();
                 self.session_switcher.close();
@@ -2255,7 +2304,7 @@ impl SingleSessionApp {
                 self.is_processing = false;
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 self.set_status(SingleSessionStatus::Info(
                     "cleared visible transcript".to_string(),
                 ));
@@ -2265,19 +2314,19 @@ impl SingleSessionApp {
             "/new" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 KeyOutcome::SpawnSession
             }
             "/sessions" | "/session" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 return Some(self.open_session_switcher());
             }
             "/model" | "/models" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 if args.is_empty() {
                     return Some(self.open_model_picker());
                 }
@@ -2286,7 +2335,7 @@ impl SingleSessionApp {
             "/copy" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 return Some(
                     self.latest_assistant_response()
                         .map(KeyOutcome::CopyLatestResponse)
@@ -2301,7 +2350,7 @@ impl SingleSessionApp {
             "/stop" | "/cancel" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 if self.is_processing {
                     KeyOutcome::CancelGeneration
                 } else {
@@ -2312,7 +2361,7 @@ impl SingleSessionApp {
             "/status" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
-                self.input_undo_stack.clear();
+                self.composer.input_undo_stack.clear();
                 self.show_help = false;
                 self.show_session_info = true;
                 self.model_picker.close();
@@ -2373,7 +2422,7 @@ impl SingleSessionApp {
         request_id: String,
         input: String,
     ) -> anyhow::Result<()> {
-        let Some(handle) = &self.session_handle else {
+        let Some(handle) = &self.runtime.session_handle else {
             anyhow::bail!("no active desktop session to receive interactive input");
         };
         handle.send_stdin_response(request_id, input)?;
@@ -2389,22 +2438,22 @@ impl SingleSessionApp {
             return KeyOutcome::None;
         }
         let images = std::mem::take(&mut self.pending_images);
-        self.queued_drafts.push((message.clone(), images));
+        self.composer.queued_drafts.push((message.clone(), images));
         self.messages.push(SingleSessionMessage::meta(format!(
             "queued prompt: {message}"
         )));
         self.draft.clear();
         self.draft_cursor = 0;
-        self.input_undo_stack.clear();
+        self.composer.input_undo_stack.clear();
         self.set_status(SingleSessionStatus::Info(format!(
             "{} prompt(s) queued",
-            self.queued_drafts.len()
+            self.composer.queued_drafts.len()
         )));
         KeyOutcome::Redraw
     }
 
     fn retrieve_queued_draft_for_edit(&mut self) -> KeyOutcome {
-        let Some((message, images)) = self.queued_drafts.pop() else {
+        let Some((message, images)) = self.composer.queued_drafts.pop() else {
             return KeyOutcome::None;
         };
         self.remember_input_undo_state();
@@ -2413,7 +2462,7 @@ impl SingleSessionApp {
         self.pending_images = images;
         self.set_status(SingleSessionStatus::Info(format!(
             "{} prompt(s) queued",
-            self.queued_drafts.len()
+            self.composer.queued_drafts.len()
         )));
         KeyOutcome::Redraw
     }
@@ -2430,54 +2479,54 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn take_next_queued_draft(&mut self) -> Option<(String, Vec<(String, String)>)> {
-        if self.is_processing || self.error.is_some() || self.queued_drafts.is_empty() {
+        if self.is_processing || self.error.is_some() || self.composer.queued_drafts.is_empty() {
             return None;
         }
-        let (message, images) = self.queued_drafts.remove(0);
+        let (message, images) = self.composer.queued_drafts.remove(0);
         self.record_user_submit(&message);
         Some((message, images))
     }
 
     pub(crate) fn begin_selection(&mut self, point: SelectionPoint) {
-        self.selection_anchor = Some(point);
-        self.selection_focus = Some(point);
+        self.selection.anchor = Some(point);
+        self.selection.focus = Some(point);
     }
 
     pub(crate) fn update_selection(&mut self, point: SelectionPoint) {
-        if self.selection_anchor.is_some() {
-            self.selection_focus = Some(point);
+        if self.selection.anchor.is_some() {
+            self.selection.focus = Some(point);
         }
     }
 
     pub(crate) fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-        self.selection_focus = None;
+        self.selection.anchor = None;
+        self.selection.focus = None;
     }
 
     pub(crate) fn begin_draft_selection(&mut self, point: SelectionPoint) {
         self.clear_selection();
-        self.draft_selection_anchor = Some(point);
-        self.draft_selection_focus = Some(point);
+        self.selection.draft_anchor = Some(point);
+        self.selection.draft_focus = Some(point);
         self.draft_cursor = self.draft_byte_index_for_line_col(point.line, point.column);
         self.clamp_draft_cursor();
     }
 
     pub(crate) fn update_draft_selection(&mut self, point: SelectionPoint) {
-        if self.draft_selection_anchor.is_some() {
-            self.draft_selection_focus = Some(point);
+        if self.selection.draft_anchor.is_some() {
+            self.selection.draft_focus = Some(point);
             self.draft_cursor = self.draft_byte_index_for_line_col(point.line, point.column);
             self.clamp_draft_cursor();
         }
     }
 
     pub(crate) fn clear_draft_selection(&mut self) {
-        self.draft_selection_anchor = None;
-        self.draft_selection_focus = None;
+        self.selection.draft_anchor = None;
+        self.selection.draft_focus = None;
     }
 
     pub(crate) fn draft_selection_points(&self) -> Option<(SelectionPoint, SelectionPoint)> {
-        let anchor = self.draft_selection_anchor?;
-        let focus = self.draft_selection_focus?;
+        let anchor = self.selection.draft_anchor?;
+        let focus = self.selection.draft_focus?;
         if selection_point_cmp(anchor, focus).is_gt() {
             Some((focus, anchor))
         } else {
@@ -2571,8 +2620,8 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn selection_points(&self) -> Option<(SelectionPoint, SelectionPoint)> {
-        let anchor = self.selection_anchor?;
-        let focus = self.selection_focus?;
+        let anchor = self.selection.anchor?;
+        let focus = self.selection.focus?;
         if selection_point_cmp(anchor, focus).is_gt() {
             Some((focus, anchor))
         } else {
@@ -2614,11 +2663,11 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn has_body_selection(&self) -> bool {
-        self.selection_anchor.is_some() && self.selection_focus.is_some()
+        self.selection.anchor.is_some() && self.selection.focus.is_some()
     }
 
     pub(crate) fn has_draft_selection(&self) -> bool {
-        self.draft_selection_anchor.is_some() && self.draft_selection_focus.is_some()
+        self.selection.draft_anchor.is_some() && self.selection.draft_focus.is_some()
     }
 
     pub(crate) fn selected_text_from_lines(&self, lines: &[String]) -> Option<String> {
@@ -2650,7 +2699,7 @@ impl SingleSessionApp {
         self.messages.push(SingleSessionMessage::user(message));
         self.draft.clear();
         self.draft_cursor = 0;
-        self.input_undo_stack.clear();
+        self.composer.input_undo_stack.clear();
         self.streaming_response.clear();
         self.scroll_body_to_bottom();
         self.set_status(SingleSessionStatus::Sending);
@@ -2668,7 +2717,7 @@ impl SingleSessionApp {
     }
 
     fn collapse_active_tool_message(&mut self) {
-        let Some(index) = self.active_tool_message_index.take() else {
+        let Some(index) = self.tool.active_message_index.take() else {
             return;
         };
         let Some(message) = self.messages.get_mut(index) else {
@@ -2686,14 +2735,14 @@ impl SingleSessionApp {
         if delta.is_empty() {
             return;
         }
-        self.active_tool_input_buffer.push_str(delta);
+        self.tool.input_buffer.push_str(delta);
     }
 
     fn flush_active_tool_input_to_message(&mut self) {
-        if self.active_tool_input_buffer.is_empty() {
+        if self.tool.input_buffer.is_empty() {
             return;
         }
-        let Some(index) = self.active_tool_message_index else {
+        let Some(index) = self.tool.active_message_index else {
             return;
         };
         let Some(message) = self.messages.get_mut(index) else {
@@ -2705,21 +2754,21 @@ impl SingleSessionApp {
         if !message.content.contains("\n  input: ") {
             message.content.push_str("\n  input: ");
         }
-        message.content.push_str(&self.active_tool_input_buffer);
-        self.active_tool_input_buffer.clear();
+        message.content.push_str(&self.tool.input_buffer);
+        self.tool.input_buffer.clear();
     }
 
     fn replace_active_tool_header(&mut self, header: &str) {
-        let Some(index) = self.active_tool_message_index else {
+        let Some(index) = self.tool.active_message_index else {
             self.messages
                 .push(SingleSessionMessage::tool(header.to_string()));
-            self.active_tool_message_index = Some(self.messages.len().saturating_sub(1));
+            self.tool.active_message_index = Some(self.messages.len().saturating_sub(1));
             return;
         };
         let Some(message) = self.messages.get_mut(index) else {
             self.messages
                 .push(SingleSessionMessage::tool(header.to_string()));
-            self.active_tool_message_index = Some(self.messages.len().saturating_sub(1));
+            self.tool.active_message_index = Some(self.messages.len().saturating_sub(1));
             return;
         };
         if message.role == SingleSessionRole::Tool {
@@ -2857,22 +2906,24 @@ impl SingleSessionApp {
 
     fn remember_input_undo_state(&mut self) {
         if self
+            .composer
             .input_undo_stack
             .last()
             .is_some_and(|(draft, cursor)| draft == &self.draft && *cursor == self.draft_cursor)
         {
             return;
         }
-        self.input_undo_stack
+        self.composer
+            .input_undo_stack
             .push((self.draft.clone(), self.draft_cursor));
         const MAX_UNDO: usize = 64;
-        if self.input_undo_stack.len() > MAX_UNDO {
-            self.input_undo_stack.remove(0);
+        if self.composer.input_undo_stack.len() > MAX_UNDO {
+            self.composer.input_undo_stack.remove(0);
         }
     }
 
     fn undo_input_change(&mut self) {
-        if let Some((draft, cursor)) = self.input_undo_stack.pop() {
+        if let Some((draft, cursor)) = self.composer.input_undo_stack.pop() {
             self.draft = draft;
             self.draft_cursor = cursor.min(self.draft.len());
             self.clamp_draft_cursor();
@@ -3228,7 +3279,8 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
         })
         .unwrap_or("none");
     let active_tool = app
-        .active_tool_message_index
+        .tool
+        .active_message_index
         .map(|index| format!("message #{index}"))
         .unwrap_or_else(|| "none".to_string());
 
@@ -3257,7 +3309,7 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
             format!(
                 "│ work         {} · worker {} · active tool {}",
                 if app.is_processing { "running" } else { "idle" },
-                if app.session_handle.is_some() {
+                if app.runtime.session_handle.is_some() {
                     "attached"
                 } else {
                     "none"
@@ -3285,7 +3337,7 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
                 app.next_prompt_number(),
                 app.draft.len(),
                 app.pending_images.len(),
-                app.queued_drafts.len(),
+                app.composer.queued_drafts.len(),
                 stdin
             ),
             SingleSessionLineStyle::Overlay,
@@ -3294,7 +3346,7 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
             format!(
                 "│ viewport     scroll {} · text scale {:.0}% · selection {} · welcome {}",
                 scroll_status_fragment(app.body_scroll_lines).trim_start_matches(" · "),
-                app.text_scale * 100.0,
+                app.view.text_scale * 100.0,
                 selection,
                 if app.is_welcome_timeline_visible() {
                     "visible"
