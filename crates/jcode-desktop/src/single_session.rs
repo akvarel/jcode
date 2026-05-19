@@ -2,7 +2,9 @@ use crate::{
     session_launch::{DesktopModelChoice, DesktopSessionEvent, DesktopSessionHandle},
     workspace,
 };
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -3554,7 +3556,10 @@ fn render_assistant_markdown_lines(content: &str) -> Vec<SingleSessionStyledLine
     let markdown_options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_DEFINITION_LIST;
     let mut renderer = AssistantMarkdownRenderer::default();
 
     for event in Parser::new_ext(content, markdown_options) {
@@ -3584,6 +3589,7 @@ struct AssistantMarkdownRenderer {
     pending_line_prefix: String,
     continuation_prefix: String,
     in_code_block: bool,
+    in_footnote_definition: bool,
     table: Option<AssistantMarkdownTable>,
     image_stack: Vec<AssistantMarkdownImage>,
     link_stack: Vec<AssistantMarkdownLink>,
@@ -3627,12 +3633,22 @@ impl AssistantMarkdownRenderer {
             Event::End(TagEnd::Heading(_)) => self.end_heading(),
             Event::Start(Tag::Paragraph) => self.start_paragraph(),
             Event::End(TagEnd::Paragraph) => self.end_paragraph(),
-            Event::Start(Tag::BlockQuote(_)) => self.start_block_quote(),
+            Event::Start(Tag::BlockQuote(kind)) => self.start_block_quote(kind),
             Event::End(TagEnd::BlockQuote(_)) => self.end_block_quote(),
             Event::Start(Tag::List(start)) => self.start_list(start),
             Event::End(TagEnd::List(_)) => self.end_list(),
             Event::Start(Tag::Item) => self.start_list_item(),
             Event::End(TagEnd::Item) => self.end_list_item(),
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                self.start_footnote_definition(label.as_ref())
+            }
+            Event::End(TagEnd::FootnoteDefinition) => self.end_footnote_definition(),
+            Event::Start(Tag::DefinitionList) => self.start_definition_list(),
+            Event::End(TagEnd::DefinitionList) => self.end_definition_list(),
+            Event::Start(Tag::DefinitionListTitle) => self.start_definition_list_title(),
+            Event::End(TagEnd::DefinitionListTitle) => self.end_definition_list_title(),
+            Event::Start(Tag::DefinitionListDefinition) => self.start_definition_list_definition(),
+            Event::End(TagEnd::DefinitionListDefinition) => self.end_definition_list_definition(),
             Event::TaskListMarker(checked) => self.apply_task_marker(checked),
             Event::Start(Tag::CodeBlock(kind)) => self.start_code_block(kind),
             Event::End(TagEnd::CodeBlock) => self.end_code_block(),
@@ -3652,12 +3668,14 @@ impl AssistantMarkdownRenderer {
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {}
             Event::Text(text) => self.push_text(text.as_ref()),
             Event::Code(code) => self.push_inline_code(code.as_ref()),
+            Event::InlineMath(math) => self.push_inline_math(math.as_ref()),
+            Event::DisplayMath(math) => self.push_display_math(math.as_ref()),
             Event::SoftBreak => self.soft_break(),
             Event::HardBreak => self.hard_break(),
             Event::Rule => self.rule(),
             Event::Html(html) | Event::InlineHtml(html) => self.push_text(html.as_ref()),
             Event::FootnoteReference(name) => {
-                self.push_text("[");
+                self.push_text("[^");
                 self.push_text(name.as_ref());
                 self.push_text("]");
             }
@@ -3704,11 +3722,16 @@ impl AssistantMarkdownRenderer {
         }
     }
 
-    fn start_block_quote(&mut self) {
+    fn start_block_quote(&mut self, kind: Option<BlockQuoteKind>) {
         self.flush_current_line();
         self.ensure_block_gap();
+        let parent_quote_prefix = self.quote_prefix();
         self.quote_depth += 1;
         self.current_style = SingleSessionLineStyle::AssistantQuote;
+        if let Some(kind) = kind {
+            self.pending_line_prefix =
+                format!("{parent_quote_prefix}{} │ ", block_quote_kind_label(kind));
+        }
     }
 
     fn end_block_quote(&mut self) {
@@ -3769,6 +3792,53 @@ impl AssistantMarkdownRenderer {
         } else {
             self.current.push_str(if checked { "✓ " } else { "☐ " });
         }
+    }
+
+    fn start_footnote_definition(&mut self, label: &str) {
+        self.flush_current_line();
+        self.ensure_block_gap();
+        self.in_footnote_definition = true;
+        self.current_style = SingleSessionLineStyle::Meta;
+        self.pending_line_prefix = format!("[^{label}]: ");
+    }
+
+    fn end_footnote_definition(&mut self) {
+        self.flush_current_line_as(SingleSessionLineStyle::Meta);
+        self.in_footnote_definition = false;
+        self.current_style = self.prose_style();
+        self.pending_line_prefix.clear();
+    }
+
+    fn start_definition_list(&mut self) {
+        self.flush_current_line();
+        self.ensure_block_gap();
+    }
+
+    fn end_definition_list(&mut self) {
+        self.flush_current_line();
+        self.pending_line_prefix.clear();
+        self.current_style = self.prose_style();
+    }
+
+    fn start_definition_list_title(&mut self) {
+        self.flush_current_line();
+        self.current_style = SingleSessionLineStyle::AssistantHeading;
+    }
+
+    fn end_definition_list_title(&mut self) {
+        self.flush_current_line_as(SingleSessionLineStyle::AssistantHeading);
+        self.current_style = self.prose_style();
+    }
+
+    fn start_definition_list_definition(&mut self) {
+        self.flush_current_line();
+        self.current_style = self.prose_style();
+        self.pending_line_prefix = "  : ".to_string();
+    }
+
+    fn end_definition_list_definition(&mut self) {
+        self.flush_current_line();
+        self.pending_line_prefix.clear();
     }
 
     fn start_code_block(&mut self, kind: CodeBlockKind<'_>) {
@@ -3917,6 +3987,12 @@ impl AssistantMarkdownRenderer {
     }
 
     fn push_inline_code(&mut self, code: &str) {
+        if let Some(image) = self.image_stack.last_mut() {
+            image.alt_text.push('`');
+            image.alt_text.push_str(code);
+            image.alt_text.push('`');
+            return;
+        }
         if let Some(table) = &mut self.table {
             table.push_text("`");
             table.push_text(code);
@@ -3927,6 +4003,53 @@ impl AssistantMarkdownRenderer {
         self.current.push('`');
         self.current.push_str(code);
         self.current.push('`');
+    }
+
+    fn push_inline_math(&mut self, math: &str) {
+        if let Some(image) = self.image_stack.last_mut() {
+            image.alt_text.push('$');
+            image.alt_text.push_str(math);
+            image.alt_text.push('$');
+            return;
+        }
+        if let Some(table) = &mut self.table {
+            table.push_text("$");
+            table.push_text(math);
+            table.push_text("$");
+            return;
+        }
+        self.begin_line_if_needed();
+        self.current.push('$');
+        self.current.push_str(math);
+        self.current.push('$');
+    }
+
+    fn push_display_math(&mut self, math: &str) {
+        if let Some(image) = self.image_stack.last_mut() {
+            image.alt_text.push_str("$$");
+            image.alt_text.push_str(math);
+            image.alt_text.push_str("$$");
+            return;
+        }
+        if let Some(table) = &mut self.table {
+            table.push_text("$$ ");
+            table.push_text(math.trim());
+            table.push_text(" $$");
+            return;
+        }
+
+        self.flush_current_line();
+        self.ensure_block_gap();
+        self.lines
+            .push(styled_line("  $$", SingleSessionLineStyle::Code));
+        for line in math.trim_matches('\n').lines() {
+            self.lines.push(styled_line(
+                format!("  {line}"),
+                SingleSessionLineStyle::Code,
+            ));
+        }
+        self.lines
+            .push(styled_line("  $$", SingleSessionLineStyle::Code));
     }
 
     fn soft_break(&mut self) {
@@ -4025,7 +4148,9 @@ impl AssistantMarkdownRenderer {
     }
 
     fn prose_style(&self) -> SingleSessionLineStyle {
-        if self.quote_depth > 0 {
+        if self.in_footnote_definition {
+            SingleSessionLineStyle::Meta
+        } else if self.quote_depth > 0 {
             SingleSessionLineStyle::AssistantQuote
         } else {
             SingleSessionLineStyle::Assistant
@@ -4147,6 +4272,16 @@ fn heading_prefix(level: HeadingLevel) -> &'static str {
         HeadingLevel::H1 | HeadingLevel::H2 => "",
         HeadingLevel::H3 => "› ",
         _ => "· ",
+    }
+}
+
+fn block_quote_kind_label(kind: BlockQuoteKind) -> &'static str {
+    match kind {
+        BlockQuoteKind::Note => "NOTE",
+        BlockQuoteKind::Tip => "TIP",
+        BlockQuoteKind::Important => "IMPORTANT",
+        BlockQuoteKind::Warning => "WARNING",
+        BlockQuoteKind::Caution => "CAUTION",
     }
 }
 
