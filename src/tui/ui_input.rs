@@ -57,19 +57,26 @@ fn normalize_repaint_sensitive_notice_text(text: &str) -> String {
     text.replace("⚠️", "⚠")
 }
 
-const MAX_VISIBLE_COMMAND_SUGGESTIONS: usize = 5;
-
-fn command_suggestion_hint_line_count(suggestions: &[(String, &'static str)], input: &str) -> u16 {
+fn command_suggestion_hint_line_count(suggestions: &[(String, &'static str)]) -> u16 {
     if suggestions.is_empty() {
         return 0;
     }
 
-    let input_trimmed = input.trim();
-    let exact_match = suggestions.iter().any(|(cmd, _)| cmd == input_trimmed);
-    if suggestions.len() == 1 || exact_match {
+    if suggestions.len() == 1 {
         1
     } else {
-        suggestions.len().min(MAX_VISIBLE_COMMAND_SUGGESTIONS) as u16
+        suggestions.len().min(app::COMMAND_SUGGESTION_VISIBLE_LIMIT) as u16
+    }
+}
+
+fn command_suggestion_window_start(selected: usize, suggestion_count: usize) -> usize {
+    if suggestion_count <= app::COMMAND_SUGGESTION_VISIBLE_LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(app::COMMAND_SUGGESTION_VISIBLE_LIMIT)
+            .min(suggestion_count.saturating_sub(app::COMMAND_SUGGESTION_VISIBLE_LIMIT))
     }
 }
 
@@ -81,7 +88,7 @@ pub(super) fn input_hint_line_height(app: &dyn TuiState) -> u16 {
         && (matches!(mode, ComposerMode::SlashCommand) || !app.is_processing());
 
     if has_suggestions {
-        return command_suggestion_hint_line_count(&suggestions, app.input());
+        return command_suggestion_hint_line_count(&suggestions);
     }
 
     u16::from(
@@ -804,14 +811,23 @@ mod tests {
         ];
 
         assert_eq!(
-            command_suggestion_hint_line_count(&suggestions, "/h"),
-            MAX_VISIBLE_COMMAND_SUGGESTIONS as u16
+            command_suggestion_hint_line_count(&suggestions),
+            app::COMMAND_SUGGESTION_VISIBLE_LIMIT as u16
         );
-        assert_eq!(command_suggestion_hint_line_count(&suggestions, "/help"), 1);
         assert_eq!(
-            command_suggestion_hint_line_count(&suggestions[..1], "/he"),
-            1
+            command_suggestion_hint_line_count(&suggestions),
+            app::COMMAND_SUGGESTION_VISIBLE_LIMIT as u16
         );
+        assert_eq!(command_suggestion_hint_line_count(&suggestions[..1]), 1);
+    }
+
+    #[test]
+    fn command_suggestion_window_start_scrolls_after_visible_limit() {
+        let limit = app::COMMAND_SUGGESTION_VISIBLE_LIMIT;
+        assert_eq!(command_suggestion_window_start(0, limit + 3), 0);
+        assert_eq!(command_suggestion_window_start(limit - 1, limit + 3), 0);
+        assert_eq!(command_suggestion_window_start(limit, limit + 3), 1);
+        assert_eq!(command_suggestion_window_start(limit + 2, limit + 3), 3);
     }
 
     #[test]
@@ -1314,55 +1330,55 @@ pub(super) fn draw_input(
     let mut hint_shown = false;
     let mut hint_line: Option<String> = None;
     if has_suggestions {
-        let input_trimmed = input_text.trim();
-        let exact_match = suggestions.iter().find(|(cmd, _)| cmd == input_trimmed);
-
-        if suggestions.len() == 1 || exact_match.is_some() {
-            let (cmd, desc) = exact_match.unwrap_or(&suggestions[0]);
-            let mut spans = vec![
-                Span::styled("", Style::default().fg(dim_color())),
-                Span::styled(cmd.to_string(), Style::default().fg(rgb(138, 180, 248))),
-                Span::styled(format!(" - {}", desc), Style::default().fg(dim_color())),
-            ];
-            if suggestions.len() > 1 {
-                spans.push(Span::styled(
-                    format!("  Tab: +{} more", suggestions.len() - 1),
-                    Style::default().fg(dim_color()),
-                ));
-            }
-            lines.push(Line::from(spans));
+        if suggestions.len() == 1 {
+            let (cmd, desc) = &suggestions[0];
+            lines.push(Line::from(vec![
+                Span::styled(cmd.to_string(), Style::default().fg(rgb(255, 213, 128))),
+                Span::styled(
+                    format!("  {}", desc),
+                    Style::default().fg(rgb(255, 213, 128)),
+                ),
+            ]));
         } else {
-            let limited: Vec<_> = suggestions
-                .iter()
-                .take(MAX_VISIBLE_COMMAND_SUGGESTIONS)
-                .collect();
-            let more_count = suggestions
-                .len()
-                .saturating_sub(MAX_VISIBLE_COMMAND_SUGGESTIONS);
             let selected = app
                 .command_suggestion_selected()
-                .min(limited.len().saturating_sub(1));
+                .min(suggestions.len().saturating_sub(1));
+            let window_start = command_suggestion_window_start(selected, suggestions.len());
+            let limited: Vec<_> = suggestions
+                .iter()
+                .skip(window_start)
+                .take(app::COMMAND_SUGGESTION_VISIBLE_LIMIT)
+                .collect();
+            let window_end = window_start + limited.len();
+            let more_count = suggestions.len().saturating_sub(window_end);
+            let selected_visible = selected.saturating_sub(window_start);
 
             for (i, (cmd, desc)) in limited.iter().enumerate() {
-                let is_selected = i == selected;
-                let row_style = if is_selected {
-                    Style::default().fg(rgb(232, 240, 254)).bg(rgb(45, 72, 112))
+                let is_selected = i == selected_visible;
+                let description_style = if is_selected {
+                    Style::default().fg(rgb(255, 213, 128))
                 } else {
                     Style::default().fg(dim_color())
                 };
                 let command_style = if is_selected {
-                    row_style.add_modifier(Modifier::BOLD)
+                    Style::default().fg(rgb(255, 213, 128))
                 } else {
                     Style::default().fg(rgb(128, 203, 196))
                 };
-                let mut spans = vec![Span::styled(
-                    if is_selected { "▸ " } else { "  " },
-                    row_style,
-                )];
+                let mut spans = Vec::new();
                 spans.push(Span::styled(cmd.to_string(), command_style));
-                spans.push(Span::styled(format!("  {}", desc), row_style));
+                spans.push(Span::styled(format!("  {}", desc), description_style));
+                if i == 0 && window_start > 0 {
+                    spans.push(Span::styled(
+                        format!("  ↑{}", window_start),
+                        Style::default().fg(dim_color()),
+                    ));
+                }
                 if i + 1 == limited.len() && more_count > 0 {
-                    spans.push(Span::styled(format!("  +{} more", more_count), row_style));
+                    spans.push(Span::styled(
+                        format!("  +{} more", more_count),
+                        Style::default().fg(dim_color()),
+                    ));
                 }
                 lines.push(Line::from(spans));
             }

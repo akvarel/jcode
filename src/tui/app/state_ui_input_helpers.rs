@@ -1031,6 +1031,41 @@ impl App {
         true
     }
 
+    fn arrow_modifiers_allow_command_suggestion_navigation(modifiers: KeyModifiers) -> bool {
+        !modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER,
+        )
+    }
+
+    pub(super) fn handle_command_suggestion_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        if self.command_suggestions().is_empty() {
+            return false;
+        }
+
+        match code {
+            KeyCode::Down
+                if Self::arrow_modifiers_allow_command_suggestion_navigation(modifiers) =>
+            {
+                self.move_command_suggestion_selection(1)
+            }
+            KeyCode::Up if Self::arrow_modifiers_allow_command_suggestion_navigation(modifiers) => {
+                self.move_command_suggestion_selection(-1)
+            }
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_command_suggestion_selection(1)
+            }
+            KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_command_suggestion_selection(-1)
+            }
+            KeyCode::Enter if modifiers.is_empty() => self.accept_selected_command_suggestion(),
+            _ => false,
+        }
+    }
+
     pub(super) fn accept_selected_command_suggestion(&mut self) -> bool {
         let suggestions = self.clamp_command_suggestion_selection();
         let Some((cmd, _)) = suggestions.get(self.command_suggestion_selected).cloned() else {

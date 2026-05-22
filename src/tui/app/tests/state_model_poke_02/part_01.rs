@@ -570,6 +570,180 @@ fn test_command_suggestion_arrow_and_ctrl_navigation_accepts_highlighted_row() {
 }
 
 #[test]
+fn test_command_suggestion_navigation_moves_through_all_rows_and_allows_shift_arrow_noise() {
+    let mut app = create_test_app();
+    app.input = "/".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestion_count = app.command_suggestions().len();
+    assert!(suggestion_count > crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT);
+
+    for expected in 1..=crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+        assert_eq!(app.command_suggestion_selected, expected);
+    }
+
+    app.handle_key(KeyCode::Down, KeyModifiers::SHIFT).unwrap();
+    assert_eq!(
+        app.command_suggestion_selected,
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT + 1
+    );
+    app.handle_key(KeyCode::Up, KeyModifiers::SHIFT).unwrap();
+    assert_eq!(
+        app.command_suggestion_selected,
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT
+    );
+
+    for _ in 0..suggestion_count {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+    }
+    assert_eq!(
+        app.command_suggestion_selected,
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT
+    );
+}
+
+fn command_cell_fg(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    command: &str,
+) -> Option<ratatui::style::Color> {
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let mut line = String::new();
+        for x in 0..buf.area.width {
+            line.push_str(buf[(x, y)].symbol());
+        }
+        if let Some(x) = line.find(command) {
+            return Some(buf[(x as u16, y)].fg);
+        }
+    }
+    None
+}
+
+#[test]
+fn test_command_suggestion_render_highlights_selected_row_by_color() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/con".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(suggestions.len() >= 2);
+    let first = suggestions[0].0.clone();
+    let second = suggestions[1].0.clone();
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+        .expect("failed to create test terminal");
+    render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        command_cell_fg(&terminal, &first),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+    assert_eq!(
+        command_cell_fg(&terminal, &second),
+        Some(crate::tui::color_support::rgb(128, 203, 196))
+    );
+
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        command_cell_fg(&terminal, &first),
+        Some(crate::tui::color_support::rgb(128, 203, 196))
+    );
+    assert_eq!(
+        command_cell_fg(&terminal, &second),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+}
+
+#[test]
+fn test_single_command_suggestion_uses_selected_color_only() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/review".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert_eq!(suggestions.len(), 1);
+    let command = suggestions[0].0.clone();
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+        .expect("failed to create test terminal");
+    render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        command_cell_fg(&terminal, &command),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+}
+
+#[test]
+fn test_command_suggestion_render_window_scrolls_with_selection() {
+    let _lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.input = "/".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    let limit = crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT;
+    assert!(suggestions.len() > limit);
+    let first = suggestions[0].0.clone();
+    let selected_after_scroll = suggestions[limit].0.clone();
+
+    for _ in 0..limit {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+    }
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+        .expect("failed to create test terminal");
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        !rendered.contains(&first),
+        "the first suggestion should scroll out of the visible window:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&selected_after_scroll),
+        "the newly selected suggestion should be visible:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("↑"),
+        "the scrolled window should indicate suggestions above:\n{rendered}"
+    );
+    assert_eq!(
+        command_cell_fg(&terminal, &selected_after_scroll),
+        Some(crate::tui::color_support::rgb(255, 213, 128))
+    );
+}
+
+#[test]
+fn test_remote_command_suggestion_arrow_and_ctrl_navigation_accepts_highlighted_row() {
+    let mut app = create_test_app();
+    app.input = "/con".to_string();
+    app.cursor_pos = app.input.len();
+    let suggestions = app.command_suggestions();
+    assert!(suggestions.len() >= 2);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    rt.block_on(app.handle_remote_key(KeyCode::Down, KeyModifiers::empty(), &mut remote))
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 1);
+    rt.block_on(app.handle_remote_key(KeyCode::Char('k'), KeyModifiers::CONTROL, &mut remote))
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 0);
+    rt.block_on(app.handle_remote_key(KeyCode::Char('j'), KeyModifiers::CONTROL, &mut remote))
+        .unwrap();
+    assert_eq!(app.command_suggestion_selected, 1);
+
+    let expected = suggestions[1].0.clone();
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .unwrap();
+    assert_eq!(app.input, expected);
+    assert_eq!(app.cursor_pos, app.input.len());
+}
+
+#[test]
 fn test_registered_command_suggestions_include_aliases_and_hide_secret_commands() {
     let app = create_test_app();
     let suggestions = app.get_suggestions_for("/");
