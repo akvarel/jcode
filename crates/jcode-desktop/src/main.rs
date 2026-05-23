@@ -4710,11 +4710,30 @@ impl DesktopRelaunch {
         }
 
         let mut args = desktop_args_without_resume(&self.args);
-        if let Some(session_id) = app.single_session_live_id() {
-            args.push(OsString::from("--resume"));
-            args.push(OsString::from(session_id));
+        match app {
+            DesktopApp::Workspace(_) => ensure_desktop_workspace_arg(&mut args),
+            DesktopApp::SingleSession(_) => {
+                if let Some(session_id) = app.single_session_live_id() {
+                    args.push(OsString::from("--resume"));
+                    args.push(OsString::from(session_id));
+                }
+            }
         }
         Self { binary, args }
+    }
+}
+
+fn ensure_desktop_workspace_arg(args: &mut Vec<OsString>) {
+    let has_mode_arg = args.iter().any(|arg| {
+        arg == "--workspace"
+            || arg == "--new"
+            || arg == "--resume"
+            || arg.to_str().is_some_and(|value| {
+                value.starts_with("--resume=") || value.starts_with("jcode://")
+            })
+    });
+    if !has_mode_arg {
+        args.push(OsString::from("--workspace"));
     }
 }
 

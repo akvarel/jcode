@@ -154,6 +154,27 @@ fn desktop_hot_reload_persists_workspace_focus_before_spawn() -> Result<()> {
 }
 
 #[test]
+fn desktop_hot_reload_restarts_default_launched_workspace_as_workspace() {
+    let relaunch = DesktopRelaunch {
+        binary: PathBuf::from("/old/jcode-desktop"),
+        args: Vec::new(),
+    };
+    let app = DesktopApp::Workspace(Workspace::from_session_cards(vec![workspace::SessionCard {
+        session_id: "session-visible".to_string(),
+        title: "visible session".to_string(),
+        subtitle: "active".to_string(),
+        detail: "already on screen".to_string(),
+        preview_lines: vec!["same content".to_string()],
+        detail_lines: vec![],
+    }]));
+
+    let updated = relaunch.for_app(&app, PathBuf::from("/new/jcode-desktop"));
+
+    assert_eq!(updated.binary, PathBuf::from("/new/jcode-desktop"));
+    assert_eq!(updated.args, vec![OsString::from("--workspace")]);
+}
+
+#[test]
 fn desktop_hot_reload_prefers_newer_selfdev_binary() -> Result<()> {
     let temp = unique_desktop_test_dir("desktop-hot-reload-candidate")?;
     let current = temp.join("installed").join(desktop_binary_name());
