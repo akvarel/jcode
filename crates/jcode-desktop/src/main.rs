@@ -5,6 +5,7 @@ mod desktop_config;
 mod desktop_gallery;
 mod desktop_log;
 mod desktop_prefs;
+mod desktop_protocol;
 mod desktop_rich_text;
 mod desktop_scene;
 mod desktop_session_events;
