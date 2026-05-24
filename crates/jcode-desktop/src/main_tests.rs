@@ -2696,7 +2696,7 @@ fn single_session_markdown_renderer_preserves_media_html_and_table_alignment() {
     assert!(body.contains("🖼 diagram ↗ https://example.com/diagram.png"));
     assert_eq!(
         style_for_text(&lines, "🖼 diagram ↗ https://example.com/diagram.png"),
-        Some(SingleSessionLineStyle::AssistantLink)
+        Some(SingleSessionLineStyle::AssistantMedia)
     );
     assert!(body.contains("html │ <div>raw</div>"));
     assert_eq!(
@@ -2837,7 +2837,7 @@ fn single_session_streaming_markdown_renders_before_done() {
 fn single_session_markdown_structure_uses_distinct_colors_and_cards() {
     let mut app = SingleSessionApp::new(None);
     app.messages.push(SingleSessionMessage::assistant(
-        "# Heading\n\n> quoted\n\n| a | b |\n| - | - |\n| c | d |",
+        "# Heading\n\n> quoted\n\n![diagram](https://example.com/diagram.png)\n\n| a | b |\n| - | - |\n| c | d |",
     ));
     let mut font_system = FontSystem::new();
 
@@ -2861,6 +2861,12 @@ fn single_session_markdown_structure_uses_distinct_colors_and_cards() {
             SingleSessionLineStyle::AssistantTable
         ))
     );
+    assert_eq!(
+        first_glyph_color_for_text(body, "🖼 diagram ↗ https://example.com/diagram.png"),
+        Some(single_session_line_color(
+            SingleSessionLineStyle::AssistantMedia
+        ))
+    );
 
     let vertices = build_single_session_vertices(&app, PhysicalSize::new(1200, 760), 0.0, 0);
     assert!(vertices_have_color(
@@ -2869,6 +2875,10 @@ fn single_session_markdown_structure_uses_distinct_colors_and_cards() {
     ));
     assert!(vertices_have_color(&vertices, QUOTE_CARD_BACKGROUND_COLOR));
     assert!(vertices_have_color(&vertices, TABLE_CARD_BACKGROUND_COLOR));
+    assert!(vertices_have_color(
+        &vertices,
+        MARKDOWN_MEDIA_BACKGROUND_COLOR
+    ));
 }
 
 #[test]
