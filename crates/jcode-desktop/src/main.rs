@@ -10671,6 +10671,42 @@ fn push_issue_browser_shell(
     if let Some(preview_rect) = layout.preview {
         push_issue_preview_panel(vertices, app, preview_rect, size);
     }
+    match app.side_panel().focus {
+        single_session::DesktopSidePanelFocus::IssueList => {
+            if let Some(rect) = layout.list {
+                push_rounded_rect_border(
+                    vertices,
+                    rect,
+                    ISSUE_BROWSER_PANEL_RADIUS,
+                    2.0,
+                    [0.090, 0.315, 0.900, 0.34],
+                    size,
+                );
+            }
+        }
+        single_session::DesktopSidePanelFocus::IssuePreview => {
+            if let Some(rect) = layout.preview {
+                push_rounded_rect_border(
+                    vertices,
+                    rect,
+                    ISSUE_BROWSER_PANEL_RADIUS,
+                    2.0,
+                    [0.090, 0.315, 0.900, 0.34],
+                    size,
+                );
+            }
+        }
+        single_session::DesktopSidePanelFocus::Chat => {
+            push_rounded_rect_border(
+                vertices,
+                layout.chat,
+                ISSUE_BROWSER_PANEL_RADIUS,
+                2.0,
+                [0.090, 0.315, 0.900, 0.20],
+                size,
+            );
+        }
+    }
 }
 
 fn issue_priority_color(priority: &str) -> [f32; 4] {
@@ -10770,12 +10806,12 @@ fn push_issue_list_panel(
             width: rect.width - 16.0,
             height: ISSUE_BROWSER_ROW_HEIGHT - 6.0,
         };
-        if index == browser.selected
+        if issue.state == single_session::GitHubIssueVisualState::Active {
+            push_rounded_rect(vertices, row, 8.0, ISSUE_BROWSER_ACTIVE_ROW, size);
+        } else if index == browser.selected
             || issue.state == single_session::GitHubIssueVisualState::Selected
         {
             push_rounded_rect(vertices, row, 8.0, ISSUE_BROWSER_SELECTED_ROW, size);
-        } else if issue.state == single_session::GitHubIssueVisualState::Active {
-            push_rounded_rect(vertices, row, 8.0, ISSUE_BROWSER_ACTIVE_ROW, size);
         }
         push_rounded_rect(
             vertices,

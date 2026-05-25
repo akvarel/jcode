@@ -288,6 +288,24 @@ impl Default for DesktopSidePanelState {
     }
 }
 
+impl DesktopSidePanelState {
+    fn focus_next(&mut self) {
+        self.focus = match self.focus {
+            DesktopSidePanelFocus::IssueList => DesktopSidePanelFocus::IssuePreview,
+            DesktopSidePanelFocus::IssuePreview => DesktopSidePanelFocus::Chat,
+            DesktopSidePanelFocus::Chat => DesktopSidePanelFocus::IssueList,
+        };
+    }
+
+    fn focus_previous(&mut self) {
+        self.focus = match self.focus {
+            DesktopSidePanelFocus::IssueList => DesktopSidePanelFocus::Chat,
+            DesktopSidePanelFocus::IssuePreview => DesktopSidePanelFocus::IssueList,
+            DesktopSidePanelFocus::Chat => DesktopSidePanelFocus::IssuePreview,
+        };
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DesktopSidePanelFocus {
     IssueList,
@@ -372,6 +390,108 @@ impl GitHubIssueBrowserState {
     pub(crate) fn selected_issue(&self) -> Option<&GitHubIssuePreview> {
         self.issues.get(self.selected)
     }
+
+    fn selected_issue_mut(&mut self) -> Option<&mut GitHubIssuePreview> {
+        self.issues.get_mut(self.selected)
+    }
+
+    fn select_first(&mut self) {
+        self.set_selected(0);
+    }
+
+    fn select_last(&mut self) {
+        self.set_selected(self.issues.len().saturating_sub(1));
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.issues.is_empty() {
+            self.selected = 0;
+            self.list_scroll = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        let selected = self.selected as i32 + delta;
+        self.set_selected(selected.clamp(0, self.issues.len().saturating_sub(1) as i32) as usize);
+    }
+
+    fn set_selected(&mut self, selected: usize) {
+        if self.issues.is_empty() {
+            self.selected = 0;
+            self.list_scroll = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        self.selected = selected.min(self.issues.len() - 1);
+        self.preview_scroll = 0;
+        let visible_rows = 6usize;
+        if self.selected < self.list_scroll {
+            self.list_scroll = self.selected;
+        } else if self.selected >= self.list_scroll.saturating_add(visible_rows) {
+            self.list_scroll = self.selected.saturating_sub(visible_rows - 1);
+        }
+        self.sync_visual_selection_state();
+    }
+
+    fn sync_visual_selection_state(&mut self) {
+        for (index, issue) in self.issues.iter_mut().enumerate() {
+            if issue.state != GitHubIssueVisualState::Active {
+                issue.state = if index == self.selected {
+                    GitHubIssueVisualState::Selected
+                } else {
+                    GitHubIssueVisualState::Idle
+                };
+            }
+        }
+    }
+
+    fn scroll_preview_lines(&mut self, lines: i32) {
+        let max_scroll = self
+            .selected_issue()
+            .map(|issue| issue.body_lines.len().saturating_sub(1))
+            .unwrap_or_default();
+        if lines > 0 {
+            self.preview_scroll = self.preview_scroll.saturating_sub(lines as usize);
+        } else if lines < 0 {
+            self.preview_scroll = self
+                .preview_scroll
+                .saturating_add(lines.unsigned_abs() as usize)
+                .min(max_scroll);
+        }
+    }
+
+    fn mark_selected_active(&mut self) {
+        for issue in &mut self.issues {
+            if issue.state == GitHubIssueVisualState::Active {
+                issue.state = GitHubIssueVisualState::Idle;
+            }
+        }
+        if let Some(issue) = self.selected_issue_mut() {
+            issue.state = GitHubIssueVisualState::Active;
+        }
+    }
+
+    pub(crate) fn selected_issue_context_prompt(&self) -> Option<String> {
+        let issue = self.selected_issue()?;
+        Some(issue_context_prompt(&self.repo, issue))
+    }
+}
+
+fn issue_context_prompt(repo: &str, issue: &GitHubIssuePreview) -> String {
+    let labels = if issue.labels.is_empty() {
+        "none".to_string()
+    } else {
+        issue.labels.join(", ")
+    };
+    let body = issue.body_lines.join("\n");
+    let comments = if issue.comment_lines.is_empty() {
+        "none".to_string()
+    } else {
+        issue.comment_lines.join("\n")
+    };
+    format!(
+        "GitHub issue context\n\nrepo: {repo}\nissue: #{}\ntitle: {}\npriority: {}\nlabels: {labels}\nage: {}\ncomments: {}\npriority rationale: {}\n\nIssue body:\n{body}\n\nRecent comments:\n{comments}\n\nTask: investigate this issue in the local repository. Reproduce it if possible, identify the root cause, propose or implement a fix, validate with targeted tests or checks, and report the result. Do not rely on the GitHub web UI while working unless explicitly needed.",
+        issue.number, issue.title, issue.priority, issue.age, issue.comments, issue.priority_reason
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1833,6 +1953,149 @@ impl SingleSessionApp {
         KeyOutcome::Redraw
     }
 
+    fn handle_issue_browser_key(&mut self, key: &KeyInput) -> Option<KeyOutcome> {
+        if !self.side_panel.visible {
+            return None;
+        }
+
+        if matches!(key, KeyInput::Autocomplete) && self.draft.is_empty() {
+            self.side_panel.focus_next();
+            return Some(KeyOutcome::Redraw);
+        }
+
+        match self.side_panel.focus {
+            DesktopSidePanelFocus::Chat => None,
+            DesktopSidePanelFocus::IssueList => Some(self.handle_issue_list_key(key)),
+            DesktopSidePanelFocus::IssuePreview => Some(self.handle_issue_preview_key(key)),
+        }
+    }
+
+    fn handle_issue_list_key(&mut self, key: &KeyInput) -> KeyOutcome {
+        match key {
+            KeyInput::Escape => {
+                self.side_panel.focus = DesktopSidePanelFocus::Chat;
+                KeyOutcome::Redraw
+            }
+            KeyInput::SubmitDraft => self.investigate_selected_issue(),
+            KeyInput::ModelPickerMove(delta) => {
+                self.side_panel.github_issues.move_selection(*delta);
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyPages(pages) => {
+                self.side_panel.github_issues.move_selection(-pages * 5);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "j" => {
+                self.side_panel.github_issues.move_selection(1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "k" => {
+                self.side_panel.github_issues.move_selection(-1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "g" => {
+                self.side_panel.github_issues.select_first();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "G" => {
+                self.side_panel.github_issues.select_last();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.side_panel.focus = DesktopSidePanelFocus::IssuePreview;
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.side_panel.focus_previous();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text.eq_ignore_ascii_case("q") => {
+                self.toggle_issue_browser(Some(false))
+            }
+            _ => KeyOutcome::None,
+        }
+    }
+
+    fn handle_issue_preview_key(&mut self, key: &KeyInput) -> KeyOutcome {
+        match key {
+            KeyInput::Escape => {
+                self.side_panel.focus = DesktopSidePanelFocus::Chat;
+                KeyOutcome::Redraw
+            }
+            KeyInput::SubmitDraft => self.investigate_selected_issue(),
+            KeyInput::ScrollBodyLines(lines) => {
+                self.side_panel.github_issues.scroll_preview_lines(*lines);
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyPages(pages) => {
+                self.side_panel
+                    .github_issues
+                    .scroll_preview_lines(*pages * 6);
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyToTop => {
+                self.side_panel.github_issues.preview_scroll = 0;
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyToBottom => {
+                self.side_panel
+                    .github_issues
+                    .scroll_preview_lines(i32::MIN + 1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "j" => {
+                self.side_panel.github_issues.scroll_preview_lines(-1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "k" => {
+                self.side_panel.github_issues.scroll_preview_lines(1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.side_panel.focus = DesktopSidePanelFocus::IssueList;
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.side_panel.focus = DesktopSidePanelFocus::Chat;
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text.eq_ignore_ascii_case("q") => {
+                self.toggle_issue_browser(Some(false))
+            }
+            KeyInput::ModelPickerMove(delta) => {
+                self.side_panel.github_issues.move_selection(*delta);
+                KeyOutcome::Redraw
+            }
+            _ => KeyOutcome::None,
+        }
+    }
+
+    fn investigate_selected_issue(&mut self) -> KeyOutcome {
+        let Some(message) = self
+            .side_panel
+            .github_issues
+            .selected_issue_context_prompt()
+        else {
+            return KeyOutcome::None;
+        };
+        self.side_panel.github_issues.mark_selected_active();
+        self.side_panel.focus = DesktopSidePanelFocus::Chat;
+        self.record_user_submit(&message, &[]);
+        if let Some(session) = &self.session {
+            KeyOutcome::SendDraft {
+                session_id: session.session_id.clone(),
+                title: session.title.clone(),
+                message,
+                images: Vec::new(),
+            }
+        } else {
+            KeyOutcome::StartFreshSession {
+                message,
+                images: Vec::new(),
+            }
+        }
+    }
+
     pub(crate) fn status_title(&self) -> String {
         format!("Jcode · {}", self.title())
     }
@@ -2213,6 +2476,10 @@ impl SingleSessionApp {
         if self.active_inline_widget() == Some(InlineWidgetKind::SlashSuggestions)
             && let Some(outcome) = self.handle_slash_suggestion_key(&key)
         {
+            return outcome;
+        }
+
+        if let Some(outcome) = self.handle_issue_browser_key(&key) {
             return outcome;
         }
 

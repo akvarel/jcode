@@ -2808,6 +2808,74 @@ fn single_session_issues_slash_toggles_local_issue_browser() {
 }
 
 #[test]
+fn single_session_issue_browser_navigates_focus_list_and_preview() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/issues".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+
+    assert_eq!(app.side_panel().focus, DesktopSidePanelFocus::IssueList);
+    assert_eq!(
+        app.handle_key(KeyInput::Character("j".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(app.side_panel().github_issues.selected, 1);
+    assert_eq!(
+        app.side_panel()
+            .github_issues
+            .selected_issue()
+            .unwrap()
+            .number,
+        337
+    );
+
+    assert_eq!(app.handle_key(KeyInput::Autocomplete), KeyOutcome::Redraw);
+    assert_eq!(app.side_panel().focus, DesktopSidePanelFocus::IssuePreview);
+    assert_eq!(
+        app.handle_key(KeyInput::Character("j".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(app.side_panel().github_issues.preview_scroll, 1);
+
+    assert_eq!(app.handle_key(KeyInput::Autocomplete), KeyOutcome::Redraw);
+    assert_eq!(app.side_panel().focus, DesktopSidePanelFocus::Chat);
+    assert_eq!(
+        app.handle_key(KeyInput::Character("hello".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(app.draft, "hello");
+}
+
+#[test]
+fn single_session_issue_browser_investigate_injects_context() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/issues".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    app.handle_key(KeyInput::Character("j".to_string()));
+
+    let outcome = app.handle_key(KeyInput::SubmitDraft);
+    let KeyOutcome::StartFreshSession { message, images } = outcome else {
+        panic!("expected issue investigation to start a fresh session, got {outcome:?}");
+    };
+    assert!(images.is_empty());
+    assert!(message.contains("GitHub issue context"));
+    assert!(message.contains("repo: 1jehuang/jcode"));
+    assert!(message.contains("issue: #337"));
+    assert!(message.contains("Task: investigate this issue"));
+    assert_eq!(app.side_panel().focus, DesktopSidePanelFocus::Chat);
+    assert_eq!(
+        app.side_panel()
+            .github_issues
+            .selected_issue()
+            .unwrap()
+            .state,
+        GitHubIssueVisualState::Active
+    );
+    assert!(app.is_processing);
+    assert!(app.draft.is_empty());
+    assert_eq!(app.messages.len(), 1);
+}
+
+#[test]
 fn issue_browser_layout_uses_three_panes_when_wide() {
     let mut app = SingleSessionApp::new(None);
     app.handle_key(KeyInput::Character("/issues".to_string()));
