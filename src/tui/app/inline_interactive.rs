@@ -1915,11 +1915,23 @@ impl App {
                     ) {
                         Ok(()) => {
                             self.invalidate_model_picker_cache();
+                            if let Some(ref mut picker) = self.inline_interactive_state {
+                                for entry in &mut picker.entries {
+                                    entry.is_default = false;
+                                }
+                                if let Some(entry) = picker.entries.get_mut(idx) {
+                                    entry.is_default = true;
+                                }
+                            }
+                            self.push_display_message(DisplayMessage::system(format!(
+                                "Saved default model: **{}** via **{}**. This affects future sessions.",
+                                model_spec,
+                                provider_key.as_deref().unwrap_or("auto")
+                            )));
                             self.set_status_notice(notice)
                         }
                         Err(e) => self.set_status_notice(format!("Failed to save default: {}", e)),
                     }
-                    self.inline_interactive_state = None;
                 }
             }
             KeyCode::Enter => {

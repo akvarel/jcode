@@ -67,7 +67,7 @@ fn route_provider_display(provider: &str, api_method: &str) -> String {
 }
 
 fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
-    let default_marker = if entry.is_default { " ⚙" } else { "" };
+    let default_marker = if entry.is_default { " default" } else { "" };
     let is_new = entry
         .options
         .iter()
@@ -495,7 +495,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         ));
         if picker.shows_default_shortcut_hint() {
             header_spans.push(Span::styled(
-                "  ^D=default",
+                "  Ctrl-D=set default",
                 Style::default().fg(rgb(60, 60, 80)).italic(),
             ));
         }
@@ -1066,6 +1066,22 @@ mod tests {
         entry.recommended = true;
 
         assert!(picker_entry_display_name(entry).contains("★"));
+    }
+
+    #[test]
+    fn picker_entry_display_name_labels_default_models_explicitly() {
+        let mut picker = sample_picker();
+        let entry = &mut picker.entries[0];
+        entry.is_default = true;
+
+        assert!(picker_entry_display_name(entry).contains(" default"));
+    }
+
+    #[test]
+    fn model_picker_shows_default_shortcut_hint() {
+        let picker = sample_picker();
+
+        assert!(picker.shows_default_shortcut_hint());
     }
 
     #[test]
