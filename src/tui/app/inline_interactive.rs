@@ -2365,7 +2365,9 @@ mod tests {
         RemoteModelCatalogCache, model_picker_route_is_current, model_picker_route_is_default,
         model_picker_route_is_recommended,
     };
-    use crate::tui::{InlineInteractiveState, PickerAction, PickerEntry, PickerKind, PickerOption};
+    use crate::tui::{
+        App, InlineInteractiveState, PickerAction, PickerEntry, PickerKind, PickerOption,
+    };
 
     fn picker_entry(name: &str, provider: &str, usage_score: u32) -> PickerEntry {
         PickerEntry {

@@ -714,6 +714,121 @@ fn test_handle_server_event_message_end_marks_stream_as_finalizing_without_stall
 }
 
 #[test]
+fn test_handle_server_event_tps_connection_phase_streaming_starts_collection_only_for_streaming() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ConnectionPhase {
+            phase: "waiting for response".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(!app.streaming_tps_collect_output);
+    assert!(app.streaming_tps_start.is_none());
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ConnectionPhase {
+            phase: "streaming".to_string(),
+        },
+        &mut remote,
+    );
+
+    assert!(app.streaming_tps_collect_output);
+    assert!(app.streaming_tps_start.is_some());
+    assert!(matches!(app.status, ProcessingStatus::Streaming));
+}
+
+#[test]
+fn test_handle_server_event_tps_message_end_counts_late_usage_without_timer_running() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ConnectionPhase {
+            phase: "streaming".to_string(),
+        },
+        &mut remote,
+    );
+    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(4));
+
+    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd, &mut remote);
+
+    assert!(app.streaming_tps_collect_output);
+    assert!(app.streaming_tps_start.is_none());
+    assert!(app.streaming_tps_elapsed >= Duration::from_secs(4));
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TokenUsage {
+            input: 100,
+            output: 20,
+            cache_read_input: None,
+            cache_creation_input: None,
+        },
+        &mut remote,
+    );
+
+    assert_eq!(app.streaming_total_output_tokens, 20);
+    assert_eq!(app.streaming_tps_observed_output_tokens, 20);
+    assert!(app.streaming_tps_observed_elapsed >= Duration::from_secs(4));
+    assert!(app.streaming_tps_start.is_none());
+}
+
+#[test]
+fn test_handle_server_event_tps_redundant_late_usage_after_message_end_does_not_double_count() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ConnectionPhase {
+            phase: "streaming".to_string(),
+        },
+        &mut remote,
+    );
+    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(5));
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TokenUsage {
+            input: 100,
+            output: 10,
+            cache_read_input: None,
+            cache_creation_input: None,
+        },
+        &mut remote,
+    );
+    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd, &mut remote);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TokenUsage {
+            input: 100,
+            output: 30,
+            cache_read_input: None,
+            cache_creation_input: None,
+        },
+        &mut remote,
+    );
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TokenUsage {
+            input: 100,
+            output: 30,
+            cache_read_input: None,
+            cache_creation_input: None,
+        },
+        &mut remote,
+    );
+
+    assert_eq!(app.streaming_total_output_tokens, 30);
+    assert_eq!(app.streaming_tps_observed_output_tokens, 30);
+    assert_eq!(*remote.call_output_tokens_seen(), 30);
+}
+
+#[test]
 fn test_handle_server_event_interrupted_clears_stream_state_and_sets_idle() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
