@@ -226,6 +226,43 @@ fn model_picker_route_is_default(
     default_model == model_name
 }
 
+fn append_simplified_anthropic_model_routes(
+    routes: &mut Vec<crate::provider::ModelRoute>,
+    model: String,
+    auth: &crate::auth::AuthStatus,
+) {
+    if auth.anthropic.has_oauth {
+        routes.push(crate::provider::ModelRoute {
+            model: model.clone(),
+            provider: "Anthropic".to_string(),
+            api_method: "claude-oauth".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        });
+    }
+    if auth.anthropic.has_api_key {
+        routes.push(crate::provider::ModelRoute {
+            model: model.clone(),
+            provider: "Anthropic".to_string(),
+            api_method: "api-key".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        });
+    }
+    if !auth.anthropic.has_oauth && !auth.anthropic.has_api_key {
+        routes.push(crate::provider::ModelRoute {
+            model,
+            provider: "Anthropic".to_string(),
+            api_method: "claude-oauth".to_string(),
+            available: false,
+            detail: "no credentials".to_string(),
+            cheapness: None,
+        });
+    }
+}
+
 impl App {
     pub(super) fn persist_remote_model_catalog_cache(&self) {
         if !self.is_remote || self.remote_model_options.is_empty() {
@@ -452,12 +489,10 @@ impl App {
                     )
                 } else {
                     match crate::provider::provider_for_model(&model) {
-                        Some("claude") => (
-                            "Anthropic".to_string(),
-                            "claude-oauth".to_string(),
-                            auth.anthropic.has_oauth || auth.anthropic.has_api_key,
-                            String::new(),
-                        ),
+                        Some("claude") => {
+                            append_simplified_anthropic_model_routes(&mut routes, model, &auth);
+                            continue;
+                        }
                         Some("openai") => unreachable!("OpenAI models are handled above"),
                         Some("gemini") => (
                             "Gemini".to_string(),
@@ -2703,9 +2738,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, model_picker_provider_labels_match, model_picker_route_is_current,
-        model_picker_route_is_default, model_picker_route_is_recommended,
+        App, append_simplified_anthropic_model_routes, model_picker_provider_labels_match,
+        model_picker_route_is_current, model_picker_route_is_default,
+        model_picker_route_is_recommended,
     };
+    use crate::auth::{AuthState, AuthStatus, ProviderAuth};
     use crate::tui::PickerOption;
 
     fn picker_option_with_method(provider: &str, api_method: &str) -> PickerOption {
@@ -2781,6 +2818,50 @@ mod tests {
                     crate::env::remove_var(key);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn simplified_anthropic_routes_preserve_oauth_vs_api_key_state_space() {
+        for (has_oauth, has_api_key, expected_methods) in [
+            (true, false, vec!["claude-oauth"]),
+            (false, true, vec!["api-key"]),
+            (true, true, vec!["claude-oauth", "api-key"]),
+            (false, false, vec!["claude-oauth"]),
+        ] {
+            let auth = AuthStatus {
+                anthropic: ProviderAuth {
+                    state: if has_oauth || has_api_key {
+                        AuthState::Available
+                    } else {
+                        AuthState::NotConfigured
+                    },
+                    has_oauth,
+                    has_api_key,
+                },
+                ..AuthStatus::default()
+            };
+            let mut routes = Vec::new();
+
+            append_simplified_anthropic_model_routes(
+                &mut routes,
+                "claude-opus-4-6".to_string(),
+                &auth,
+            );
+
+            let methods = routes
+                .iter()
+                .map(|route| route.api_method.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods, expected_methods,
+                "oauth={has_oauth} api={has_api_key}"
+            );
+            assert!(routes.iter().all(|route| route.provider == "Anthropic"));
+            assert_eq!(
+                routes.iter().all(|route| route.available),
+                has_oauth || has_api_key
+            );
         }
     }
 
