@@ -580,7 +580,7 @@ cargo check --all-targets -p jcode --features dev-bins --quiet
 
 The wrapper:
 
-- uses `sccache` automatically when available
+- uses `sccache` automatically when available **for non-incremental builds only**
 - prefers `lld` locally on Linux x86_64
 - uses the fast `selfdev` Cargo profile for self-dev build/reload workflows
 - can inject a named feature profile via `JCODE_DEV_FEATURE_PROFILE` unless explicit feature args are present
@@ -594,6 +594,35 @@ JCODE_FAST_LINKER=lld scripts/dev_cargo.sh build --release -p jcode --bin jcode
 JCODE_FAST_LINKER=mold scripts/dev_cargo.sh build --release -p jcode --bin jcode
 JCODE_FAST_LINKER=system scripts/dev_cargo.sh build --release -p jcode --bin jcode
 ```
+
+### sccache: non-incremental only
+
+`sccache` cannot cache incremental compilation units. All of jcode's common
+profiles (`selfdev`, `dev`, `release`, `test`) set `incremental = true`, so on
+the inner loop sccache produced a **0% hit rate** (measured across 272 real
+compilations and clean workspace/dep rebuilds) while still adding per-rustc
+wrapper overhead and a misleading "enabled" status.
+
+`dev_cargo.sh` now decides automatically:
+
+- **Incremental builds** (selfdev/dev/release/test, or `CARGO_INCREMENTAL=1`):
+  sccache is skipped (`sccache_status=skipped-incremental`), since it can never hit.
+- **Non-incremental builds** (`release-lto`, or `CARGO_INCREMENTAL=0`): sccache is
+  enabled, where it genuinely produces cache hits (CI, distribution builds).
+
+Overrides:
+
+```bash
+JCODE_SCCACHE=on   scripts/dev_cargo.sh build --profile selfdev ...   # force-enable
+JCODE_SCCACHE=off  scripts/dev_cargo.sh build --profile release-lto ... # force-disable
+CARGO_INCREMENTAL=0 scripts/dev_cargo.sh build --profile selfdev ...   # makes it cacheable
+```
+
+- 2026-05-29: made sccache incremental-aware. Validation on this machine:
+  `--print-setup` reports `skipped-incremental` for `--profile selfdev` and `enabled`
+  for `--profile release-lto`; `JCODE_SCCACHE=on` and `CARGO_INCREMENTAL=0` both
+  re-enable it for selfdev. A clean `jcode-azure-auth` rebuild under the old
+  always-on sccache showed `0/54` cache hits, confirming the prior wasted overhead.
 
 ### Remote build host fast-fail / fast-recovery
 
