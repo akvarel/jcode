@@ -2,10 +2,47 @@
 //! and the provider doctor. These are pure HTTP/JSON checks with no test-only
 //! dependencies, so they compile into the shipping binary.
 
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use serde::Deserialize;
 
-use crate::provider_catalog::OpenAiCompatibleProfile;
+use crate::provider_catalog::{OpenAiCompatibleProfile, ResolvedOpenAiCompatibleProfile};
+
+/// Apply the right auth headers for a resolved OpenAI-compatible profile.
+///
+/// Most providers use `Authorization: Bearer <key>`. Anthropic's
+/// OpenAI-compatible endpoints authenticate with `x-api-key` plus a required
+/// `anthropic-version` header and reject Bearer auth (401), so key off the
+/// resolved host.
+fn apply_provider_auth(
+    request: reqwest::RequestBuilder,
+    resolved: &ResolvedOpenAiCompatibleProfile,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    if resolved.api_base.to_ascii_lowercase().contains("api.anthropic.com") {
+        return request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+    request.bearer_auth(api_key)
+}
+
+/// Set an output-token cap on a chat-completions body using the parameter name
+/// the provider accepts. OpenAI's newer models (gpt-5.x) reject the legacy
+/// `max_tokens` and require `max_completion_tokens`; most OpenAI-compatible and
+/// Anthropic endpoints still take `max_tokens`. Keying off the resolved host
+/// keeps the live probes one round-trip without provider-specific retries.
+fn set_output_token_cap(
+    body: &mut serde_json::Value,
+    resolved: &ResolvedOpenAiCompatibleProfile,
+    cap: u32,
+) {
+    let key = if resolved.api_base.to_ascii_lowercase().contains("api.openai.com") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    body[key] = serde_json::json!(cap);
+}
 
 #[derive(Debug, Deserialize)]
 struct OpenAiCompatibleModelsResponse {
@@ -25,8 +62,8 @@ pub async fn fetch_live_openai_compatible_models(
     let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
     let url = format!("{}/models", resolved.api_base.trim_end_matches('/'));
     let request = crate::provider::shared_http_client()
-        .get(&url)
-        .bearer_auth(api_key);
+        .get(&url);
+    let request = apply_provider_auth(request, &resolved, api_key);
     let response = tokio::time::timeout(std::time::Duration::from_secs(20), request.send())
         .await
         .context("timed out fetching live model catalog")?
@@ -88,8 +125,8 @@ pub async fn run_live_openai_compatible_smoke(
     });
     let request = crate::provider::shared_http_client()
         .post(&url)
-        .bearer_auth(api_key)
         .json(&body);
+    let request = apply_provider_auth(request, &resolved, api_key);
     let response = tokio::time::timeout(std::time::Duration::from_secs(30), request.send())
         .await
         .context("timed out running live smoke completion")?
@@ -154,8 +191,8 @@ pub async fn run_live_openai_compatible_stream_smoke(
     });
     let request = crate::provider::shared_http_client()
         .post(&url)
-        .bearer_auth(api_key)
         .json(&body);
+    let request = apply_provider_auth(request, &resolved, api_key);
     let response = tokio::time::timeout(std::time::Duration::from_secs(45), request.send())
         .await
         .context("timed out running live stream smoke completion")?
@@ -259,16 +296,16 @@ pub async fn run_live_openai_compatible_tool_smoke(
                 }
             }
         ],
-        "stream": false,
-        "max_tokens": 256
+        "stream": false
     });
+    set_output_token_cap(&mut body, &resolved, 256);
     if !resolved.api_base.contains("fptcloud.com") {
         body["tool_choice"] = serde_json::json!("auto");
     }
     let request = crate::provider::shared_http_client()
         .post(&url)
-        .bearer_auth(api_key)
         .json(&body);
+    let request = apply_provider_auth(request, &resolved, api_key);
     let response = tokio::time::timeout(std::time::Duration::from_secs(45), request.send())
         .await
         .context("timed out running live tool-call smoke completion")?

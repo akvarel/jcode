@@ -534,6 +534,19 @@ pub(crate) use crate::auth::live_provider_probes::{
 mod tests {
     use super::*;
 
+    /// True when an OpenAI-compatible profile id is intentionally remapped onto a
+    /// native runtime (e.g. `anthropic-api` -> `claude-api`, `openai-api`) instead
+    /// of the generic `openai-compatible:<id>` route. Such profiles exist so
+    /// `provider-doctor` can drive the native Anthropic/OpenAI API-key surfaces,
+    /// but they fail the generic openai-compatible lifecycle contracts by design,
+    /// so the generic matrices skip them.
+    fn is_native_routed_compat_profile(
+        profile: &crate::provider_catalog::OpenAiCompatibleProfile,
+    ) -> bool {
+        crate::auth::lifecycle::normalized_auth_provider_id(Some(profile.id))
+            .is_some_and(|canonical| canonical != profile.id)
+    }
+
     fn env_truthy(key: &str) -> bool {
         std::env::var(key)
             .ok()
@@ -895,7 +908,11 @@ mod tests {
             AuthLifecycleAuthPath::ProcessEnvPreseeded,
         ];
 
-        for profile in crate::provider_catalog::openai_compatible_profiles() {
+        for profile in crate::provider_catalog::openai_compatible_profiles()
+            .iter()
+            .copied()
+            .filter(|profile| !is_native_routed_compat_profile(profile))
+        {
             for auth_path in auth_paths {
                 let driver = AuthLifecycleDriver::new().unwrap_or_else(|error| {
                     panic!(
@@ -903,7 +920,7 @@ mod tests {
                         profile.id, auth_path
                     )
                 });
-                let spec = AuthLifecycleSpec::openai_compatible_fixture(*profile, auth_path);
+                let spec = AuthLifecycleSpec::openai_compatible_fixture(profile, auth_path);
 
                 let result = driver
                     .run_openai_compatible_fixture(&spec)
@@ -930,7 +947,14 @@ mod tests {
 
     #[test]
     fn provider_switch_reauth_matrix_recovers_from_stale_previous_provider_state() {
-        let profiles = crate::provider_catalog::openai_compatible_profiles();
+        // Native-routed profiles (Anthropic/OpenAI API-key) deliberately use a
+        // native runtime route, not the generic `openai-compatible:<id>` one, so
+        // exclude them from this generic switch/reauth contract.
+        let profiles: Vec<_> = crate::provider_catalog::openai_compatible_profiles()
+            .iter()
+            .copied()
+            .filter(|profile| !is_native_routed_compat_profile(profile))
+            .collect();
         assert!(
             profiles.len() >= 2,
             "switch/reauth matrix needs at least two OpenAI-compatible providers"

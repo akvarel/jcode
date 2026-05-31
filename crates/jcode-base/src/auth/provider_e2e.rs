@@ -444,6 +444,54 @@ pub async fn run_provider_e2e(
     ))
 }
 
+/// The jcode-side wiring a given compat profile is expected to activate.
+///
+/// Most OpenAI-compatible profiles route through the generic
+/// `openai-compatible` runtime with a per-profile catalog namespace and an
+/// `openai-compatible:<id>` api_method. A few profile ids deliberately collide
+/// with native login providers (`anthropic-api`→Anthropic, `openai-api`→OpenAI)
+/// and jcode remaps them to their native runtimes. The doctor must assert the
+/// *native* wiring for those, not the generic compat contract, or the routing
+/// checkpoints fail even though the live API works.
+struct WiringContract {
+    /// The api_method string the live-catalog routes should carry.
+    api_method: String,
+    /// The provider display name to stamp on synthesized routes.
+    route_provider: String,
+    /// `expected_runtime` for the AuthChanged activation.
+    expected_runtime: &'static str,
+    /// `expected_catalog_namespace` for the AuthChanged activation, if any.
+    expected_namespace: Option<String>,
+    /// The `provider:` prefix a model-switch request must produce.
+    switch_prefix: String,
+}
+
+fn wiring_contract(profile: OpenAiCompatibleProfile) -> WiringContract {
+    match crate::auth::lifecycle::normalized_auth_provider_id(Some(profile.id)) {
+        Some("claude-api") => WiringContract {
+            api_method: "claude-api".to_string(),
+            route_provider: "Anthropic".to_string(),
+            expected_runtime: "claude-api",
+            expected_namespace: None,
+            switch_prefix: "claude-api:".to_string(),
+        },
+        Some("openai-api") => WiringContract {
+            api_method: "openai-api".to_string(),
+            route_provider: "OpenAI".to_string(),
+            expected_runtime: "openai-api",
+            expected_namespace: None,
+            switch_prefix: "openai-api:".to_string(),
+        },
+        _ => WiringContract {
+            api_method: format!("openai-compatible:{}", profile.id),
+            route_provider: profile.display_name.to_string(),
+            expected_runtime: "openai-compatible",
+            expected_namespace: Some(profile.id.to_string()),
+            switch_prefix: format!("{}:", profile.id),
+        },
+    }
+}
+
 fn run_wiring_checks(
     profile: OpenAiCompatibleProfile,
     selected: &str,
@@ -453,12 +501,13 @@ fn run_wiring_checks(
     // Build the live-catalog routes the same way the runtime does after auth,
     // then drive the production auth-activation + catalog-invariant logic. This
     // exercises jcode's real wiring without the test sandbox.
-    let api_method = format!("openai-compatible:{}", profile.id);
+    let contract = wiring_contract(profile);
+    let api_method = contract.api_method.clone();
     let catalog_routes: Vec<ModelRoute> = catalog_models
         .iter()
         .map(|model| ModelRoute {
             model: model.clone(),
-            provider: profile.display_name.to_string(),
+            provider: contract.route_provider.clone(),
             api_method: api_method.clone(),
             available: true,
             detail: "live-catalog route".to_string(),
@@ -470,8 +519,11 @@ fn run_wiring_checks(
         provider: crate::protocol::AuthProviderId::new(profile.id),
         credential_source: None,
         auth_method: None,
-        expected_runtime: Some(RuntimeProviderKey::new("openai-compatible")),
-        expected_catalog_namespace: Some(CatalogNamespace::new(profile.id)),
+        expected_runtime: Some(RuntimeProviderKey::new(contract.expected_runtime)),
+        expected_catalog_namespace: contract
+            .expected_namespace
+            .as_deref()
+            .map(CatalogNamespace::new),
     };
     let activation = activate_auth_change(&AuthActivationRequest::new(None, Some(auth)));
 
@@ -534,7 +586,7 @@ fn run_wiring_checks(
     // backed, never a static fallback.
     let matching_routes: Vec<&ModelRoute> = catalog_routes
         .iter()
-        .filter(|route| route.available && route.provider == profile.display_name)
+        .filter(|route| route.available && route.provider == contract.route_provider)
         .collect();
     let from_live_catalog = matching_routes
         .iter()
@@ -571,7 +623,7 @@ fn run_wiring_checks(
     match switch_target {
         Some(target) => {
             let request = activation.model_switch_request("mock-auth", target);
-            let request_ok = request.starts_with(&format!("{}:", profile.id));
+            let request_ok = request.starts_with(&contract.switch_prefix);
             if request_ok {
                 checks.push(DoctorCheck::passed(
                     checkpoints::MODEL_SWITCH_ROUTE,
@@ -583,8 +635,8 @@ fn run_wiring_checks(
                     checkpoints::MODEL_SWITCH_ROUTE,
                     label_for(checkpoints::MODEL_SWITCH_ROUTE),
                     format!(
-                        "model switch produced non-provider-explicit request `{request}` (expected `{}:`)",
-                        profile.id
+                        "model switch produced non-provider-explicit request `{request}` (expected `{}`)",
+                        contract.switch_prefix
                     ),
                 ));
             }
