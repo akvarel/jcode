@@ -166,6 +166,18 @@ const DESKTOP_SLASH_COMMANDS: &[(&str, &str)] = &[
         "compact context or set compaction mode",
     ),
     ("/rename <title|--clear>", "rename the current session"),
+    ("/usage", "desktop parity notice for TUI usage overlay"),
+    ("/todo", "desktop parity notice for TUI todo panel"),
+    ("/todos", "alias for /todo"),
+    ("/memory", "desktop parity notice for TUI memory panel"),
+    (
+        "/changelog",
+        "desktop parity notice for TUI changelog overlay",
+    ),
+    ("/diff", "desktop parity notice for TUI diff viewer"),
+    ("/account", "desktop parity notice for TUI account picker"),
+    ("/swarm", "desktop parity notice for TUI swarm panel"),
+    ("/bg", "desktop parity notice for TUI background task panel"),
     (
         "/copy [latest|code|transcript]",
         "copy latest response, latest code block, or transcript",
@@ -4931,6 +4943,78 @@ impl SingleSessionApp {
                 } else {
                     KeyOutcome::RenameSession(Some(args.to_string()))
                 }
+            }
+            "/usage" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                let usage = self.runtime_settings.token_usage.as_ref();
+                let message = usage
+                    .map(|usage| {
+                        format!(
+                            "desktop /usage overlay is not implemented yet · latest tokens: input={} output={}",
+                            usage.input, usage.output
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "desktop /usage overlay is not implemented yet · no token usage received for this session".to_string()
+                    });
+                self.set_status(SingleSessionStatus::Info(message));
+                KeyOutcome::Redraw
+            }
+            "/todo" | "/todos" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop todo panel is not implemented yet · todo tool output is shown in transcript".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/memory" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop memory panel is not implemented yet · memory server events are not surfaced".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/changelog" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop changelog overlay is not implemented yet".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/diff" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop diff viewer is not implemented yet".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/account" | "/auth" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop account picker is not implemented yet · use the TUI for account management".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/swarm" | "/bg" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(format!(
+                    "desktop {command} panel is not implemented yet · related tool output is shown in transcript"
+                )));
+                KeyOutcome::Redraw
             }
             "/copy" => {
                 self.draft.clear();
