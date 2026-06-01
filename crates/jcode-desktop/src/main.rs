@@ -4299,6 +4299,8 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
     let mut workspace_layout_ms = 0.0;
     let mut workspace_vertices_ms = 0.0;
     let mut workspace_visible_surfaces = 0usize;
+    let mut workspace_navigation_font_system = benchmark_font_system();
+    let mut workspace_navigation_text_pane_cache = HashMap::new();
     let (workspace_navigation_ms, workspace_navigation_checksum) =
         benchmark_phase(frames, |frame| {
             let key = if frame % 2 == 0 { "l" } else { "h" };
@@ -4306,12 +4308,40 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
             let phase_started = Instant::now();
             let layout = workspace_render_layout(&workspace_app, size, Some(size));
             workspace_layout_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
+            let panes = build_workspace_single_session_text_panes(
+                &mut workspace_navigation_text_pane_cache,
+                &workspace_app,
+                size,
+                layout,
+                None,
+                &mut workspace_navigation_font_system,
+            );
+            let pane_count = panes.len();
+            drop(panes);
             let phase_started = Instant::now();
-            let vertices = build_vertices(&workspace_app, size, layout, 0.0, None);
+            let mut vertices = Vec::with_capacity(workspace_vertex_capacity_hint(&workspace_app));
+            build_vertices_into(
+                WorkspaceVertexBuildParams {
+                    workspace: &workspace_app,
+                    size,
+                    render_layout: layout,
+                    focus_pulse: 0.0,
+                    space_hold_progress: None,
+                    surface_frames: None,
+                    exiting_surfaces: &HashMap::new(),
+                    workspace_panel_cache: Some(&workspace_navigation_text_pane_cache),
+                    status_color: workspace_status_bar_target_color(&workspace_app),
+                    status_text_frame: None,
+                },
+                &mut vertices,
+            );
             workspace_vertices_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
             workspace_visible_surfaces +=
                 workspace_visible_surface_count(&workspace_app, size, layout);
-            vertices.len() ^ (workspace_app.focused_id as usize) ^ workspace_app.surfaces.len()
+            vertices.len()
+                ^ pane_count
+                ^ (workspace_app.focused_id as usize)
+                ^ workspace_app.surfaces.len()
         });
 
     let mut workspace_full_app =
@@ -11486,32 +11516,6 @@ fn nearest_hero_stroke_progress(
     (best_progress, best_distance_sq.sqrt())
 }
 
-fn build_vertices(
-    workspace: &Workspace,
-    size: PhysicalSize<u32>,
-    render_layout: WorkspaceRenderLayout,
-    focus_pulse: f32,
-    space_hold_progress: Option<f32>,
-) -> Vec<Vertex> {
-    let mut vertices = Vec::with_capacity(workspace_vertex_capacity_hint(workspace));
-    build_vertices_into(
-        WorkspaceVertexBuildParams {
-            workspace,
-            size,
-            render_layout,
-            focus_pulse,
-            space_hold_progress,
-            surface_frames: None,
-            exiting_surfaces: &HashMap::new(),
-            workspace_panel_cache: None,
-            status_color: workspace_status_bar_target_color(workspace),
-            status_text_frame: None,
-        },
-        &mut vertices,
-    );
-    vertices
-}
-
 fn reserve_workspace_vertex_capacity(vertices: &mut Vec<Vertex>, workspace: &Workspace) {
     let hint = workspace_vertex_capacity_hint(workspace);
     if vertices.capacity() < hint {
@@ -11874,7 +11878,7 @@ fn build_workspace_single_session_text_panes<'a>(
     if workspace.zoomed {
         if let Some(surface) = workspace.focused_surface()
             && surface.kind == workspace::SurfaceKind::Session
-            && let Some(app) = workspace_single_session_app_for_surface(workspace, surface)
+            && surface.session_id.is_some()
         {
             let target_rect = Rect {
                 x: OUTER_PADDING,
@@ -11884,16 +11888,17 @@ fn build_workspace_single_session_text_panes<'a>(
             };
             let rect = workspace_transitioned_surface_rect(surface_frames, surface.id, target_rect);
             let panel_size = workspace_panel_size(rect);
-            visible_surface_ids.push(surface.id);
-            refresh_workspace_text_pane_cache_entry(
+            if refresh_workspace_text_pane_cache_entry(
                 cache,
                 surface.id,
                 workspace_surface_text_pane_identity_key(workspace, surface, panel_size),
-                app,
                 rect,
                 panel_size,
                 font_system,
-            );
+                || workspace_single_session_app_for_surface(workspace, surface),
+            ) {
+                visible_surface_ids.push(surface.id);
+            }
         }
         retain_workspace_text_pane_cache_for_workspace(cache, workspace);
         return workspace_text_panes_from_cache(cache, &visible_surface_ids);
@@ -11908,21 +11913,22 @@ fn build_workspace_single_session_text_panes<'a>(
             if surface.kind != workspace::SurfaceKind::Session {
                 return;
             }
-            let Some(app) = workspace_single_session_app_for_surface(workspace, surface) else {
+            if surface.session_id.is_none() {
                 return;
-            };
+            }
             let rect = workspace_transitioned_surface_rect(surface_frames, surface.id, target_rect);
             let panel_size = workspace_panel_size(rect);
-            visible_surface_ids.push(surface.id);
-            refresh_workspace_text_pane_cache_entry(
+            if refresh_workspace_text_pane_cache_entry(
                 cache,
                 surface.id,
                 workspace_surface_text_pane_identity_key(workspace, surface, panel_size),
-                app,
                 rect,
                 panel_size,
                 font_system,
-            );
+                || workspace_single_session_app_for_surface(workspace, surface),
+            ) {
+                visible_surface_ids.push(surface.id);
+            }
         },
     );
 
@@ -11985,19 +11991,22 @@ fn refresh_workspace_text_pane_cache_entry(
     cache: &mut HashMap<u64, CachedWorkspaceSingleSessionTextPane>,
     surface_id: u64,
     identity_key: u64,
-    app: SingleSessionApp,
     rect: Rect,
     panel_size: PhysicalSize<u32>,
     font_system: &mut FontSystem,
-) {
+    build_app: impl FnOnce() -> Option<SingleSessionApp>,
+) -> bool {
     if let Some(entry) = cache.get_mut(&surface_id)
         && entry.identity_key == identity_key
     {
-        entry.app = app;
         entry.rect = rect;
         entry.size = panel_size;
-        return;
+        return true;
     }
+
+    let Some(app) = build_app() else {
+        return false;
+    };
 
     let rendered_body_lines = single_session_rendered_body_lines_for_tick(&app, panel_size, 0);
     let key = single_session_text_key_for_tick_with_rendered_body(
@@ -12014,7 +12023,7 @@ fn refresh_workspace_text_pane_cache_entry(
         entry.app = app;
         entry.rect = rect;
         entry.size = panel_size;
-        return;
+        return true;
     }
 
     let child_vertices = build_single_session_vertices_with_cached_body(
@@ -12040,6 +12049,7 @@ fn refresh_workspace_text_pane_cache_entry(
             child_vertices,
         },
     );
+    true
 }
 
 fn workspace_text_panes_from_cache<'a>(
@@ -12192,17 +12202,31 @@ fn build_vertices_into(params: WorkspaceVertexBuildParams<'_>, vertices: &mut Ve
             let rect = workspace_transitioned_surface_rect(surface_frames, surface.id, target_rect);
             let opacity = workspace_transitioned_surface_opacity(surface_frames, surface.id);
             let start_index = vertices.len();
-            if surface.kind == workspace::SurfaceKind::Session
-                && let Some(app) = workspace_single_session_app_for_surface(workspace, surface)
-            {
-                push_workspace_single_session_panel(
-                    vertices,
-                    &app,
-                    rect,
-                    size,
-                    focus_pulse,
-                    opacity,
-                );
+            if surface.kind == workspace::SurfaceKind::Session {
+                if focus_pulse <= 0.001
+                    && let Some(entry) =
+                        workspace_panel_cache.and_then(|cache| cache.get(&surface.id))
+                {
+                    append_child_vertices_to_parent_with_opacity(
+                        vertices,
+                        &entry.child_vertices,
+                        entry.size,
+                        rect,
+                        size,
+                        opacity,
+                    );
+                } else if let Some(app) =
+                    workspace_single_session_app_for_surface(workspace, surface)
+                {
+                    push_workspace_single_session_panel(
+                        vertices,
+                        &app,
+                        rect,
+                        size,
+                        focus_pulse,
+                        opacity,
+                    );
+                }
             } else {
                 push_surface(vertices, rect, surface.color_index, true, focus_pulse, size);
                 let draft = focused_panel_draft(workspace, surface.id);
