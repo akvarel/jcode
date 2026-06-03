@@ -1,10 +1,10 @@
 //! Shared formatting for streamed reasoning/thinking content.
 //!
 //! Reasoning is rendered as a self-contained markdown blockquote so it shows up
-//! with a dim `│ ` gutter, an italic `Thinking…` header, and a `Thought for Xs`
-//! footer, instead of an emoji prefix that scatters when reasoning and output
-//! interleave. The formatter is stateful across streamed deltas so that every
-//! line (including the header and footer) stays inside one quote block.
+//! with a dim `│ ` gutter and a dim/italic body, plus a `Thought for Xs` footer,
+//! instead of an emoji prefix that scatters when reasoning and output interleave.
+//! The formatter is stateful across streamed deltas so that every line (including
+//! the footer) stays inside one quote block.
 //!
 //! This is used by the server streaming paths (mpsc/broadcast) so that remote
 //! clients receive ready-to-render markdown. The local TUI turn loop has an
@@ -31,8 +31,8 @@ impl ReasoningStreamFormatter {
         self.open
     }
 
-    /// Format a reasoning delta, opening the blockquote (with header) on first use.
-    /// Returns the markdown text to emit, or an empty string for empty input.
+    /// Format a reasoning delta, opening the blockquote on first use. Returns the
+    /// markdown text to emit, or an empty string for empty input.
     pub fn push_delta(&mut self, text: &str) -> String {
         if text.is_empty() {
             return String::new();
@@ -40,7 +40,6 @@ impl ReasoningStreamFormatter {
         let mut out = String::new();
         if !self.open {
             self.open = true;
-            out.push_str("> *Thinking…*\n");
             self.at_line_start = true;
         }
         for ch in text.chars() {
@@ -86,11 +85,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wraps_lines_in_blockquote_with_header() {
+    fn wraps_lines_in_blockquote_without_header() {
         let mut f = ReasoningStreamFormatter::new();
         let mut s = f.push_delta("alpha\nbeta");
         s.push_str(&f.finish(Some("*Thought for 1.5s*")));
-        assert!(s.contains("> *Thinking…*"));
+        assert!(!s.contains("Thinking"), "no header expected: {s:?}");
         assert!(s.contains("> alpha"));
         assert!(s.contains("> beta"));
         assert!(s.contains("> *Thought for 1.5s*"));
@@ -98,11 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn header_only_emitted_once_across_deltas() {
+    fn no_header_and_continuation_stays_on_one_line() {
         let mut f = ReasoningStreamFormatter::new();
         let mut s = f.push_delta("one ");
         s.push_str(&f.push_delta("two"));
-        assert_eq!(s.matches("*Thinking…*").count(), 1);
+        assert!(!s.contains("Thinking"), "no header expected: {s:?}");
         // Mid-line continuation must not inject a stray gutter.
         assert!(s.contains("> one two"));
     }
