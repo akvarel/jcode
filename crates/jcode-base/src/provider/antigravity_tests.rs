@@ -28,6 +28,11 @@ fn parse_fetch_available_models_response_discovers_metadata_and_priority_order()
     .expect("parse response");
 
     let parsed = parse_fetch_available_models_response(&response);
+    assert_eq!(
+        parsed.default_model_id.as_deref(),
+        Some("gemini-3.1-pro-high")
+    );
+    let parsed = parsed.models;
     assert_eq!(parsed[0].id, "claude-opus-4-6-thinking");
     assert_eq!(parsed[1].id, "gemini-3.1-pro-high");
     assert_eq!(parsed[2].id, "gpt-oss-120b-medium");
@@ -114,6 +119,7 @@ fn available_models_display_seeds_from_persisted_catalog() {
                 remaining_fraction_milli: Some(1000),
             }],
             fetched_at_rfc3339: Utc::now().to_rfc3339(),
+            default_model_id: Some("gemini-3-flash".to_string()),
         },
     )
     .expect("write persisted catalog");
@@ -123,6 +129,10 @@ fn available_models_display_seeds_from_persisted_catalog() {
         provider
             .available_models_display()
             .contains(&"claude-opus-4-6-thinking".to_string())
+    );
+    assert_eq!(
+        provider.backend_default_model().as_deref(),
+        Some("gemini-3-flash")
     );
 
     if let Some(previous) = previous {
@@ -155,6 +165,114 @@ fn catalog_detail_mentions_quota_and_reset() {
 #[test]
 fn catalog_stale_handles_invalid_timestamp() {
     assert!(catalog_is_stale("not-a-time"));
+}
+
+#[test]
+fn resolve_model_for_request_maps_default_alias_to_real_model() {
+    let provider = AntigravityProvider::new();
+
+    // With no backend default and no catalog, the alias resolves to the
+    // hardcoded fallback rather than the literal "default" (which 404s).
+    *provider
+        .backend_default_model
+        .write()
+        .expect("default lock") = None;
+    *provider.fetched_catalog.write().expect("catalog lock") = Vec::new();
+    assert_eq!(
+        provider.resolve_model_for_request("default"),
+        DEFAULT_FALLBACK_MODEL
+    );
+    assert_eq!(
+        provider.resolve_model_for_request("  "),
+        DEFAULT_FALLBACK_MODEL
+    );
+
+    // A backend-advertised default takes precedence over the fallback.
+    *provider
+        .backend_default_model
+        .write()
+        .expect("default lock") = Some("gemini-3.5-flash-low".to_string());
+    assert_eq!(
+        provider.resolve_model_for_request("default"),
+        "gemini-3.5-flash-low"
+    );
+
+    // Explicit model ids are always passed through untouched.
+    assert_eq!(
+        provider.resolve_model_for_request("claude-sonnet-4-6"),
+        "claude-sonnet-4-6"
+    );
+}
+
+#[test]
+fn resolve_model_for_request_default_prefers_gemini_catalog_model() {
+    let provider = AntigravityProvider::new();
+    *provider
+        .backend_default_model
+        .write()
+        .expect("default lock") = None;
+    *provider.fetched_catalog.write().expect("catalog lock") = vec![
+        CatalogModel {
+            id: "claude-opus-4-6-thinking".to_string(),
+            display_name: None,
+            reset_time: None,
+            tag_title: None,
+            model_provider: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            recommended: true,
+            available: true,
+            remaining_fraction_milli: Some(1000),
+        },
+        CatalogModel {
+            id: "gemini-3-flash".to_string(),
+            display_name: None,
+            reset_time: None,
+            tag_title: None,
+            model_provider: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            recommended: false,
+            available: true,
+            remaining_fraction_milli: Some(1000),
+        },
+    ];
+
+    // Even though Claude is listed first (and recommended), the default alias
+    // resolves to the Gemini model, which works reliably with tool use on the
+    // Cloud Code backend. Claude on this backend rejects jcode's tool schemas.
+    assert_eq!(
+        provider.resolve_model_for_request("default"),
+        "gemini-3-flash"
+    );
+}
+
+#[test]
+fn resolve_model_for_request_default_falls_back_to_any_catalog_model_without_gemini() {
+    let provider = AntigravityProvider::new();
+    *provider
+        .backend_default_model
+        .write()
+        .expect("default lock") = None;
+    *provider.fetched_catalog.write().expect("catalog lock") = vec![CatalogModel {
+        id: "claude-opus-4-6-thinking".to_string(),
+        display_name: None,
+        reset_time: None,
+        tag_title: None,
+        model_provider: None,
+        max_tokens: None,
+        max_output_tokens: None,
+        recommended: true,
+        available: true,
+        remaining_fraction_milli: Some(1000),
+    }];
+
+    // With no Gemini model available, fall back to the first available catalog
+    // model rather than the hardcoded default.
+    assert_eq!(
+        provider.resolve_model_for_request("default"),
+        "claude-opus-4-6-thinking"
+    );
 }
 
 #[tokio::test]
