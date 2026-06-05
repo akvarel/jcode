@@ -345,7 +345,7 @@ pub async fn run_provider_e2e(
                 checks.push(DoctorCheck::failed(
                     checkpoints::MODEL_CATALOG_LIVE_ENDPOINT,
                     label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
                 return Ok(finish_report(
                     provider_id,
@@ -635,7 +635,7 @@ pub async fn run_claude_native_e2e(
                 checks.push(DoctorCheck::failed(
                     checkpoints::MODEL_CATALOG_LIVE_ENDPOINT,
                     label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
                 return Ok(finish_report(
                     provider_id,
@@ -771,7 +771,7 @@ async fn run_native_claude_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::NON_STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::NON_STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -788,7 +788,7 @@ async fn run_native_claude_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -819,7 +819,7 @@ async fn run_native_claude_api_checks(
                 checks.push(DoctorCheck::failed(
                     checkpoint,
                     label_for(checkpoint),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
             }
         }
@@ -992,7 +992,7 @@ pub async fn run_antigravity_native_e2e(
                 checks.push(DoctorCheck::failed(
                     checkpoints::MODEL_CATALOG_LIVE_ENDPOINT,
                     label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
                 return Ok(finish_report(
                     provider_id,
@@ -1114,7 +1114,7 @@ async fn run_native_antigravity_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::NON_STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::NON_STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -1131,7 +1131,7 @@ async fn run_native_antigravity_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -1162,7 +1162,7 @@ async fn run_native_antigravity_api_checks(
                 checks.push(DoctorCheck::failed(
                     checkpoint,
                     label_for(checkpoint),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
             }
         }
@@ -1614,7 +1614,7 @@ pub async fn run_generic_native_e2e(
                 checks.push(DoctorCheck::failed(
                     checkpoints::MODEL_CATALOG_LIVE_ENDPOINT,
                     label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
                 return Ok(finish_report(
                     provider_id,
@@ -1748,7 +1748,7 @@ async fn run_generic_native_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::NON_STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::NON_STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -1765,7 +1765,7 @@ async fn run_generic_native_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -1796,7 +1796,7 @@ async fn run_generic_native_api_checks(
                 checks.push(DoctorCheck::failed(
                     checkpoint,
                     label_for(checkpoint),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
             }
         }
@@ -2046,7 +2046,7 @@ async fn run_full_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::NON_STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::NON_STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -2063,7 +2063,7 @@ async fn run_full_api_checks(
         Err(error) => checks.push(DoctorCheck::failed(
             checkpoints::STREAMING_CHAT_COMPLETION,
             label_for(checkpoints::STREAMING_CHAT_COMPLETION),
-            error.to_string(),
+            format_error_chain(&error),
         )),
     }
 
@@ -2094,7 +2094,7 @@ async fn run_full_api_checks(
                 checks.push(DoctorCheck::failed(
                     checkpoint,
                     label_for(checkpoint),
-                    error.to_string(),
+                    format_error_chain(&error),
                 ));
             }
         }
@@ -2235,9 +2235,105 @@ fn truncate_list(models: &[String]) -> String {
     out
 }
 
+/// Render an `anyhow::Error` as its full cause chain (`outer: cause: root`).
+///
+/// The doctor wraps probe failures with high-level context (e.g. "open native
+/// provider stream"), so `format_error_chain(&error)` alone shows only that outer label
+/// and hides the actionable root cause (the live HTTP/JSON error). Joining the
+/// chain surfaces the real reason a checkpoint failed in the report and ledger.
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        // Skip empty or exact-duplicate adjacent frames so the chain stays tight.
+        if message.trim().is_empty() {
+            continue;
+        }
+        if parts.last().map(String::as_str) == Some(message.as_str()) {
+            continue;
+        }
+        parts.push(message);
+    }
+    if parts.is_empty() {
+        error.to_string()
+    } else {
+        parts.join(": ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_error_chain_joins_context_with_root_cause() {
+        use anyhow::Context as _;
+        let root: anyhow::Result<()> = Err(anyhow::anyhow!("HTTP 429 usage_limit_reached"));
+        let wrapped = root
+            .context("native provider stream event error")
+            .context("open native provider stream")
+            .unwrap_err();
+        let rendered = format_error_chain(&wrapped);
+        // Outer-most context first, root cause last, all joined.
+        assert_eq!(
+            rendered,
+            "open native provider stream: native provider stream event error: HTTP 429 usage_limit_reached"
+        );
+    }
+
+    #[test]
+    fn format_error_chain_dedupes_and_handles_single_error() {
+        let single = anyhow::anyhow!("standalone failure");
+        assert_eq!(format_error_chain(&single), "standalone failure");
+    }
+
+    #[test]
+    fn native_provider_kind_maps_every_generic_id() {
+        for (id, expected) in [
+            ("openai", NativeProviderKind::OpenAi),
+            ("gemini", NativeProviderKind::Gemini),
+            ("cursor", NativeProviderKind::Cursor),
+            ("copilot", NativeProviderKind::Copilot),
+            ("bedrock", NativeProviderKind::Bedrock),
+            ("jcode", NativeProviderKind::Jcode),
+            ("azure-openai", NativeProviderKind::Azure),
+        ] {
+            assert_eq!(NativeProviderKind::from_normalized(id), Some(expected));
+        }
+        // Native providers with bespoke drivers are intentionally not generic.
+        assert_eq!(NativeProviderKind::from_normalized("claude"), None);
+        assert_eq!(NativeProviderKind::from_normalized("antigravity"), None);
+        assert_eq!(NativeProviderKind::from_normalized("openrouter"), None);
+    }
+
+    #[test]
+    fn native_provider_specs_are_self_consistent() {
+        // Every generic kind's spec must carry a switch_prefix that the wiring
+        // contract's api_method-derived routes will satisfy, and a stable id.
+        for kind in [
+            NativeProviderKind::OpenAi,
+            NativeProviderKind::Gemini,
+            NativeProviderKind::Cursor,
+            NativeProviderKind::Copilot,
+            NativeProviderKind::Bedrock,
+            NativeProviderKind::Jcode,
+            NativeProviderKind::Azure,
+        ] {
+            let spec = kind.spec();
+            assert!(!spec.provider_id.is_empty(), "{kind:?} has empty id");
+            assert!(!spec.label.is_empty(), "{kind:?} has empty label");
+            assert!(
+                spec.contract.switch_prefix.ends_with(':'),
+                "{kind:?} switch_prefix must end with ':'"
+            );
+            // Round-trips through the id map.
+            assert_eq!(
+                NativeProviderKind::from_normalized(spec.provider_id),
+                Some(kind),
+                "{kind:?} id does not round-trip"
+            );
+        }
+    }
 
     #[test]
     fn spend_accumulates_openai_style_usage_and_cost() {
