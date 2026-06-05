@@ -1407,7 +1407,6 @@ pub async fn run_live_native_provider_tool_smoke(
     history.push(tool_result_then_text(
         &tool_call.id,
         "TOOL_RESULT_TOKEN=42. Report this token back to confirm you read it.",
-        None,
     ));
 
     let second = consume_native_stream(
@@ -1429,56 +1428,62 @@ pub async fn run_live_native_provider_tool_smoke(
         crate::util::truncate_str(second.text.trim(), 200)
     );
 
-    // Phase 2 (best-effort): drive a second tool call so the replayed history
-    // carries *two* function calls, then assert the backend accepts the
-    // multi-call transcript (the only shape that reproduces the
-    // "missing a thought_signature ... position N" 400).
+    // Phase 2 (best-effort): drive an agentic loop that requires reading TWO
+    // files so the model emits a *sequence* of tool calls. Each call is replayed
+    // (carrying its captured signature) and answered with a synthetic result, so
+    // by the final turn the request we send carries two assistant `functionCall`
+    // blocks. That multi-call history is the only shape that reproduces the
+    // Antigravity/Cloud Code `400 ... "Function call is missing a
+    // thought_signature ... position N"`: a backend that validates *every*
+    // signature rejects the request here if an earlier one was dropped, so the
+    // `consume_native_stream` below surfaces the regression. If the model never
+    // makes a second tool call (common for providers that emit no signatures at
+    // all), the phase records `multi_tool_replay: "skipped"` rather than failing.
     let mut total_input = first.input_tokens + second.input_tokens;
     let mut total_output = first.output_tokens + second.output_tokens;
     let mut multi_tool_replay = "skipped";
-    let mut signatures_present = vec![tool_call.thought_signature.is_some()];
+    let mut signatures_present: Vec<bool> = Vec::new();
 
-    // Ask for a *second* distinct read so the model emits another tool call.
-    let mut second_request = first_turn.clone();
-    second_request.push(assistant_tool_use(&tool_call, &parsed_arguments));
-    second_request.push(tool_result_then_text(
-        &tool_call.id,
+    let mut convo = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "Read two files using the read tool, one tool call at a time: first read \
+                   /tmp/auth_tool_probe.txt, then read /tmp/auth_tool_probe_2.txt. After both \
+                   reads, reply with the single word DONE. Call the tool now; do not answer \
+                   in text first."
+                .to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let synthetic_results = [
         "Contents of /tmp/auth_tool_probe.txt: alpha.",
-        Some(
-            "Now read the file at /tmp/auth_tool_probe_2.txt using the read tool. \
-             Call the tool now; do not answer in text.",
-        ),
-    ));
+        "Contents of /tmp/auth_tool_probe_2.txt: bravo.",
+    ];
+    // Cap the loop so a model that keeps calling tools cannot run forever.
+    const MAX_TOOL_ROUNDS: usize = 4;
+    let mut tool_round = 0usize;
 
-    let third = consume_native_stream(
-        provider,
-        &second_request,
-        &tools,
-        system,
-        std::time::Duration::from_secs(120),
-    )
-    .await?;
-    total_input += third.input_tokens;
-    total_output += third.output_tokens;
+    loop {
+        // Number of assistant function calls already in the history we are about
+        // to replay. Once this reaches two, a successful response proves the
+        // backend accepted a multi-`functionCall` transcript with every
+        // signature intact.
+        let prior_calls = convo
+            .iter()
+            .filter(|message| {
+                matches!(message.role, Role::Assistant)
+                    && message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            })
+            .count();
 
-    if let Some(second_call) = third.tool_calls.first().cloned() {
-        let second_arguments = parse_tool_arguments(&second_call.input_json);
-        signatures_present.push(second_call.thought_signature.is_some());
-
-        // Final request: history now contains BOTH tool_use blocks, each
-        // carrying its own captured signature. A dropped earlier signature is
-        // rejected here with the position-N 400.
-        let mut final_request = second_request.clone();
-        final_request.push(assistant_tool_use(&second_call, &second_arguments));
-        final_request.push(tool_result_then_text(
-            &second_call.id,
-            "TOOL_RESULT_TOKEN=77. Report this token back to confirm you read it.",
-            None,
-        ));
-
-        let fourth = consume_native_stream(
+        let turn = consume_native_stream(
             provider,
-            &final_request,
+            &convo,
             &tools,
             system,
             std::time::Duration::from_secs(120),
@@ -1486,25 +1491,34 @@ pub async fn run_live_native_provider_tool_smoke(
         .await
         .with_context(|| {
             format!(
-                "native {label} multi-tool signature replay was rejected (history carried \
-                 {} function calls; a backend that validates every functionCall signature \
-                 fails here when an earlier thought_signature is dropped)",
-                signatures_present.len()
+                "native {label} multi-tool signature replay was rejected (replayed history \
+                 carried {prior_calls} function call(s); a backend that validates every \
+                 functionCall signature fails here when an earlier thought_signature is dropped)"
             )
         })?;
-        total_input += fourth.input_tokens;
-        total_output += fourth.output_tokens;
+        total_input += turn.input_tokens;
+        total_output += turn.output_tokens;
+        if prior_calls >= 2 {
+            multi_tool_replay = "verified";
+        }
 
-        ensure!(
-            fourth.saw_message_end,
-            "native {label} multi-tool follow-up ended without a message_end event"
-        );
-        ensure!(
-            fourth.text.contains("77"),
-            "native {label} multi-tool follow-up did not reflect the second tool result token: {:?}",
-            crate::util::truncate_str(fourth.text.trim(), 200)
-        );
-        multi_tool_replay = "verified";
+        let Some(call) = turn.tool_calls.first().cloned() else {
+            // Model produced a final (text) answer; the loop is done.
+            break;
+        };
+        signatures_present.push(call.thought_signature.is_some());
+        let args = parse_tool_arguments(&call.input_json);
+        convo.push(assistant_tool_use(&call, &args));
+        let result = synthetic_results
+            .get(tool_round)
+            .copied()
+            .unwrap_or("Contents: omega.");
+        convo.push(tool_result_then_text(&call.id, result));
+
+        tool_round += 1;
+        if tool_round >= MAX_TOOL_ROUNDS {
+            break;
+        }
     }
 
     let mut stage = crate::live_tests::LiveVerificationStage::passed(
@@ -1519,6 +1533,7 @@ pub async fn run_live_native_provider_tool_smoke(
         serde_json::json!(tool_call.thought_signature.is_some()),
     )
     .with_evidence("multi_tool_replay", serde_json::json!(multi_tool_replay))
+    .with_evidence("multi_tool_call_count", serde_json::json!(tool_round))
     .with_evidence(
         "tool_call_signatures_present",
         serde_json::json!(signatures_present),
@@ -1557,24 +1572,16 @@ fn assistant_tool_use(call: &NativeClaudeToolCall, arguments: &serde_json::Value
     }
 }
 
-/// Build a user turn carrying a synthetic `tool_result` and, optionally, a
-/// follow-up text instruction (used to chain a second tool call in one message
-/// so the provider sees a clean user turn rather than two consecutive ones).
-fn tool_result_then_text(tool_use_id: &str, result: &str, follow_up: Option<&str>) -> Message {
-    let mut content = vec![ContentBlock::ToolResult {
-        tool_use_id: tool_use_id.to_string(),
-        content: result.to_string(),
-        is_error: Some(false),
-    }];
-    if let Some(text) = follow_up {
-        content.push(ContentBlock::Text {
-            text: text.to_string(),
-            cache_control: None,
-        });
-    }
+/// Build a user turn carrying a synthetic `tool_result` for a captured native
+/// tool call, used to answer each step of the multi-call replay loop.
+fn tool_result_then_text(tool_use_id: &str, result: &str) -> Message {
     Message {
         role: Role::User,
-        content,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: result.to_string(),
+            is_error: Some(false),
+        }],
         timestamp: None,
         tool_duration_ms: None,
     }
