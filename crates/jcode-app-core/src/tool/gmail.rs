@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::auth::google;
 use crate::gmail::{self, GmailClient, MessageFormat};
 
 pub struct GmailTool {
@@ -92,10 +91,8 @@ impl Tool for GmailTool {
     }
 
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
-        if !google::has_tokens() {
-            return Ok(ToolOutput::new(
-                "Gmail is not configured. Run `jcode login google` to set up Gmail access.",
-            ));
+        if !self.client.is_configured() {
+            return Ok(ToolOutput::new(self.client.not_configured_message()));
         }
 
         let params: GmailInput = serde_json::from_value(input)?;
@@ -278,8 +275,7 @@ impl Tool for GmailTool {
             }
 
             "send" => {
-                let tokens = google::load_tokens()?;
-                if !tokens.tier.can_send() {
+                if !self.client.can_send() {
                     return Ok(ToolOutput::new(
                         "Send is not available. Your Gmail access is configured as Read & Draft Only (API-level restriction).\n\
                          The draft has been created - open Gmail to send it manually.\n\
@@ -323,8 +319,7 @@ impl Tool for GmailTool {
             }
 
             "send_draft" => {
-                let tokens = google::load_tokens()?;
-                if !tokens.tier.can_send() {
+                if !self.client.can_send() {
                     return Ok(ToolOutput::new(
                         "Send is not available. Your Gmail access is configured as Read & Draft Only (API-level restriction).\n\
                          Open Gmail to send the draft manually.\n\
@@ -352,8 +347,7 @@ impl Tool for GmailTool {
             }
 
             "trash" => {
-                let tokens = google::load_tokens()?;
-                if !tokens.tier.can_delete() {
+                if !self.client.can_delete() {
                     return Ok(ToolOutput::new(
                         "Trash is not available. Your Gmail access is configured as Read & Draft Only (API-level restriction).\n\
                          To enable delete, rerun `jcode login google --google-access-tier full`.",
