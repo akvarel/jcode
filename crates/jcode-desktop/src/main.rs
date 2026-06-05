@@ -11907,30 +11907,15 @@ fn build_hero_reveal_texture(
     }
 
     let mut values = vec![1.0_f32; (width * height) as usize];
-    let mut min_value = f32::INFINITY;
-    let mut max_value = 0.0_f32;
     let brush_delay_px = (alpha_bounds.height() * 0.10).max(5.0);
 
-    for y in 0..height {
-        for x in 0..width {
-            let pixel_index = (y * width + x) as usize;
-            let alpha = glyph_rgba[pixel_index * 4];
-            if alpha <= 2 {
-                continue;
-            }
-            let (path_progress, distance) = nearest_hero_stroke_progress(
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                alpha_bounds,
-                &segments,
-            );
-            let width_delay = (distance / brush_delay_px).min(1.0) * 0.045;
-            let value = (path_progress + width_delay).clamp(0.0, 1.0);
-            values[pixel_index] = value;
-            min_value = min_value.min(value);
-            max_value = max_value.max(value);
-        }
-    }
+    // This per-pixel nearest-stroke search dominates the one-time hero mask
+    // build (hundreds of ms on the UI thread). Each lit pixel is independent
+    // and only reads `glyph_rgba`/`segments`, so split the rows across worker
+    // threads. Output is bit-identical to the serial version; min/max are
+    // reduced afterward from the filled buffer.
+    let (min_value, max_value) =
+        fill_hero_reveal_values(&mut values, width, height, glyph_rgba, alpha_bounds, &segments, brush_delay_px);
 
     if !min_value.is_finite() || max_value <= min_value {
         return None;
@@ -11956,6 +11941,103 @@ fn build_hero_reveal_texture(
         }
     }
     Some(reveal_rgba)
+}
+
+/// Fill `values` with each lit pixel's reveal progress and return the
+/// `(min, max)` of the written values.
+///
+/// The work is split into horizontal row bands processed on separate threads
+/// when the image is large enough to amortize the spawn cost. Pixels are
+/// independent, so the result is identical to a serial fill.
+fn fill_hero_reveal_values(
+    values: &mut [f32],
+    width: u32,
+    height: u32,
+    glyph_rgba: &[u8],
+    alpha_bounds: HeroMaskPixelBounds,
+    segments: &[WelcomeHeroStrokeSegment],
+    brush_delay_px: f32,
+) -> (f32, f32) {
+    let row_stride = width as usize;
+    let compute_row = |row_index: u32, row_values: &mut [f32]| -> (f32, f32) {
+        let mut min_value = f32::INFINITY;
+        let mut max_value = 0.0_f32;
+        let row_offset = row_index as usize * row_stride;
+        for x in 0..width {
+            let pixel_index = row_offset + x as usize;
+            let alpha = glyph_rgba[pixel_index * 4];
+            if alpha <= 2 {
+                continue;
+            }
+            let (path_progress, distance) = nearest_hero_stroke_progress(
+                x as f32 + 0.5,
+                row_index as f32 + 0.5,
+                alpha_bounds,
+                segments,
+            );
+            let width_delay = (distance / brush_delay_px).min(1.0) * 0.045;
+            let value = (path_progress + width_delay).clamp(0.0, 1.0);
+            row_values[x as usize] = value;
+            min_value = min_value.min(value);
+            max_value = max_value.max(value);
+        }
+        (min_value, max_value)
+    };
+
+    let total_pixels = row_stride.saturating_mul(height as usize);
+    let worker_count = hero_reveal_worker_count(total_pixels);
+    if worker_count <= 1 || height < 2 {
+        let mut min_value = f32::INFINITY;
+        let mut max_value = 0.0_f32;
+        for (row_index, row_values) in values.chunks_mut(row_stride).enumerate() {
+            let (row_min, row_max) = compute_row(row_index as u32, row_values);
+            min_value = min_value.min(row_min);
+            max_value = max_value.max(row_max);
+        }
+        return (min_value, max_value);
+    }
+
+    let rows_per_band = (height as usize).div_ceil(worker_count).max(1);
+    let mut min_value = f32::INFINITY;
+    let mut max_value = 0.0_f32;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (band_index, band) in values.chunks_mut(rows_per_band * row_stride).enumerate() {
+            let first_row = (band_index * rows_per_band) as u32;
+            let compute_row = &compute_row;
+            handles.push(scope.spawn(move || {
+                let mut band_min = f32::INFINITY;
+                let mut band_max = 0.0_f32;
+                for (offset, row_values) in band.chunks_mut(row_stride).enumerate() {
+                    let (row_min, row_max) = compute_row(first_row + offset as u32, row_values);
+                    band_min = band_min.min(row_min);
+                    band_max = band_max.max(row_max);
+                }
+                (band_min, band_max)
+            }));
+        }
+        for handle in handles {
+            if let Ok((band_min, band_max)) = handle.join() {
+                min_value = min_value.min(band_min);
+                max_value = max_value.max(band_max);
+            }
+        }
+    });
+    (min_value, max_value)
+}
+
+/// Number of worker threads to use for the hero reveal fill. Returns 1 for
+/// small images where threading overhead would dominate.
+fn hero_reveal_worker_count(total_pixels: usize) -> usize {
+    const MIN_PIXELS_PER_WORKER: usize = 32 * 1024;
+    if total_pixels < MIN_PIXELS_PER_WORKER * 2 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let by_work = total_pixels / MIN_PIXELS_PER_WORKER;
+    available.min(by_work).max(1)
 }
 
 fn nearest_hero_stroke_progress(
