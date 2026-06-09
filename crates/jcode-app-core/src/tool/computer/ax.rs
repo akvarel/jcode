@@ -295,7 +295,7 @@ pub fn element_at(app: &str, x: f64, y: f64) -> Result<ToolOutput> {
         r#"
 using terms from application "System Events"
     on hit(el, px, py, idxPath, best)
-        set result to best
+        set bestHit to best
         try
             set p to position of el
             set sz to size of el
@@ -312,17 +312,17 @@ using terms from application "System Events"
                 try
                     set t to (title of el as text)
                 end try
-                set result to idxPath & "  " & r & " \"" & t & "\" @(" & x1 & "," & y1 & " " & (item 1 of sz) & "x" & (item 2 of sz) & ")"
+                set bestHit to idxPath & "  " & r & " \"" & t & "\" @(" & x1 & "," & y1 & " " & (item 1 of sz) & "x" & (item 2 of sz) & ")"
             end if
         end try
         try
             set i to 0
             repeat with child in (UI elements of el)
                 set i to i + 1
-                set result to my hit(child, px, py, idxPath & "." & i, result)
+                set bestHit to my hit(child, px, py, idxPath & "." & i, bestHit)
             end repeat
         end try
-        return result
+        return bestHit
     end hit
 end using terms from
 
