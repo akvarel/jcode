@@ -76,10 +76,36 @@ pub(super) fn single_session_styled_text_buffer_with_opacity(
     wrap: Wrap,
     opacity: f32,
 ) -> Buffer {
+    single_session_styled_text_buffer_with_opacity_and_tail_fade(
+        font_system,
+        lines,
+        font_size,
+        line_height,
+        width,
+        height,
+        wrap,
+        opacity,
+        0.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn single_session_styled_text_buffer_with_opacity_and_tail_fade(
+    font_system: &mut FontSystem,
+    lines: &[SingleSessionStyledLine],
+    font_size: f32,
+    line_height: f32,
+    width: f32,
+    height: f32,
+    wrap: Wrap,
+    opacity: f32,
+    tail_fade_chars: f32,
+) -> Buffer {
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
     buffer.set_size(font_system, width, height);
     buffer.set_wrap(font_system, wrap);
     let segments = single_session_styled_text_segments_with_opacity(lines, opacity);
+    let segments = apply_streaming_tail_fade(segments, tail_fade_chars);
     // Inline span geometry uses glyphon cursors with byte offsets, and the
     // glyphon `highlight()` API used to position inline-code/math pills only
     // works on Advanced-shaped buffers. So any line carrying inline spans must be
@@ -214,6 +240,50 @@ pub(super) fn text_attrs_with_opacity(mut attrs: Attrs<'static>, opacity: f32) -
         (a as f32 * opacity).round().clamp(0.0, 255.0) as u8,
     ));
     attrs
+}
+
+/// Re-segment the trailing `tail_fade_chars` characters into per-character
+/// runs with a rising alpha ramp toward the end of the text. This is the
+/// streaming "tail fade": freshly revealed characters appear faint and gain
+/// opacity as newer characters arrive after them. Segments outside the fade
+/// window pass through untouched.
+pub(super) fn apply_streaming_tail_fade<'a>(
+    segments: Vec<(&'a str, Attrs<'static>)>,
+    tail_fade_chars: f32,
+) -> Vec<(&'a str, Attrs<'static>)> {
+    if tail_fade_chars < 0.5 {
+        return segments;
+    }
+    let total_chars: usize = segments.iter().map(|(text, _)| text.chars().count()).sum();
+    if total_chars == 0 {
+        return segments;
+    }
+    let fade_window = (tail_fade_chars.ceil() as usize).min(total_chars);
+    let fade_start = total_chars - fade_window;
+
+    let mut faded = Vec::with_capacity(segments.len() + fade_window);
+    let mut char_index = 0usize;
+    for (text, attrs) in segments {
+        let segment_chars = text.chars().count();
+        if char_index + segment_chars <= fade_start {
+            faded.push((text, attrs));
+            char_index += segment_chars;
+            continue;
+        }
+        for (byte_offset, ch) in text.char_indices() {
+            let char_text = &text[byte_offset..byte_offset + ch.len_utf8()];
+            if char_index < fade_start {
+                faded.push((char_text, attrs));
+            } else {
+                let distance_from_end = (total_chars - 1 - char_index) as f32;
+                let multiplier =
+                    ((distance_from_end + 1.0) / tail_fade_chars).clamp(0.0, 1.0);
+                faded.push((char_text, text_attrs_with_opacity(attrs, multiplier)));
+            }
+            char_index += 1;
+        }
+    }
+    faded
 }
 
 pub(super) fn push_assistant_markdown_inline_segments<'a>(

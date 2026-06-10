@@ -2584,6 +2584,13 @@ impl SingleSessionApp {
                 .is_some_and(SingleSessionStatus::is_in_flight)
     }
 
+    /// The standalone activity pill only shows while waiting for the first
+    /// streamed token. Once text flows, the streaming tail cursor takes over
+    /// as the "alive" cue at the end of the revealed text.
+    pub(crate) fn streaming_activity_pill_visible(&self) -> bool {
+        self.has_activity_indicator() && self.streaming_response.is_empty()
+    }
+
     fn set_status(&mut self, status: SingleSessionStatus) {
         self.status = Some(status.label());
         self.status_kind = Some(status);
@@ -3902,9 +3909,24 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn streaming_response_styled_lines(&self) -> Vec<SingleSessionStyledLine> {
+        self.streaming_response_revealed_styled_lines(self.streaming_response.len())
+    }
+
+    /// Styled lines for the first `revealed_bytes` of the streaming response.
+    /// Drives the adaptive streaming reveal: the renderer grows the visible
+    /// prefix smoothly instead of popping whole provider chunks in at once.
+    pub(crate) fn streaming_response_revealed_styled_lines(
+        &self,
+        revealed_bytes: usize,
+    ) -> Vec<SingleSessionStyledLine> {
+        let mut end = revealed_bytes.min(self.streaming_response.len());
+        while end > 0 && !self.streaming_response.is_char_boundary(end) {
+            end -= 1;
+        }
+        let revealed = self.streaming_response[..end].trim_end();
         let mut lines = Vec::new();
-        if !self.streaming_response.is_empty() {
-            append_streaming_assistant_lines(&mut lines, self.streaming_response.trim_end());
+        if !revealed.is_empty() {
+            append_streaming_assistant_lines(&mut lines, revealed);
         }
         lines
     }
