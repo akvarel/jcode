@@ -163,6 +163,11 @@ pub fn jcode_bindings(cfg: &KeybindingsConfig) -> Vec<JcodeBinding> {
             "Toggle info widget",
             cfg.info_widget_toggle.as_str(),
         ),
+        (
+            "new_terminal",
+            "Spawn new terminal session",
+            cfg.new_terminal.as_str(),
+        ),
     ];
 
     let mut out = Vec::new();
