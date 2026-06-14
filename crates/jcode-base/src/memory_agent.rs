@@ -584,7 +584,7 @@ impl MemoryAgent {
         // irrelevant ones; we surface the top MAX_MEMORIES_PER_TURN. This matches
         // the validated benchmark pipeline (recall@5 0.53 -> 0.75) and uses ONE
         // LLM call instead of the old per-candidate binary checks.
-        // Mode-1 (no sidecar): fall back to hybrid order via evaluate_candidates.
+        // Mode-1 (no sidecar): take the top hybrid-ranked candidates by score.
         memory::set_state(MemoryState::SidecarChecking {
             count: new_candidates.len(),
         });
@@ -600,8 +600,7 @@ impl MemoryAgent {
                     .await;
             reranked.into_iter().take(MAX_MEMORIES_PER_TURN).collect()
         } else {
-            self.evaluate_candidates(session_id, &context, new_candidates)
-                .await?
+            self.select_top_candidates_no_sidecar(session_id, new_candidates)
         };
 
         let verified_ids: Vec<String> = relevant.iter().map(|e| e.id.clone()).collect();
@@ -665,91 +664,30 @@ impl MemoryAgent {
         Ok(())
     }
 
-    /// Use Haiku to evaluate which candidates are actually relevant
-    async fn evaluate_candidates(
+    /// Mode-1 (no sidecar) candidate selection: take the top hybrid-ranked
+    /// candidates by score, capped at `MAX_MEMORIES_PER_TURN`.
+    ///
+    /// In Mode-2 the listwise LLM reranker (`memory_rerank::rerank_candidates`)
+    /// handles relevance selection instead, so this is only reached when the
+    /// memory sidecar is disabled (no LLM available to judge relevance).
+    fn select_top_candidates_no_sidecar(
         &self,
         session_id: &str,
-        context: &str,
         candidates: Vec<(MemoryEntry, f32)>,
-    ) -> Result<Vec<MemoryEntry>> {
-        if !memory::memory_sidecar_enabled() {
-            return Ok(candidates
-                .into_iter()
-                .take(MAX_MEMORIES_PER_TURN)
-                .map(|(entry, sim)| {
-                    crate::logging::info(&format!(
-                        "[{}] Memory relevant (semantic sim={:.2}): {}",
-                        session_id,
-                        sim,
-                        &entry.content[..entry.content.len().min(40)]
-                    ));
-                    entry
-                })
-                .collect());
-        }
-
-        let Some(sidecar) = self.sidecar.clone() else {
-            return Ok(Vec::new());
-        };
-
-        let mut relevant = Vec::new();
-
-        // Process in parallel
-        let futures: Vec<_> = candidates
-            .iter()
+    ) -> Vec<MemoryEntry> {
+        candidates
+            .into_iter()
             .take(MAX_MEMORIES_PER_TURN)
             .map(|(entry, sim)| {
-                let sidecar = sidecar.clone();
-                let content = entry.content.clone();
-                let ctx = context.to_string();
-                let similarity = *sim;
-                async move {
-                    let start = Instant::now();
-                    let result = sidecar.check_relevance(&content, &ctx).await;
-                    (result, start.elapsed(), similarity)
-                }
+                crate::logging::info(&format!(
+                    "[{}] Memory relevant (semantic sim={:.2}): {}",
+                    session_id,
+                    sim,
+                    &entry.content[..entry.content.len().min(40)]
+                ));
+                entry
             })
-            .collect();
-
-        let results = futures::future::join_all(futures).await;
-
-        for ((entry, _), (result, elapsed, sim)) in candidates.iter().zip(results) {
-            match result {
-                Ok((is_relevant, reason)) => {
-                    memory::add_event(MemoryEventKind::SidecarComplete {
-                        latency_ms: elapsed.as_millis() as u64,
-                    });
-
-                    if is_relevant {
-                        crate::logging::info(&format!(
-                            "[{}] Memory relevant (sim={:.2}): {} - {}",
-                            session_id,
-                            sim,
-                            &entry.content[..entry.content.len().min(40)],
-                            reason
-                        ));
-                        memory::add_event(MemoryEventKind::SidecarRelevant {
-                            memory_preview: entry.content[..entry.content.len().min(30)]
-                                .to_string(),
-                        });
-                        relevant.push(entry.clone());
-                    } else {
-                        memory::add_event(MemoryEventKind::SidecarNotRelevant);
-                    }
-                }
-                Err(e) => {
-                    memory::add_event(MemoryEventKind::Error {
-                        message: e.to_string(),
-                    });
-                }
-            }
-
-            if relevant.len() >= MAX_MEMORIES_PER_TURN {
-                break;
-            }
-        }
-
-        Ok(relevant)
+            .collect()
     }
 
     /// Extract memories from a context string
