@@ -74,6 +74,12 @@ pub struct SetupHintsState {
     /// never nagged about the same conflicts on every launch.
     #[serde(default)]
     pub keymap_conflict_signature: String,
+    /// Whether we've shown the one-time "glyph-safe mode is active" disclosure
+    /// for fragile-glyph terminals (macOS VS Code integrated terminal / Apple
+    /// Terminal). We surface the tradeoff once per install so the user knows
+    /// colors are quantized to 256 to avoid the terminal's glyph corruption.
+    #[serde(default)]
+    pub glyph_safe_notice_shown: bool,
 }
 
 /// Current macOS hotkey listener implementation version.
@@ -874,6 +880,75 @@ pub(crate) fn keymap_conflict_hint_for(
             (hint, true)
         }
     }
+}
+
+/// Whether the current terminal triggers jcode's glyph-safe color quantization
+/// (macOS VS Code integrated terminal / Apple Terminal). Mirrors the detection
+/// in `jcode-tui-style`'s color module and `jcode-app-core::perf` so the
+/// disclosure fires exactly when the behavior is active. Overridable with
+/// `JCODE_GLYPH_SAFE_MODE=on|off`.
+fn glyph_safe_mode_active() -> bool {
+    if let Ok(raw) = std::env::var("JCODE_GLYPH_SAFE_MODE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    match std::env::var("TERM_PROGRAM") {
+        Ok(tp) => {
+            let tp = tp.to_ascii_lowercase();
+            tp == "vscode" || tp == "apple_terminal"
+        }
+        Err(_) => false,
+    }
+}
+
+/// One-time disclosure that glyph-safe mode (256-color quantization) is active,
+/// shown the first time jcode launches in a fragile-glyph terminal. Discloses
+/// the tradeoff (slightly reduced color fidelity) and how to opt out.
+pub fn maybe_show_glyph_safe_notice() -> Option<StartupHints> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return None;
+    }
+    let mut state = SetupHintsState::load();
+    let (hint, changed) = glyph_safe_notice_for(glyph_safe_mode_active(), &mut state);
+    if changed {
+        let _ = state.save();
+    }
+    hint
+}
+
+/// Core of [`maybe_show_glyph_safe_notice`], split out for unit testing.
+/// Returns the optional notice and whether `state` was mutated.
+pub(crate) fn glyph_safe_notice_for(
+    active: bool,
+    state: &mut SetupHintsState,
+) -> (Option<StartupHints>, bool) {
+    if !active || state.glyph_safe_notice_shown {
+        return (None, false);
+    }
+    state.glyph_safe_notice_shown = true;
+    let status =
+        "Glyph-safe mode: colors quantized to 256 to avoid this terminal's glyph corruption."
+            .to_string();
+    let display = "This terminal (VS Code integrated terminal / Apple Terminal on macOS) corrupts \
+its glyph cache under jcode's full-color animations, rendering letters as boxes. \
+jcode automatically quantizes colors to the 256-palette here to keep text readable; \
+the only tradeoff is slightly reduced color fidelity. Animations still run. \
+For full color, use Ghostty, iTerm2, kitty, or WezTerm, or set JCODE_GLYPH_SAFE_MODE=off."
+        .to_string();
+    (
+        Some(StartupHints::with_status_and_display(
+            status,
+            "Display",
+            display,
+        )),
+        true,
+    )
 }
 
 /// Manual `jcode setup-launcher` command.
