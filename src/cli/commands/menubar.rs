@@ -383,6 +383,16 @@ mod macos {
         let mtm = MainThreadMarker::new()
             .expect("jcode menubar must run on the main thread (the process entry point)");
 
+        // Defense in depth: a process running under an explicit test/temp marker
+        // must never paint into the real user's menu bar. The real protection
+        // against duplicates is `ensure_menubar_helper_running` (which refuses
+        // to spawn from sandboxes) plus the global singleton lock below, but a
+        // stray `jcode menubar` invoked directly inside a test harness should
+        // still never realize a status item.
+        if super::env_truthy("JCODE_TEST_SESSION") || super::env_truthy("JCODE_TEMP_SERVER") {
+            return;
+        }
+
         // Enforce a single live menu bar helper. The pid-file fast path in
         // `ensure_menubar_helper_running` is best-effort and can race or be
         // bypassed entirely (e.g. a self-dev `target/.../jcode` and the
