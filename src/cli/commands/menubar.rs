@@ -248,9 +248,10 @@ mod macos {
     use objc2::runtime::AnyObject;
     use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSColor, NSFont,
-        NSFontAttributeName, NSForegroundColorAttributeName, NSFontWeightRegular, NSImage, NSMenu,
-        NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+        NSApplicationActivationPolicy, NSCellImagePosition, NSColor, NSFont, NSFontAttributeName,
+        NSForegroundColorAttributeName, NSFontWeightRegular, NSImage, NSMenu, NSMenuItem,
+        NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
     };
     use objc2_foundation::{
         NSAttributedString, NSDictionary, NSObject, NSString, NSUserDefaults, ns_string,
@@ -411,6 +412,16 @@ mod macos {
         // Accessory: no Dock icon, no main menu, just a menu bar item.
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+        // Follow the system's Light/Dark setting explicitly. `jcode` runs as a
+        // bare Mach-O with no Info.plist app bundle, so AppKit defaults the
+        // process to the light Aqua appearance and never auto-adopts macOS Dark
+        // Mode. That made the status item's template icon and `labelColor` text
+        // resolve to *black*, which is invisible on a dark menu bar (the exact
+        // symptom: a black icon on an already-black bar). Pin the app's
+        // appearance to match `AppleInterfaceStyle` so the template image and
+        // dynamic colors render light on a dark bar (and dark on a light bar).
+        sync_app_appearance(&app);
+
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item: Retained<NSStatusItem> =
             status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -496,7 +507,13 @@ mod macos {
         status_item.setMenu(Some(&menu));
 
         let last_sessions: RefCell<Vec<SessionPresence>> = RefCell::new(Vec::new());
+        let app_for_refresh = app.clone();
         let refresh = move || {
+            // Re-sync the Light/Dark appearance each tick so toggling the
+            // system theme at runtime keeps the status item visible (the
+            // process won't auto-adopt the change on its own).
+            sync_app_appearance(&app_for_refresh);
+
             let mut sessions = session::session_presence();
             sessions.sort_by_key(|s| (Reverse(s.streaming), s.session_id.clone()));
 
@@ -535,6 +552,35 @@ mod macos {
 
         // Run the Cocoa event loop. `terminate:` (the Quit item) exits the process.
         app.run();
+    }
+
+    /// Pin the application's appearance to the system Light/Dark setting.
+    ///
+    /// `jcode` runs as a bare executable without an `Info.plist` app bundle, so
+    /// AppKit defaults the process to the light `Aqua` appearance and does not
+    /// follow the user's macOS Dark Mode preference. With a light appearance the
+    /// status item's template SF Symbol and `labelColor` title both resolve to a
+    /// dark/black color, which is invisible against a dark menu bar. Reading
+    /// `AppleInterfaceStyle` (absent => Light, "Dark" => Dark) and applying the
+    /// matching named appearance makes those dynamic colors and template images
+    /// render with proper contrast on whatever menu bar the user has.
+    ///
+    /// Safe to call repeatedly; setting the same appearance is a no-op.
+    fn sync_app_appearance(app: &NSApplication) {
+        let is_dark = {
+            let defaults = NSUserDefaults::standardUserDefaults();
+            defaults
+                .stringForKey(ns_string!("AppleInterfaceStyle"))
+                .map(|style| style.to_string().eq_ignore_ascii_case("dark"))
+                .unwrap_or(false)
+        };
+        let name = if is_dark {
+            unsafe { NSAppearanceNameDarkAqua }
+        } else {
+            unsafe { NSAppearanceNameAqua }
+        };
+        let appearance = NSAppearance::appearanceNamed(name);
+        app.setAppearance(appearance.as_deref());
     }
 
     /// Color used for the count (and icon tint) while any session is actively
