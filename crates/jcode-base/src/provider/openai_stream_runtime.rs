@@ -1,5 +1,13 @@
 use super::*;
 
+/// Effective websocket completion/idle budget in seconds. Uses the built-in
+/// default, extended by `[provider] stream_idle_timeout_secs` when the user
+/// raises it above the default so slow reasoning models don't get cut off at
+/// the hardcoded budget on one transport but not another (issue #434).
+pub(super) fn effective_ws_completion_timeout_secs() -> u64 {
+    WEBSOCKET_COMPLETION_TIMEOUT_SECS.max(crate::provider::stream_idle_timeout().as_secs())
+}
+
 pub(super) async fn openai_access_token(
     credentials: &Arc<RwLock<CodexCredentials>>,
 ) -> anyhow::Result<String> {
@@ -239,8 +247,38 @@ pub(super) async fn stream_response(
     let mut stream = OpenAIResponsesStream::new(response.bytes_stream());
     let mut saw_message_end = false;
 
+    // Idle timeout between streamed events. Without this, a silently dead
+    // connection (or a provider that never emits) would hang forever; with a
+    // hardcoded short value, slow reasoning models that think silently for
+    // minutes get cancelled prematurely. Resolved from
+    // `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
+    // (issue #434).
+    let idle_timeout = crate::provider::stream_idle_timeout();
+
     use futures::StreamExt;
-    while let Some(result) = stream.next().await {
+    loop {
+        let result = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break, // stream ended normally
+            Err(_) => {
+                log_openai_stream_lifecycle(
+                    crate::logging::LogLevel::Warn,
+                    "https_stream_idle_timeout",
+                    vec![
+                        ("model", request_model.clone()),
+                        ("idle_timeout_secs", idle_timeout.as_secs().to_string()),
+                        (
+                            "elapsed_ms",
+                            stream_started_at.elapsed().as_millis().to_string(),
+                        ),
+                    ],
+                );
+                return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                    "Stream read timeout: no data received for {} seconds",
+                    idle_timeout.as_secs()
+                )));
+            }
+        };
         match result {
             Ok(event) => {
                 if matches!(event, StreamEvent::MessageEnd { .. }) {
@@ -726,16 +764,18 @@ pub(super) async fn try_persistent_ws_continuation(
     let mut last_api_activity_at = stream_started;
     let mut saw_api_activity = false;
     let mut logged_first_server_event = false;
+    let ws_completion_timeout_secs = effective_ws_completion_timeout_secs();
 
     loop {
-        if stream_started.elapsed() >= Duration::from_secs(WEBSOCKET_COMPLETION_TIMEOUT_SECS) {
+        if stream_started.elapsed() >= Duration::from_secs(ws_completion_timeout_secs) {
             return PersistentWsResult::Failed("completion timeout".to_string());
         }
 
-        let timeout_secs = match websocket_next_activity_timeout_secs(
+        let timeout_secs = match websocket_next_activity_timeout_secs_with_completion(
             stream_started,
             last_api_activity_at,
             saw_api_activity,
+            ws_completion_timeout_secs,
         ) {
             Some(timeout_secs) => timeout_secs,
             None => {
@@ -743,7 +783,7 @@ pub(super) async fn try_persistent_ws_continuation(
                     "timed out waiting for {} websocket activity on persistent WS ({}s)",
                     websocket_activity_timeout_kind(saw_api_activity),
                     if saw_api_activity {
-                        WEBSOCKET_COMPLETION_TIMEOUT_SECS
+                        ws_completion_timeout_secs
                     } else {
                         WEBSOCKET_FIRST_EVENT_TIMEOUT_SECS
                     }
@@ -1107,14 +1147,15 @@ pub(super) async fn stream_response_websocket_persistent(
     let mut response_id: Option<String> = None;
     let connected_at = Instant::now();
     let mut logged_first_server_event = false;
+    let ws_completion_timeout_secs = effective_ws_completion_timeout_secs();
 
     loop {
         if !saw_response_completed
-            && ws_started_at.elapsed() >= Duration::from_secs(WEBSOCKET_COMPLETION_TIMEOUT_SECS)
+            && ws_started_at.elapsed() >= Duration::from_secs(ws_completion_timeout_secs)
         {
             return Err(OpenAIStreamFailure::FallbackToHttps(anyhow::anyhow!(
                 "WebSocket stream did not complete within {}s",
-                WEBSOCKET_COMPLETION_TIMEOUT_SECS
+                ws_completion_timeout_secs
             )));
         }
 
@@ -1127,17 +1168,18 @@ pub(super) async fn stream_response_websocket_persistent(
             )));
         }
 
-        let timeout_secs = websocket_next_activity_timeout_secs(
+        let timeout_secs = websocket_next_activity_timeout_secs_with_completion(
             ws_started_at,
             last_api_activity_at,
             saw_api_activity,
+            ws_completion_timeout_secs,
         )
         .ok_or_else(|| {
             OpenAIStreamFailure::FallbackToHttps(anyhow::anyhow!(
                 "WebSocket stream timed out waiting for {} websocket activity ({}s)",
                 websocket_activity_timeout_kind(saw_api_activity),
                 if saw_api_activity {
-                    WEBSOCKET_COMPLETION_TIMEOUT_SECS
+                    ws_completion_timeout_secs
                 } else {
                     WEBSOCKET_FIRST_EVENT_TIMEOUT_SECS
                 }

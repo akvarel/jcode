@@ -390,6 +390,37 @@ fn test_websocket_activity_timeout_kind_labels_first_and_next() {
 }
 
 #[test]
+fn test_websocket_completion_timeout_extends_with_configured_idle_budget() {
+    use crate::provider::openai::websocket_health::websocket_next_activity_timeout_secs_with_completion;
+    // A custom completion budget larger than the default should be honored
+    // once API activity has been seen (issue #434).
+    let ws_started_at = Instant::now() - Duration::from_secs(400);
+    let last_api_activity_at = Instant::now() - Duration::from_secs(2);
+    let remaining = websocket_next_activity_timeout_secs_with_completion(
+        ws_started_at,
+        last_api_activity_at,
+        true,
+        600,
+    )
+    .expect("custom idle budget should still be active");
+    assert!(
+        remaining >= 595,
+        "expected near-full 600s idle budget, got {remaining}"
+    );
+    // And an exhausted custom budget still expires.
+    let stale_activity = Instant::now() - Duration::from_secs(601);
+    assert!(
+        websocket_next_activity_timeout_secs_with_completion(
+            ws_started_at,
+            stale_activity,
+            true,
+            600,
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn test_format_status_duration_uses_compact_human_labels() {
     assert_eq!(format_status_duration(Duration::from_secs(9)), "9s");
     assert_eq!(format_status_duration(Duration::from_secs(125)), "2m 5s");

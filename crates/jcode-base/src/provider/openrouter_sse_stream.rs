@@ -228,12 +228,9 @@ async fn stream_response(
     // models (e.g. DeepSeek) that think silently for minutes before emitting
     // tokens don't trip a premature timeout (issue #196). Resolved from
     // `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`,
-    // defaulting to 180s.
-    let idle_timeout_secs = crate::config::config()
-        .provider
-        .stream_idle_timeout_secs
-        .max(1);
-    let sse_chunk_timeout = std::time::Duration::from_secs(idle_timeout_secs);
+    // defaulting to 180s. Shared with the native provider paths (issue #434).
+    let sse_chunk_timeout = crate::provider::stream_idle_timeout();
+    let idle_timeout_secs = sse_chunk_timeout.as_secs();
 
     loop {
         let event = match tokio::time::timeout(sse_chunk_timeout, stream.next()).await {
