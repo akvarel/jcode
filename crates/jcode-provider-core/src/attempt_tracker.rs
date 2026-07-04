@@ -15,8 +15,8 @@
 //! has no side effects. The Claude CLI path is the exception (the CLI executes
 //! tools live mid-stream) and keeps its no-retry-after-output guard instead.
 
-use crate::message::StreamEvent;
 use anyhow::Result;
+use jcode_message_types::StreamEvent;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 /// Status-style events (connection phases, token usage snapshots, transport
 /// labels) are excluded: consumers overwrite rather than accumulate them, so a
 /// replay is harmless.
-pub(crate) fn stream_event_is_replay_visible(event: &StreamEvent) -> bool {
+fn stream_event_is_replay_visible(event: &StreamEvent) -> bool {
     match event {
         StreamEvent::TextDelta(_)
         | StreamEvent::ToolUseStart { .. }
@@ -60,7 +60,7 @@ pub(crate) fn stream_event_is_replay_visible(event: &StreamEvent) -> bool {
 /// Handle returned by [`track_attempt_output`]. Await [`AttemptGuard::finish`]
 /// after the attempt completes (and after dropping the attempt sender) to
 /// drain in-flight events and learn whether the attempt streamed output.
-pub(crate) struct AttemptGuard {
+pub struct AttemptGuard {
     saw_output: Arc<AtomicBool>,
     forwarder: JoinHandle<()>,
 }
@@ -69,7 +69,7 @@ impl AttemptGuard {
     /// Wait for all events the attempt buffered to be forwarded to the outer
     /// sender (preserving ordering relative to any subsequent rollback event),
     /// then report whether any replay-visible output was emitted.
-    pub(crate) async fn finish(self) -> bool {
+    pub async fn finish(self) -> bool {
         let _ = self.forwarder.await;
         self.saw_output.load(Ordering::SeqCst)
     }
@@ -83,7 +83,7 @@ impl AttemptGuard {
 /// attempt sender (and all its clones) are dropped, so callers must drop the
 /// returned sender (usually implicit: `stream_response` consumes it) before
 /// awaiting the guard.
-pub(crate) fn track_attempt_output(
+pub fn track_attempt_output(
     outer: mpsc::Sender<Result<StreamEvent>>,
 ) -> (mpsc::Sender<Result<StreamEvent>>, AttemptGuard) {
     let (attempt_tx, mut attempt_rx) = mpsc::channel::<Result<StreamEvent>>(32);
@@ -118,7 +118,7 @@ pub(crate) fn track_attempt_output(
 /// a correlated upstream outage (thundering herd). Jitter spreads the retries
 /// out. `attempt` is the 0-based index of the attempt about to run (so the
 /// first retry, `attempt == 1`, waits ~`base_ms`).
-pub(crate) fn retry_backoff_delay(attempt: u32, base_ms: u64) -> std::time::Duration {
+pub fn retry_backoff_delay(attempt: u32, base_ms: u64) -> std::time::Duration {
     use rand::Rng;
     let exp = base_ms.saturating_mul(1u64 << attempt.saturating_sub(1).min(16));
     let jittered = (exp as f64 * rand::rng().random_range(0.8..1.2)) as u64;
@@ -150,7 +150,7 @@ mod tests {
     fn status_events_are_not_replay_visible() {
         assert!(!stream_event_is_replay_visible(
             &StreamEvent::ConnectionPhase {
-                phase: crate::message::ConnectionPhase::Connecting,
+                phase: jcode_message_types::ConnectionPhase::Connecting,
             }
         ));
         assert!(!stream_event_is_replay_visible(&StreamEvent::TokenUsage {
@@ -176,7 +176,7 @@ mod tests {
 
         attempt_tx
             .send(Ok(StreamEvent::ConnectionPhase {
-                phase: crate::message::ConnectionPhase::Connecting,
+                phase: jcode_message_types::ConnectionPhase::Connecting,
             }))
             .await
             .unwrap();
@@ -210,7 +210,7 @@ mod tests {
         let (attempt_tx, guard) = track_attempt_output(outer_tx);
         attempt_tx
             .send(Ok(StreamEvent::ConnectionPhase {
-                phase: crate::message::ConnectionPhase::Connecting,
+                phase: jcode_message_types::ConnectionPhase::Connecting,
             }))
             .await
             .unwrap();

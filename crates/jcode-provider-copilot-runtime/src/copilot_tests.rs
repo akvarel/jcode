@@ -2,7 +2,7 @@ use super::*;
 
 fn make_test_provider(fetched: Vec<String>) -> CopilotApiProvider {
     CopilotApiProvider {
-        client: crate::provider::shared_http_client(),
+        client: jcode_base::provider::shared_http_client(),
         model: Arc::new(RwLock::new(DEFAULT_MODEL.to_string())),
         github_token: "test-token".to_string(),
         bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
@@ -100,59 +100,74 @@ fn non_gpt5_copilot_models_keep_max_tokens() {
 #[test]
 fn context_window_handles_dot_and_dash_names() {
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("claude-opus-4.6", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider(
+            "claude-opus-4.6",
+            Some("copilot")
+        ),
         Some(200_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("claude-opus-4-6", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider(
+            "claude-opus-4-6",
+            Some("copilot")
+        ),
         Some(200_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider(
+        jcode_base::provider::context_limit_for_model_with_provider(
             "claude-opus-4.6-fast",
             Some("copilot")
         ),
         Some(200_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider(
+        jcode_base::provider::context_limit_for_model_with_provider(
             "claude-sonnet-4.6",
             Some("copilot")
         ),
         Some(128_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider(
+        jcode_base::provider::context_limit_for_model_with_provider(
             "claude-sonnet-4-6",
             Some("copilot")
         ),
         Some(128_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("gpt-5.4", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider("gpt-5.4", Some("copilot")),
         Some(128_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("gpt-5.4-pro", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider("gpt-5.4-pro", Some("copilot")),
         Some(128_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("gpt-5.3-codex", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider(
+            "gpt-5.3-codex",
+            Some("copilot")
+        ),
         Some(128_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider(
+        jcode_base::provider::context_limit_for_model_with_provider(
             "gemini-3-pro-preview",
             Some("copilot")
         ),
         Some(1_000_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("gemini-2.5-pro", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider(
+            "gemini-2.5-pro",
+            Some("copilot")
+        ),
         Some(1_000_000)
     );
     assert_eq!(
-        crate::provider::context_limit_for_model_with_provider("unknown-model", Some("copilot")),
+        jcode_base::provider::context_limit_for_model_with_provider(
+            "unknown-model",
+            Some("copilot")
+        ),
         Some(128_000)
     );
 }
