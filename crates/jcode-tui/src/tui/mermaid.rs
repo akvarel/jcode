@@ -19,6 +19,7 @@ pub use jcode_tui_mermaid::{
     materialize_inline_image_by_id, normalize_aspect_ratio, parse_image_placeholder,
     parse_inline_image_placeholder, preferred_aspect_ratio_bucket, prewarm_inline_fit_state,
     protocol_type, register_active_diagram, register_external_image, register_inline_image,
+    rediscover_inline_image,
     render_image_widget, render_image_widget_fit, render_image_widget_fit_stable,
     render_image_widget_scale, render_image_widget_viewport, render_image_widget_viewport_precise,
     render_mermaid, render_mermaid_deferred, render_mermaid_deferred_with_registration,

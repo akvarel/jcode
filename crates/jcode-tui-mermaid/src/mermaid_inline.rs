@@ -189,6 +189,46 @@ fn inline_image_extension(media_type: &str) -> &'static str {
     }
 }
 
+/// Every extension [`materialize_inline_image_by_id`] can write, so
+/// [`rediscover_inline_image`] probes exactly the files that can exist.
+const INLINE_EXTENSIONS: [&str; 7] = ["png", "jpg", "gif", "webp", "bmp", "ico", "img"];
+
+/// Re-register an inline image from its persisted cache file.
+///
+/// Payloads are staged in the UI's payload registry only until first
+/// materialization (which writes the decoded bytes to the cache dir); after
+/// that the base64 copy is dropped to keep multi-megabyte screenshots from
+/// being resident twice. If the in-memory `RENDER_CACHE` entry is later
+/// LRU-evicted, this path restores it from disk without needing the payload.
+///
+/// Returns `(id, width, height)` when the cache file exists and decodes.
+pub fn rediscover_inline_image(id: u64) -> Option<(u64, u32, u32)> {
+    let cache_dir = RENDER_CACHE.lock().ok()?.cache_dir.clone();
+    let path = INLINE_EXTENSIONS
+        .iter()
+        .map(|ext| cache_dir.join(format!("{:016x}_inline.{}", id, ext)))
+        .find(|path| path.exists())?;
+    let image = image::open(&path).ok()?;
+    let (width, height) = image.dimensions();
+    dims_cache_put(id, InlineDims { width, height });
+    if let Ok(mut source) = SOURCE_CACHE.lock() {
+        source.insert(id, path.clone(), image);
+    }
+    if let Ok(mut cache) = RENDER_CACHE.lock() {
+        cache.insert(
+            id,
+            RenderProfile::default(),
+            CachedDiagram {
+                path,
+                width,
+                height,
+            },
+        );
+        return Some((id, width, height));
+    }
+    None
+}
+
 /// Test-only view of [`inline_image_extension`], used to prove the eviction
 /// path recognizes every extension the materialize path can write.
 #[cfg(test)]

@@ -180,10 +180,29 @@ impl PayloadRegistry {
     fn get(&self, id: u64) -> Option<(String, String)> {
         self.map.get(&id).cloned()
     }
+
+    fn remove(&mut self, id: u64) {
+        if let Some((media_type, data_b64)) = self.map.remove(&id) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(media_type.len() + data_b64.len());
+            if let Some(pos) = self.order.iter().position(|entry| *entry == id) {
+                self.order.remove(pos);
+            }
+        }
+    }
 }
 
 /// Record an image payload so [`materialize_visible`] can decode it on demand.
+///
+/// Skipped entirely for images that are already materialized: their decoded
+/// bytes live in the render cache (memory) and cache dir (disk), so staging
+/// the base64 copy again would just hold multi-megabyte payloads resident
+/// twice. [`materialize_visible`] rediscovers evicted entries from disk.
 pub(crate) fn register_payload(id: u64, media_type: &str, data_b64: &str) {
+    if mermaid::inline_image_is_materialized(id) {
+        return;
+    }
     let newly_inserted = match PAYLOAD_REGISTRY.lock() {
         Ok(mut reg) => reg.insert(id, media_type, data_b64),
         Err(_) => false,
@@ -192,6 +211,14 @@ pub(crate) fn register_payload(id: u64, media_type: &str, data_b64: &str) {
     // failed, so give the prewarm pipeline its retries back.
     if newly_inserted && let Ok(mut failures) = PREWARM_FAILURES.lock() {
         failures.remove(&id);
+    }
+}
+
+/// Drop the staged base64 payload for an image whose decoded bytes are now
+/// persisted in the render cache; see [`register_payload`].
+fn release_payload(id: u64) {
+    if let Ok(mut reg) = PAYLOAD_REGISTRY.lock() {
+        reg.remove(id);
     }
 }
 
@@ -206,12 +233,22 @@ pub(crate) fn materialize_visible(id: u64) -> bool {
         return true;
     }
     if let Some((media_type, data_b64)) = PAYLOAD_REGISTRY.lock().ok().and_then(|reg| reg.get(id)) {
-        return mermaid::materialize_inline_image_by_id(id, &media_type, &data_b64).is_some();
+        let materialized = mermaid::materialize_inline_image_by_id(id, &media_type, &data_b64);
+        if materialized.is_some() {
+            // The decoded bytes now live in the render cache and cache dir;
+            // holding the base64 copy too would double-count every image.
+            release_payload(id);
+            return true;
+        }
+        return false;
     }
-    // Mermaid diagrams share this pipeline but have no payload registration:
-    // their PNG lives in the shared render cache. A hash evicted from the
-    // in-memory cache can still be rediscovered on disk (and re-registered)
-    // by the cached-path lookup.
+    // No staged payload: either it was dropped after a successful
+    // materialization and the render-cache entry has since been LRU-evicted
+    // (restore it from the persisted cache file), or this is a mermaid
+    // diagram whose PNG lives in the shared render cache/disk.
+    if mermaid::rediscover_inline_image(id).is_some() {
+        return true;
+    }
     mermaid::get_cached_path(id).is_some()
 }
 
@@ -1094,6 +1131,62 @@ mod tests {
             !prewarm_failures_exhausted(ID),
             "fresh payload registration must reset the failure memo"
         );
+    }
+
+    /// Materialization must release the staged base64 payload (the decoded
+    /// bytes are persisted in the render cache + cache dir), and later
+    /// re-registrations for a materialized image must be no-ops so the payload
+    /// is never staged twice. Draws must keep working afterwards.
+    #[test]
+    fn materialize_releases_payload_and_blocks_restaging() {
+        // Distinct payload so this test's id cannot collide with others.
+        let id = mermaid::inline_image_id("image/png", MATERIALIZE_PNG_B64_RELEASE);
+        register_payload(id, "image/png", MATERIALIZE_PNG_B64_RELEASE);
+        assert!(
+            PAYLOAD_REGISTRY.lock().unwrap().get(id).is_some(),
+            "payload staged before materialization"
+        );
+        assert!(materialize_visible(id), "materialization succeeds");
+        assert!(
+            PAYLOAD_REGISTRY.lock().unwrap().get(id).is_none(),
+            "payload must be released after materialization"
+        );
+        // Prepare passes keep calling register_payload; it must stay empty.
+        register_payload(id, "image/png", MATERIALIZE_PNG_B64_RELEASE);
+        assert!(
+            PAYLOAD_REGISTRY.lock().unwrap().get(id).is_none(),
+            "re-registering a materialized image must not restage its payload"
+        );
+        // And the image must still be drawable without the payload.
+        assert!(
+            materialize_visible(id),
+            "materialized image stays visible after payload release"
+        );
+    }
+
+    /// 1x1 red PNG distinct from `MATERIALIZE_PNG_B64` so payload-release
+    /// tests own their image id.
+    const MATERIALIZE_PNG_B64_RELEASE: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+    /// PayloadRegistry::remove must keep byte accounting and the eviction
+    /// queue in sync.
+    #[test]
+    fn payload_registry_remove_keeps_accounting_consistent() {
+        let mut reg = PayloadRegistry::new();
+        reg.insert(1, "image/png", "AAAA");
+        reg.insert(2, "image/png", "BBBBBBBB");
+        let bytes_with_both = reg.total_bytes;
+        reg.remove(1);
+        assert!(reg.get(1).is_none());
+        assert_eq!(reg.map.len(), reg.order.len(), "map/order desynced");
+        assert_eq!(
+            reg.total_bytes,
+            bytes_with_both - ("image/png".len() + "AAAA".len()),
+            "byte accounting must shrink by exactly the removed entry"
+        );
+        // Removing an absent id is a no-op.
+        reg.remove(42);
+        assert_eq!(reg.map.len(), 1);
     }
 
     /// 1x1 transparent PNG, used to exercise the real header parse.

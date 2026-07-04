@@ -245,7 +245,7 @@ pub use content_render::{
 };
 pub use inline_image::{
     inline_image_dims, inline_image_id, inline_image_is_materialized, materialize_inline_image,
-    materialize_inline_image_by_id,
+    materialize_inline_image_by_id, rediscover_inline_image,
 };
 pub use runtime::force_test_kitty_picker;
 pub use runtime::{
