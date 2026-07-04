@@ -5,6 +5,10 @@ use super::*;
 
 #[async_trait]
 impl Provider for OpenAIProvider {
+    fn reload_credentials(&self) {
+        self.reload_credentials_now();
+    }
+
     fn credential_mode(&self) -> jcode_provider_core::CredentialMode {
         self.credential_mode_snapshot()
     }
@@ -96,8 +100,8 @@ impl Provider for OpenAIProvider {
         });
         let prompt_cache_key_hash = request
             .get("prompt_cache_key")
-            .map(crate::provider::fingerprint::stable_hash_json);
-        crate::provider::fingerprint::log_provider_canonical_input(
+            .map(jcode_provider_core::fingerprint::stable_hash_json);
+        jcode_provider_core::fingerprint::log_provider_canonical_input(
             "openai",
             &model_id,
             "openai_responses_full",
@@ -140,9 +144,9 @@ impl Provider for OpenAIProvider {
                 ),
             ],
         );
-        let usage_snapshot = crate::usage::get_openai_usage_sync();
+        let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Info,
+            jcode_base::logging::LogLevel::Info,
             "request_start",
             vec![
                 ("model", model_id.clone()),
@@ -179,7 +183,7 @@ impl Provider for OpenAIProvider {
                 ),
             ],
         );
-        crate::logging::info(&format!(
+        jcode_base::logging::info(&format!(
             "OpenAI limit diag: request start model={} transport_mode={} websocket_preferred={} usage=({}) provider=({})",
             model_id,
             transport_mode_snapshot.as_str(),
@@ -206,7 +210,7 @@ impl Provider for OpenAIProvider {
                     // and then fails falls through to a fresh-connection replay
                     // from the top, which must roll the partial output back.
                     let (attempt_tx, attempt_guard) =
-                        crate::provider::attempt_tracker::track_attempt_output(tx.clone());
+                        jcode_provider_core::attempt_tracker::track_attempt_output(tx.clone());
                     let continuation_result = try_persistent_ws_continuation(
                         &persistent_ws,
                         &request,
@@ -221,7 +225,7 @@ impl Provider for OpenAIProvider {
                     match continuation_result {
                         PersistentWsResult::Success => {
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Info,
+                                jcode_base::logging::LogLevel::Info,
                                 "persistent_reuse_success",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -238,20 +242,20 @@ impl Provider for OpenAIProvider {
                         }
                         PersistentWsResult::NotAvailable => {
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Info,
+                                jcode_base::logging::LogLevel::Info,
                                 "persistent_reuse_unavailable",
                                 vec![
                                     ("model", model_for_transport.clone()),
                                     ("transport", "websocket".to_string()),
                                 ],
                             );
-                            crate::logging::info(
+                            jcode_base::logging::info(
                                 "No persistent WS connection available; using fresh connection",
                             );
                         }
                         PersistentWsResult::Failed(err) => {
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Warn,
+                                jcode_base::logging::LogLevel::Warn,
                                 "persistent_reuse_failed",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -259,7 +263,7 @@ impl Provider for OpenAIProvider {
                                     ("error", err.clone()),
                                 ],
                             );
-                            crate::logging::warn(&format!(
+                            jcode_base::logging::warn(&format!(
                                 "Persistent WS continuation failed: {}; using fresh connection",
                                 err
                             ));
@@ -278,7 +282,7 @@ impl Provider for OpenAIProvider {
                             let mut guard = persistent_ws.lock().await;
                             *guard = None;
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Warn,
+                                jcode_base::logging::LogLevel::Warn,
                                 "persistent_state_reset",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -298,7 +302,7 @@ impl Provider for OpenAIProvider {
                     if attempt > 0 {
                         emit_connection_phase(
                             &tx,
-                            crate::message::ConnectionPhase::Retrying {
+                            jcode_message_types::ConnectionPhase::Retrying {
                                 attempt: attempt + 1,
                                 max: MAX_RETRIES,
                             },
@@ -306,12 +310,12 @@ impl Provider for OpenAIProvider {
                         .await;
                     }
                     if attempt > 0 && !skip_backoff_once {
-                        let delay = crate::provider::attempt_tracker::retry_backoff_delay(
+                        let delay = jcode_provider_core::attempt_tracker::retry_backoff_delay(
                             attempt,
                             RETRY_BASE_DELAY_MS,
                         );
                         tokio::time::sleep(delay).await;
-                        crate::logging::info(&format!(
+                        jcode_base::logging::info(&format!(
                             "Retrying OpenAI API request (attempt {}/{})",
                             attempt + 1,
                             MAX_RETRIES
@@ -334,7 +338,7 @@ impl Provider for OpenAIProvider {
                                 )
                                 .await
                                 {
-                                    crate::logging::info(&format!(
+                                    jcode_base::logging::info(&format!(
                                         "OpenAI websocket cooldown active for model='{}' ({}s remaining); using HTTPS",
                                         model_for_transport,
                                         remaining.as_secs()
@@ -358,7 +362,7 @@ impl Provider for OpenAIProvider {
                     let transport_label = transport.as_str();
                     let attempt_started = Instant::now();
                     log_openai_stream_lifecycle(
-                        crate::logging::LogLevel::Info,
+                        jcode_base::logging::LogLevel::Info,
                         "attempt_start",
                         vec![
                             ("model", model_for_transport.clone()),
@@ -369,7 +373,7 @@ impl Provider for OpenAIProvider {
                             ("forced_https", force_https_for_request.to_string()),
                         ],
                     );
-                    crate::logging::info(&format!(
+                    jcode_base::logging::info(&format!(
                         "OpenAI stream attempt {}/{} using transport '{}'; model='{}'; mode='{}'",
                         attempt + 1,
                         MAX_RETRIES,
@@ -384,7 +388,7 @@ impl Provider for OpenAIProvider {
                     // output back on the consumer before the retry (or HTTPS
                     // fallback) replays the response from the top.
                     let (attempt_tx, attempt_guard) =
-                        crate::provider::attempt_tracker::track_attempt_output(tx.clone());
+                        jcode_provider_core::attempt_tracker::track_attempt_output(tx.clone());
                     let result = if use_websocket {
                         stream_response_websocket_persistent(
                             Arc::clone(&credentials),
@@ -406,7 +410,7 @@ impl Provider for OpenAIProvider {
                         let attempt_client = if attempt == 0 {
                             client.clone()
                         } else {
-                            crate::provider::fresh_transport_client()
+                            jcode_provider_core::fresh_transport_client()
                         };
                         stream_response(
                             attempt_client,
@@ -439,7 +443,7 @@ impl Provider for OpenAIProvider {
                     match result {
                         Ok(()) => {
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Info,
+                                jcode_base::logging::LogLevel::Info,
                                 "attempt_success",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -467,7 +471,7 @@ impl Provider for OpenAIProvider {
                             let fallback_reason =
                                 classify_websocket_fallback_reason(&error.to_string());
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Warn,
+                                jcode_base::logging::LogLevel::Warn,
                                 "fallback_to_https",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -478,7 +482,7 @@ impl Provider for OpenAIProvider {
                                     ("elapsed_ms", elapsed_ms.to_string()),
                                 ],
                             );
-                            crate::logging::warn(&format!(
+                            jcode_base::logging::warn(&format!(
                                 "WebSocket fallback after {}ms: {}",
                                 elapsed_ms, error
                             ));
@@ -505,7 +509,7 @@ impl Provider for OpenAIProvider {
                                     fallback_reason,
                                 )
                                 .await;
-                                crate::logging::warn(&format!(
+                                jcode_base::logging::warn(&format!(
                                     "OpenAI websocket backoff for model='{}': reason='{}' streak={} cooldown={}s",
                                     model_for_transport,
                                     fallback_reason.summary(),
@@ -519,7 +523,7 @@ impl Provider for OpenAIProvider {
                                 *guard = None;
                             }
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Warn,
+                                jcode_base::logging::LogLevel::Warn,
                                 "persistent_state_reset",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -551,7 +555,7 @@ impl Provider for OpenAIProvider {
                                         .await;
                                 }
                                 log_openai_stream_lifecycle(
-                                    crate::logging::LogLevel::Warn,
+                                    jcode_base::logging::LogLevel::Warn,
                                     "retry_scheduled",
                                     vec![
                                         ("model", model_for_transport.clone()),
@@ -562,7 +566,7 @@ impl Provider for OpenAIProvider {
                                         ("elapsed_ms", elapsed_ms.to_string()),
                                     ],
                                 );
-                                crate::logging::info(&format!(
+                                jcode_base::logging::info(&format!(
                                     "Transient error after {}ms, will retry: {}",
                                     elapsed_ms, error
                                 ));
@@ -570,7 +574,7 @@ impl Provider for OpenAIProvider {
                                 continue;
                             }
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Error,
+                                jcode_base::logging::LogLevel::Error,
                                 "attempt_failed",
                                 vec![
                                     ("model", model_for_transport.clone()),
@@ -590,7 +594,7 @@ impl Provider for OpenAIProvider {
                 // All retries exhausted
                 if let Some(e) = last_error {
                     log_openai_stream_lifecycle(
-                        crate::logging::LogLevel::Error,
+                        jcode_base::logging::LogLevel::Error,
                         "retries_exhausted",
                         vec![
                             ("model", model_for_transport.clone()),
@@ -618,7 +622,10 @@ impl Provider for OpenAIProvider {
                 } else {
                     "unknown panic".to_string()
                 };
-                crate::logging::error(&format!("OpenAI provider stream task panicked: {}", msg));
+                jcode_base::logging::error(&format!(
+                    "OpenAI provider stream task panicked: {}",
+                    msg
+                ));
                 let _ = panic_tx
                     .send(Err(anyhow::anyhow!(
                         "OpenAI provider stream task panicked: {}",
@@ -652,7 +659,7 @@ impl Provider for OpenAIProvider {
     }
 
     fn set_model(&self, model: &str) -> Result<()> {
-        if !crate::provider::known_openai_model_ids()
+        if !jcode_base::provider::known_openai_model_ids()
             .iter()
             .any(|known| known == model)
         {
@@ -661,10 +668,11 @@ impl Provider for OpenAIProvider {
                 model,
             );
         }
-        let availability = crate::provider::model_availability_for_account(model);
-        if availability.state == crate::provider::AccountModelAvailabilityState::Unavailable {
-            let detail = crate::provider::format_account_model_availability_detail(&availability)
-                .unwrap_or_else(|| "not available for your account".to_string());
+        let availability = jcode_base::provider::model_availability_for_account(model);
+        if availability.state == jcode_base::provider::AccountModelAvailabilityState::Unavailable {
+            let detail =
+                jcode_base::provider::format_account_model_availability_detail(&availability)
+                    .unwrap_or_else(|| "not available for your account".to_string());
             anyhow::bail!(
                 "The '{}' model is not available for your account right now ({}). \
                  Use /model to see available models.",
@@ -675,7 +683,7 @@ impl Provider for OpenAIProvider {
         if let Ok(mut current) = self.model.try_write() {
             let changed = current.as_str() != model;
             *current = model.to_string();
-            crate::provider::clear_model_unavailable_for_account(model);
+            jcode_base::provider::clear_model_unavailable_for_account(model);
             drop(current);
             if changed {
                 self.clear_persistent_ws_try("manual OpenAI model change reset the response chain");
@@ -689,11 +697,11 @@ impl Provider for OpenAIProvider {
     }
 
     fn available_models(&self) -> Vec<&'static str> {
-        crate::provider::ALL_OPENAI_MODELS.to_vec()
+        jcode_provider_core::ALL_OPENAI_MODELS.to_vec()
     }
 
     fn available_models_for_switching(&self) -> Vec<String> {
-        crate::provider::cached_openai_model_ids().unwrap_or_else(|| vec![self.model()])
+        jcode_base::provider::cached_openai_model_ids().unwrap_or_else(|| vec![self.model()])
     }
 
     fn available_models_display(&self) -> Vec<String> {
@@ -712,16 +720,16 @@ impl Provider for OpenAIProvider {
         };
         let catalog = if is_chatgpt_mode {
             let access_token = openai_access_token(&self.credentials).await?;
-            crate::provider::fetch_openai_model_catalog(&access_token).await?
+            jcode_base::provider::fetch_openai_model_catalog(&access_token).await?
         } else {
-            crate::provider::fetch_openai_api_key_model_catalog(&access_token).await?
+            jcode_base::provider::fetch_openai_api_key_model_catalog(&access_token).await?
         };
-        crate::provider::persist_openai_model_catalog(&catalog);
+        jcode_base::provider::persist_openai_model_catalog(&catalog);
         if !catalog.context_limits.is_empty() {
-            crate::provider::populate_context_limits(catalog.context_limits);
+            jcode_base::provider::populate_context_limits(catalog.context_limits);
         }
         if !catalog.available_models.is_empty() {
-            crate::provider::populate_account_models(catalog.available_models);
+            jcode_base::provider::populate_account_models(catalog.available_models);
         }
         Ok(())
     }
@@ -841,7 +849,7 @@ impl Provider for OpenAIProvider {
         messages: &[ChatMessage],
         existing_summary_text: Option<&str>,
         existing_openai_encrypted_content: Option<&str>,
-    ) -> Result<crate::provider::NativeCompactionResult> {
+    ) -> Result<jcode_provider_core::NativeCompactionResult> {
         if self.native_compaction_mode != OpenAINativeCompactionMode::Explicit {
             anyhow::bail!(
                 "OpenAI native explicit compaction is disabled (mode={})",
@@ -858,13 +866,13 @@ impl Provider for OpenAIProvider {
 
         let mut input = Vec::new();
         if let Some(encrypted_content) = existing_openai_encrypted_content {
-            if !crate::provider::openai_request::openai_encrypted_content_is_sendable(
+            if !jcode_base::provider::openai_request::openai_encrypted_content_is_sendable(
                 encrypted_content,
             ) {
                 anyhow::bail!(
                     "OpenAI native compaction payload is too large to replay ({} chars > safe limit {} chars)",
                     encrypted_content.len(),
-                    crate::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS,
+                    jcode_base::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS,
                 );
             }
             input.push(serde_json::json!({
@@ -908,7 +916,7 @@ impl Provider for OpenAIProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = crate::util::http_error_body(response, "HTTP error").await;
+            let body = jcode_base::util::http_error_body(response, "HTTP error").await;
             anyhow::bail!("OpenAI compact error {}: {}", status, body);
         }
 
@@ -932,17 +940,17 @@ impl Provider for OpenAIProvider {
             })
             .ok_or_else(|| anyhow::anyhow!("OpenAI compact response missing compaction item"))?;
 
-        if !crate::provider::openai_request::openai_encrypted_content_is_sendable(
+        if !jcode_base::provider::openai_request::openai_encrypted_content_is_sendable(
             &encrypted_content,
         ) {
             anyhow::bail!(
                 "OpenAI compact response returned oversized encrypted_content ({} chars > safe limit {} chars)",
                 encrypted_content.len(),
-                crate::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS,
+                jcode_base::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS,
             );
         }
 
-        Ok(crate::provider::NativeCompactionResult {
+        Ok(jcode_provider_core::NativeCompactionResult {
             summary_text: None,
             openai_encrypted_content: Some(encrypted_content),
         })
@@ -950,8 +958,8 @@ impl Provider for OpenAIProvider {
 
     fn context_window(&self) -> usize {
         let model = self.model();
-        crate::provider::context_limit_for_model_with_provider(&model, Some(self.name()))
-            .unwrap_or(crate::provider::DEFAULT_CONTEXT_LIMIT)
+        jcode_provider_core::context_limit_for_model_with_provider(&model, Some(self.name()))
+            .unwrap_or(jcode_provider_core::DEFAULT_CONTEXT_LIMIT)
     }
 
     fn fork(&self) -> Arc<dyn Provider> {

@@ -1,10 +1,10 @@
 #[test]
 fn test_openai_supports_codex_models() {
-    let _guard = crate::storage::lock_test_env();
-    crate::auth::codex::set_active_account_override(Some(
+    let _guard = jcode_base::storage::lock_test_env();
+    jcode_base::auth::codex::set_active_account_override(Some(
         "openai-supports-codex-models".to_string(),
     ));
-    crate::provider::populate_account_models(vec![
+    jcode_base::provider::populate_account_models(vec![
         "gpt-5.1-codex".to_string(),
         "gpt-5.1-codex-mini".to_string(),
         "gpt-5.2-codex".to_string(),
@@ -28,15 +28,15 @@ fn test_openai_supports_codex_models() {
     provider.set_model("gpt-5.1-codex-mini").unwrap();
     assert_eq!(provider.model(), "gpt-5.1-codex-mini");
 
-    crate::auth::codex::set_active_account_override(None);
+    jcode_base::auth::codex::set_active_account_override(None);
 }
 
 #[test]
 fn test_openai_switching_models_include_dynamic_catalog_entries() {
-    let _guard = crate::storage::lock_test_env();
+    let _guard = jcode_base::storage::lock_test_env();
     let dynamic_model = "gpt-5.9-switching-test";
-    crate::auth::codex::set_active_account_override(Some("switching-test".to_string()));
-    crate::provider::populate_account_models(vec![
+    jcode_base::auth::codex::set_active_account_override(Some("switching-test".to_string()));
+    jcode_base::provider::populate_account_models(vec![
         "gpt-5.4".to_string(),
         dynamic_model.to_string(),
     ]);
@@ -53,7 +53,7 @@ fn test_openai_switching_models_include_dynamic_catalog_entries() {
     assert!(models.contains(&"gpt-5.4".to_string()));
     assert!(models.contains(&dynamic_model.to_string()));
 
-    crate::auth::codex::set_active_account_override(None);
+    jcode_base::auth::codex::set_active_account_override(None);
 }
 
 #[test]
@@ -123,9 +123,9 @@ fn test_persistent_ws_idle_policy_thresholds() {
     reason = "test intentionally serializes process-wide active OpenAI account model cache across async websocket state setup"
 )]
 async fn test_set_model_clears_persistent_ws_state() {
-    let _guard = crate::storage::lock_test_env();
-    crate::auth::codex::set_active_account_override(Some("openai-set-model-clears-ws".to_string()));
-    crate::provider::populate_account_models(vec!["gpt-5.3-codex".to_string()]);
+    let _guard = jcode_base::storage::lock_test_env();
+    jcode_base::auth::codex::set_active_account_override(Some("openai-set-model-clears-ws".to_string()));
+    jcode_base::provider::populate_account_models(vec!["gpt-5.3-codex".to_string()]);
 
     let provider = OpenAIProvider::new(CodexCredentials {
         access_token: "test".to_string(),
@@ -144,7 +144,7 @@ async fn test_set_model_clears_persistent_ws_state() {
         "changing models should reset the persistent websocket chain"
     );
     server.abort();
-    crate::auth::codex::set_active_account_override(None);
+    jcode_base::auth::codex::set_active_account_override(None);
 }
 
 #[tokio::test]
@@ -269,7 +269,7 @@ fn openai_catalog_and_chat_endpoints_agree_on_credential_shape() {
 /// while ChatGPT/Codex OAuth mode stays pinned to the Codex backend.
 #[test]
 fn responses_url_honors_api_base_override_in_api_key_mode() {
-    let _guard = crate::storage::lock_test_env();
+    let _guard = jcode_base::storage::lock_test_env();
     let _b = EnvVarGuard::remove("JCODE_OPENAI_API_BASE");
     let _c = EnvVarGuard::remove("OPENAI_BASE_URL");
     let _d = EnvVarGuard::remove("OPENAI_API_BASE");
@@ -308,7 +308,7 @@ fn responses_url_honors_api_base_override_in_api_key_mode() {
 
 #[test]
 fn responses_url_ignores_override_in_chatgpt_mode() {
-    let _guard = crate::storage::lock_test_env();
+    let _guard = jcode_base::storage::lock_test_env();
     let _override = EnvVarGuard::set("JCODE_OPENAI_API_BASE", "http://127.0.0.1:8317/v1");
 
     let oauth_creds = CodexCredentials {
@@ -327,7 +327,7 @@ fn responses_url_ignores_override_in_chatgpt_mode() {
 
 #[test]
 fn resolve_api_base_precedence_and_validation() {
-    let _guard = crate::storage::lock_test_env();
+    let _guard = jcode_base::storage::lock_test_env();
     let _a = EnvVarGuard::remove("JCODE_OPENAI_API_BASE");
     let _b = EnvVarGuard::remove("OPENAI_BASE_URL");
     let _c = EnvVarGuard::remove("OPENAI_API_BASE");

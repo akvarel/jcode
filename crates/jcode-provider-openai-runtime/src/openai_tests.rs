@@ -1,10 +1,10 @@
 #![allow(clippy::collapsible_match)]
 
 use super::*;
-use crate::auth::codex::CodexCredentials;
-use crate::message::{ContentBlock, Role};
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
+use jcode_base::auth::codex::CodexCredentials;
+use jcode_message_types::{ContentBlock, Role};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -23,19 +23,19 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
-        crate::env::set_var(key, value);
+        jcode_base::env::set_var(key, value);
         Self { key, previous }
     }
 
     fn set_path(key: &'static str, value: &std::path::Path) -> Self {
         let previous = std::env::var_os(key);
-        crate::env::set_var(key, value);
+        jcode_base::env::set_var(key, value);
         Self { key, previous }
     }
 
     fn remove(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
-        crate::env::remove_var(key);
+        jcode_base::env::remove_var(key);
         Self { key, previous }
     }
 }
@@ -43,9 +43,9 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         if let Some(previous) = &self.previous {
-            crate::env::set_var(self.key, previous);
+            jcode_base::env::set_var(self.key, previous);
         } else {
-            crate::env::remove_var(self.key);
+            jcode_base::env::remove_var(self.key);
         }
     }
 }
@@ -96,7 +96,7 @@ struct LiveOpenAITestEnv {
 
 impl LiveOpenAITestEnv {
     fn new() -> Result<Option<Self>> {
-        let lock = crate::storage::lock_test_env();
+        let lock = jcode_base::storage::lock_test_env();
         let Some(source_auth) = real_codex_auth_path() else {
             return Ok(None);
         };
@@ -134,18 +134,18 @@ fn real_codex_auth_path() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-async fn live_openai_catalog() -> Result<Option<crate::provider::OpenAIModelCatalog>> {
+async fn live_openai_catalog() -> Result<Option<jcode_base::provider::OpenAIModelCatalog>> {
     let Some(_env) = LiveOpenAITestEnv::new()? else {
         return Ok(None);
     };
-    let creds = crate::auth::codex::load_credentials()?;
+    let creds = jcode_base::auth::codex::load_credentials()?;
     if !OpenAIProvider::is_chatgpt_mode(&creds) {
         return Ok(None);
     }
 
     let token = openai_access_token(&Arc::new(RwLock::new(creds))).await?;
     Ok(Some(
-        crate::provider::fetch_openai_model_catalog(&token).await?,
+        jcode_base::provider::fetch_openai_model_catalog(&token).await?,
     ))
 }
 
@@ -153,7 +153,7 @@ async fn live_openai_smoke(model: &str, sentinel: &str) -> Result<Option<String>
     let Some(_env) = LiveOpenAITestEnv::new()? else {
         return Ok(None);
     };
-    let creds = crate::auth::codex::load_credentials()?;
+    let creds = jcode_base::auth::codex::load_credentials()?;
     if !OpenAIProvider::is_chatgpt_mode(&creds) {
         return Ok(None);
     }
@@ -178,17 +178,17 @@ include!("openai_tests/parsing_tools.rs");
 /// actually use.
 #[test]
 fn openai_credential_mode_runtime_provider_identity_round_trips() {
-    let _guard = crate::storage::lock_test_env();
+    let _guard = jcode_base::storage::lock_test_env();
     let previous = std::env::var_os("JCODE_RUNTIME_PROVIDER");
 
-    crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai");
+    jcode_base::env::set_var("JCODE_RUNTIME_PROVIDER", "openai");
     assert_eq!(
         OpenAICredentialMode::from_runtime_env(jcode_provider_core::DualAuthProvider::OpenAI),
         OpenAICredentialMode::OAuth,
         "OAuth selection must surface as the OAuth runtime identity"
     );
 
-    crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-api");
+    jcode_base::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-api");
     assert_eq!(
         OpenAICredentialMode::from_runtime_env(jcode_provider_core::DualAuthProvider::OpenAI),
         OpenAICredentialMode::ApiKey,
@@ -196,7 +196,7 @@ fn openai_credential_mode_runtime_provider_identity_round_trips() {
     );
 
     match previous {
-        Some(value) => crate::env::set_var("JCODE_RUNTIME_PROVIDER", value),
-        None => crate::env::remove_var("JCODE_RUNTIME_PROVIDER"),
+        Some(value) => jcode_base::env::set_var("JCODE_RUNTIME_PROVIDER", value),
+        None => jcode_base::env::remove_var("JCODE_RUNTIME_PROVIDER"),
     }
 }

@@ -5,7 +5,7 @@ use super::*;
 /// raises it above the default so slow reasoning models don't get cut off at
 /// the hardcoded budget on one transport but not another (issue #434).
 pub(super) fn effective_ws_completion_timeout_secs() -> u64 {
-    WEBSOCKET_COMPLETION_TIMEOUT_SECS.max(crate::provider::stream_idle_timeout().as_secs())
+    WEBSOCKET_COMPLETION_TIMEOUT_SECS.max(jcode_base::provider::stream_idle_timeout().as_secs())
 }
 
 pub(super) async fn openai_access_token(
@@ -78,19 +78,19 @@ pub(super) async fn stream_response(
     initial_status_detail: String,
     tx: mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<(), OpenAIStreamFailure> {
-    use crate::message::ConnectionPhase;
+    use jcode_message_types::ConnectionPhase;
     let request_model = openai_request_model(&request);
     let stream_started_at = Instant::now();
     log_openai_stream_lifecycle(
-        crate::logging::LogLevel::Info,
+        jcode_base::logging::LogLevel::Info,
         "https_request_start",
         vec![
             ("model", request_model.clone()),
             ("transport", "https".to_string()),
         ],
     );
-    let usage_snapshot = crate::usage::get_openai_usage_sync();
-    crate::logging::info(&format!(
+    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
+    jcode_base::logging::info(&format!(
         "OpenAI limit diag: starting fresh HTTPS request usage=({})",
         usage_snapshot.diagnostic_fields()
     ));
@@ -126,13 +126,13 @@ pub(super) async fn stream_response(
         .map_err(OpenAIStreamFailure::Other)?;
 
     let connect_ms = connect_start.elapsed().as_millis();
-    crate::logging::info(&format!(
+    jcode_base::logging::info(&format!(
         "HTTP connection established in {}ms (status={})",
         connect_ms,
         response.status()
     ));
     log_openai_stream_lifecycle(
-        crate::logging::LogLevel::Info,
+        jcode_base::logging::LogLevel::Info,
         "https_connected",
         vec![
             ("model", request_model.clone()),
@@ -141,7 +141,7 @@ pub(super) async fn stream_response(
         ],
     );
     if response.status().is_success() && usage_snapshot.exhausted() {
-        crate::logging::warn(&format!(
+        jcode_base::logging::warn(&format!(
             "OpenAI limit diag: fresh HTTPS request accepted while local usage indicates exhausted usage=({})",
             usage_snapshot.diagnostic_fields()
         ));
@@ -155,9 +155,9 @@ pub(super) async fn stream_response(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
 
-        let body = crate::util::http_error_body(response, "HTTP error").await;
+        let body = jcode_base::util::http_error_body(response, "HTTP error").await;
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Warn,
+            jcode_base::logging::LogLevel::Warn,
             "https_http_error",
             vec![
                 ("model", request_model.clone()),
@@ -179,8 +179,8 @@ pub(super) async fn stream_response(
         if let Some(reason) = classify_unavailable_model_error(status, &body)
             && let Some(model_name) = request.get("model").and_then(|m| m.as_str())
         {
-            crate::provider::record_model_unavailable_for_account(model_name, &reason);
-            crate::logging::warn(&format!(
+            jcode_base::provider::record_model_unavailable_for_account(model_name, &reason);
+            jcode_base::logging::warn(&format!(
                 "Recorded OpenAI model '{}' as unavailable: {}",
                 model_name, reason
             ));
@@ -205,7 +205,7 @@ pub(super) async fn stream_response(
 
             match force_refresh_openai_token(&credentials, &refresh_token).await {
                 Ok(_) => {
-                    crate::logging::info(
+                    jcode_base::logging::info(
                         "OpenAI access token rejected; refreshed credentials and will retry",
                     );
                     // Surface a retryable error so the retry loop reconnects
@@ -253,7 +253,7 @@ pub(super) async fn stream_response(
     // minutes get cancelled prematurely. Resolved from
     // `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
     // (issue #434).
-    let idle_timeout = crate::provider::stream_idle_timeout();
+    let idle_timeout = jcode_base::provider::stream_idle_timeout();
 
     use futures::StreamExt;
     loop {
@@ -262,7 +262,7 @@ pub(super) async fn stream_response(
             Ok(None) => break, // stream ended normally
             Err(_) => {
                 log_openai_stream_lifecycle(
-                    crate::logging::LogLevel::Warn,
+                    jcode_base::logging::LogLevel::Warn,
                     "https_stream_idle_timeout",
                     vec![
                         ("model", request_model.clone()),
@@ -292,7 +292,7 @@ pub(super) async fn stream_response(
                     }
                     if is_retryable_error(&message.to_lowercase()) {
                         log_openai_stream_lifecycle(
-                            crate::logging::LogLevel::Warn,
+                            jcode_base::logging::LogLevel::Warn,
                             "https_stream_retryable_error",
                             vec![
                                 ("model", request_model.clone()),
@@ -312,7 +312,7 @@ pub(super) async fn stream_response(
                 if tx.send(Ok(event)).await.is_err() {
                     // Receiver dropped, stop streaming
                     log_openai_stream_lifecycle(
-                        crate::logging::LogLevel::Warn,
+                        jcode_base::logging::LogLevel::Warn,
                         "consumer_dropped",
                         vec![
                             ("model", request_model.clone()),
@@ -328,7 +328,7 @@ pub(super) async fn stream_response(
             }
             Err(e) => {
                 log_openai_stream_lifecycle(
-                    crate::logging::LogLevel::Warn,
+                    jcode_base::logging::LogLevel::Warn,
                     "https_stream_error",
                     vec![
                         ("model", request_model.clone()),
@@ -349,7 +349,7 @@ pub(super) async fn stream_response(
 
     if !saw_message_end {
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Warn,
+            jcode_base::logging::LogLevel::Warn,
             "https_eof_before_message_end",
             vec![
                 ("model", request_model.clone()),
@@ -365,7 +365,7 @@ pub(super) async fn stream_response(
     }
 
     log_openai_stream_lifecycle(
-        crate::logging::LogLevel::Info,
+        jcode_base::logging::LogLevel::Info,
         "https_stream_complete",
         vec![
             ("model", request_model),
@@ -407,7 +407,7 @@ pub(super) async fn try_persistent_ws_continuation(
         Some(s) => s,
         None => {
             log_openai_stream_lifecycle(
-                crate::logging::LogLevel::Info,
+                jcode_base::logging::LogLevel::Info,
                 "persistent_reuse_unavailable_detail",
                 vec![
                     ("model", request_model.clone()),
@@ -420,10 +420,10 @@ pub(super) async fn try_persistent_ws_continuation(
 
     // Check connection age - reconnect before the 60-min server limit
     if state.connected_at.elapsed() >= Duration::from_secs(WEBSOCKET_PERSISTENT_MAX_AGE_SECS) {
-        crate::logging::info("Persistent WS connection too old; forcing reconnect");
+        jcode_base::logging::info("Persistent WS connection too old; forcing reconnect");
         *guard = None;
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Info,
+            jcode_base::logging::LogLevel::Info,
             "persistent_state_reset",
             vec![
                 ("model", request_model.clone()),
@@ -444,10 +444,10 @@ pub(super) async fn try_persistent_ws_continuation(
     match ensure_persistent_ws_is_healthy(state).await {
         Ok(true) => {}
         Ok(false) => {
-            crate::logging::info("Persistent WS healthcheck requested reconnect before reuse");
+            jcode_base::logging::info("Persistent WS healthcheck requested reconnect before reuse");
             *guard = None;
             log_openai_stream_lifecycle(
-                crate::logging::LogLevel::Info,
+                jcode_base::logging::LogLevel::Info,
                 "persistent_state_reset",
                 vec![
                     ("model", request_model.clone()),
@@ -457,13 +457,13 @@ pub(super) async fn try_persistent_ws_continuation(
             return PersistentWsResult::NotAvailable;
         }
         Err(err) => {
-            crate::logging::warn(&format!(
+            jcode_base::logging::warn(&format!(
                 "Persistent WS healthcheck failed: {}; forcing reconnect",
                 err
             ));
             *guard = None;
             log_openai_stream_lifecycle(
-                crate::logging::LogLevel::Warn,
+                jcode_base::logging::LogLevel::Warn,
                 "persistent_state_reset",
                 vec![
                     ("model", request_model.clone()),
@@ -480,12 +480,12 @@ pub(super) async fn try_persistent_ws_continuation(
     // was reset (e.g., after compaction) - we need a fresh connection.
     if input_item_count <= state.last_input_item_count {
         let last_input_item_count = state.last_input_item_count;
-        crate::logging::info(&format!(
+        jcode_base::logging::info(&format!(
             "Input items didn't grow ({} <= {}); conversation may have been compacted, reconnecting",
             input_item_count, last_input_item_count
         ));
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Info,
+            jcode_base::logging::LogLevel::Info,
             "persistent_state_reset",
             vec![
                 ("model", request_model.clone()),
@@ -510,16 +510,16 @@ pub(super) async fn try_persistent_ws_continuation(
     let (incremental_items, skipped_reasoning_items) =
         persistent_ws_incremental_items(input, state.last_input_item_count);
     if skipped_reasoning_items > 0 {
-        crate::logging::info(&format!(
+        jcode_base::logging::info(&format!(
             "Skipped {} reasoning item(s) in persistent WS continuation delta to avoid duplicate rs_* replay",
             skipped_reasoning_items
         ));
     }
     if incremental_items.is_empty() {
-        crate::logging::info("No incremental items to send; need fresh request");
+        jcode_base::logging::info("No incremental items to send; need fresh request");
         *guard = None;
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Info,
+            jcode_base::logging::LogLevel::Info,
             "persistent_state_reset",
             vec![
                 ("model", request_model.clone()),
@@ -533,15 +533,15 @@ pub(super) async fn try_persistent_ws_continuation(
     let previous_response_id = state.last_response_id.clone();
     let request_prompt_cache_key_hash = request
         .get("prompt_cache_key")
-        .map(crate::provider::fingerprint::stable_hash_json);
-    let usage_snapshot = crate::usage::get_openai_usage_sync();
-    crate::logging::info(&format!(
+        .map(jcode_provider_core::fingerprint::stable_hash_json);
+    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
+    jcode_base::logging::info(&format!(
         "OpenAI limit diag: attempting persistent WS reuse previous_response_id_present={} usage=({}) state=({})",
         !previous_response_id.is_empty(),
         usage_snapshot.diagnostic_fields(),
         state.diag_snapshot().log_fields()
     ));
-    crate::logging::info(&format!(
+    jcode_base::logging::info(&format!(
         "Persistent WS continuation: previous_response_id={} {} tool_callback={} (was {} now {})",
         previous_response_id,
         incremental_stats.log_fields(),
@@ -550,7 +550,7 @@ pub(super) async fn try_persistent_ws_continuation(
         input_item_count,
     ));
     log_openai_stream_lifecycle(
-        crate::logging::LogLevel::Info,
+        jcode_base::logging::LogLevel::Info,
         "persistent_reuse_start",
         vec![
             ("model", request_model.clone()),
@@ -654,14 +654,14 @@ pub(super) async fn try_persistent_ws_continuation(
         .unwrap_or(0);
     let prompt_cache_key_hash = continuation_request
         .get("prompt_cache_key")
-        .map(crate::provider::fingerprint::stable_hash_json);
+        .map(jcode_provider_core::fingerprint::stable_hash_json);
     let model_for_fingerprint = continuation_request
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("unknown");
     let continuation_payload = serde_json::json!({
         "type": continuation_request.get("type"),
-        "previous_response_id_hash": crate::provider::fingerprint::stable_hash_str(&previous_response_id),
+        "previous_response_id_hash": jcode_provider_core::fingerprint::stable_hash_str(&previous_response_id),
         "model": continuation_request.get("model"),
         "instructions": continuation_request.get("instructions"),
         "input": &incremental_items,
@@ -675,7 +675,7 @@ pub(super) async fn try_persistent_ws_continuation(
         "prompt_cache_key": continuation_request.get("prompt_cache_key"),
         "prompt_cache_retention": continuation_request.get("prompt_cache_retention"),
     });
-    crate::provider::fingerprint::log_provider_canonical_input(
+    jcode_provider_core::fingerprint::log_provider_canonical_input(
         "openai",
         model_for_fingerprint,
         "openai_responses_ws_delta",
@@ -745,9 +745,9 @@ pub(super) async fn try_persistent_ws_continuation(
     if let Err(e) = state.ws_stream.send(WsMessage::Text(request_text)).await {
         return PersistentWsResult::Failed(format!("send error: {}", e));
     }
-    emit_connection_phase(tx, crate::message::ConnectionPhase::WaitingForResponse).await;
+    emit_connection_phase(tx, jcode_message_types::ConnectionPhase::WaitingForResponse).await;
     state.last_activity_at = Instant::now();
-    crate::logging::info(&format!(
+    jcode_base::logging::info(&format!(
         "Persistent WS continuation request sent in {}ms ({})",
         send_started_at.elapsed().as_millis(),
         incremental_stats.log_fields(),
@@ -817,8 +817,9 @@ pub(super) async fn try_persistent_ws_continuation(
             Ok(WsMessage::Text(text)) => {
                 let text = text.to_string();
                 if !logged_first_server_event {
-                    emit_connection_phase(tx, crate::message::ConnectionPhase::Streaming).await;
-                    crate::logging::info(&format!(
+                    emit_connection_phase(tx, jcode_message_types::ConnectionPhase::Streaming)
+                        .await;
+                    jcode_base::logging::info(&format!(
                         "Persistent WS first server event after {}ms ({})",
                         stream_started.elapsed().as_millis(),
                         incremental_stats.log_fields(),
@@ -845,15 +846,15 @@ pub(super) async fn try_persistent_ws_continuation(
                         .and_then(|id| id.as_str())
                 {
                     new_response_id = Some(id.to_string());
-                    crate::logging::info(&format!(
+                    jcode_base::logging::info(&format!(
                         "Persistent WS got new response_id after {}ms: {} ({})",
                         stream_started.elapsed().as_millis(),
                         id,
                         incremental_stats.log_fields(),
                     ));
-                    let usage_snapshot = crate::usage::get_openai_usage_sync();
+                    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
                     if usage_snapshot.exhausted() {
-                        crate::logging::warn(&format!(
+                        jcode_base::logging::warn(&format!(
                             "OpenAI limit diag: persistent WS reuse accepted request while local usage indicates exhausted usage=({}) state=({})",
                             usage_snapshot.diagnostic_fields(),
                             state.diag_snapshot().log_fields()
@@ -927,14 +928,14 @@ pub(super) async fn try_persistent_ws_continuation(
         state.last_input_item_count = input_item_count;
         state.message_count += 1;
         state.last_activity_at = Instant::now();
-        crate::logging::info(&format!(
+        jcode_base::logging::info(&format!(
             "Persistent WS continuation success after {}ms (chain length: {}, {})",
             stream_started.elapsed().as_millis(),
             state.message_count,
             incremental_stats.log_fields(),
         ));
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Info,
+            jcode_base::logging::LogLevel::Info,
             "persistent_reuse_stream_complete",
             vec![
                 ("model", request_model),
@@ -949,10 +950,10 @@ pub(super) async fn try_persistent_ws_continuation(
         PersistentWsResult::Success
     } else {
         // Got response but no response_id - can't chain further
-        crate::logging::warn("Persistent WS: no response_id in response; breaking chain");
+        jcode_base::logging::warn("Persistent WS: no response_id in response; breaking chain");
         *guard = None;
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Warn,
+            jcode_base::logging::LogLevel::Warn,
             "persistent_state_reset",
             vec![
                 ("model", request_model),
@@ -976,7 +977,7 @@ pub(super) async fn stream_response_websocket_persistent(
     persistent_ws: Arc<Mutex<Option<PersistentWsState>>>,
     input_item_count: usize,
 ) -> Result<(), OpenAIStreamFailure> {
-    use crate::message::ConnectionPhase;
+    use jcode_message_types::ConnectionPhase;
     let request_model = request
         .get("model")
         .and_then(|m| m.as_str())
@@ -986,7 +987,7 @@ pub(super) async fn stream_response_websocket_persistent(
         .unwrap_or_else(|| "unknown".to_string());
     let stream_started_at = Instant::now();
     log_openai_stream_lifecycle(
-        crate::logging::LogLevel::Info,
+        jcode_base::logging::LogLevel::Info,
         "fresh_ws_request_start",
         vec![
             ("model", request_model_label.clone()),
@@ -996,8 +997,8 @@ pub(super) async fn stream_response_websocket_persistent(
     );
 
     let access_token = openai_access_token(&credentials).await?;
-    let usage_snapshot = crate::usage::get_openai_usage_sync();
-    crate::logging::info(&format!(
+    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
+    jcode_base::logging::info(&format!(
         "OpenAI limit diag: opening fresh persistent WS request usage=({})",
         usage_snapshot.diagnostic_fields()
     ));
@@ -1059,12 +1060,12 @@ pub(super) async fn stream_response_websocket_persistent(
     let (mut ws_stream, _response) = match connect_result {
         Ok((stream, response)) => {
             let connect_ms = connect_start.elapsed().as_millis();
-            crate::logging::info(&format!(
+            jcode_base::logging::info(&format!(
                 "WebSocket connection established in {}ms (persistent mode)",
                 connect_ms
             ));
             log_openai_stream_lifecycle(
-                crate::logging::LogLevel::Info,
+                jcode_base::logging::LogLevel::Info,
                 "fresh_ws_connected",
                 vec![
                     ("model", request_model_label.clone()),
@@ -1130,7 +1131,7 @@ pub(super) async fn stream_response_websocket_persistent(
         .await
         .map_err(|err| OpenAIStreamFailure::Other(anyhow::anyhow!(err)))?;
     emit_connection_phase(&tx, ConnectionPhase::WaitingForResponse).await;
-    crate::logging::info(&format!(
+    jcode_base::logging::info(&format!(
         "Fresh WS request sent in {}ms ({})",
         request_send_started_at.elapsed().as_millis(),
         request_input_stats.log_fields(),
@@ -1210,7 +1211,7 @@ pub(super) async fn stream_response_websocket_persistent(
                     let text = text.to_string();
                     if !logged_first_server_event {
                         emit_connection_phase(&tx, ConnectionPhase::Streaming).await;
-                        crate::logging::info(&format!(
+                        jcode_base::logging::info(&format!(
                             "Fresh WS first server event after {}ms ({})",
                             ws_started_at.elapsed().as_millis(),
                             request_input_stats.log_fields(),
@@ -1234,14 +1235,14 @@ pub(super) async fn stream_response_websocket_persistent(
                             .and_then(|id| id.as_str())
                     {
                         response_id = Some(id.to_string());
-                        crate::logging::info(&format!(
+                        jcode_base::logging::info(&format!(
                             "Fresh WS got response_id after {}ms: {} (will save for continuation; {})",
                             ws_started_at.elapsed().as_millis(),
                             id,
                             request_input_stats.log_fields(),
                         ));
                         if usage_snapshot.exhausted() {
-                            crate::logging::warn(&format!(
+                            jcode_base::logging::warn(&format!(
                                 "OpenAI limit diag: fresh WS request accepted while local usage indicates exhausted usage=({})",
                                 usage_snapshot.diagnostic_fields()
                             ));
@@ -1281,7 +1282,7 @@ pub(super) async fn stream_response_websocket_persistent(
                         }
                         if tx.send(Ok(event)).await.is_err() {
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Warn,
+                                jcode_base::logging::LogLevel::Warn,
                                 "consumer_dropped",
                                 vec![
                                     ("model", request_model_label.clone()),
@@ -1317,7 +1318,7 @@ pub(super) async fn stream_response_websocket_persistent(
                         }
                         if tx.send(Ok(event)).await.is_err() {
                             log_openai_stream_lifecycle(
-                                crate::logging::LogLevel::Warn,
+                                jcode_base::logging::LogLevel::Warn,
                                 "consumer_dropped",
                                 vec![
                                     ("model", request_model_label.clone()),
@@ -1370,14 +1371,14 @@ pub(super) async fn stream_response_websocket_persistent(
     // Save the WebSocket connection and response_id for reuse on next turn
     if let Some(resp_id) = response_id {
         let mut guard = persistent_ws.lock().await;
-        crate::logging::info(&format!(
+        jcode_base::logging::info(&format!(
             "Saving persistent WS connection after {}ms (response_id={}, {})",
             ws_started_at.elapsed().as_millis(),
             resp_id,
             request_input_stats.log_fields(),
         ));
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Info,
+            jcode_base::logging::LogLevel::Info,
             "fresh_ws_stream_complete_saved",
             vec![
                 ("model", request_model_label.clone()),
@@ -1398,11 +1399,11 @@ pub(super) async fn stream_response_websocket_persistent(
             last_input_item_count: input_item_count,
         });
     } else {
-        crate::logging::info(
+        jcode_base::logging::info(
             "No response_id captured from WS stream; connection not saved for reuse",
         );
         log_openai_stream_lifecycle(
-            crate::logging::LogLevel::Warn,
+            jcode_base::logging::LogLevel::Warn,
             "fresh_ws_stream_complete_not_saved",
             vec![
                 ("model", request_model_label),
@@ -1437,8 +1438,8 @@ fn maybe_record_runtime_model_unavailable_from_stream_error(model: &str, message
         .or_else(|| classify_unavailable_model_error(StatusCode::FORBIDDEN, message));
 
     if let Some(reason) = reason {
-        crate::provider::record_model_unavailable_for_account(model, &reason);
-        crate::logging::warn(&format!(
+        jcode_base::provider::record_model_unavailable_for_account(model, &reason);
+        jcode_base::logging::warn(&format!(
             "Recorded OpenAI model '{}' as unavailable from stream error: {}",
             model, reason
         ));
@@ -1493,7 +1494,7 @@ pub(super) fn is_retryable_error(error_str: &str) -> bool {
     // TLS BadRecordMac / fatal-alert, TLS handshake EOF, DNS/route failures,
     // and HTTP/2 stream/protocol faults). Keeping the OpenAI path delegated
     // here ensures retry behavior is unified across providers (issue #338).
-    crate::provider::is_transient_transport_error(error_str)
+    jcode_provider_core::is_transient_transport_error(error_str)
         // OpenAI-specific transport wrapper.
         || error_str.contains("failed to send request to openai api")
         // Stream/decode errors specific to the OpenAI streaming runtime.

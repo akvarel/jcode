@@ -6,8 +6,8 @@ async fn live_openai_catalog_lists_gpt_5_4_family() -> Result<()> {
         return Ok(());
     };
 
-    crate::provider::populate_context_limits(catalog.context_limits.clone());
-    crate::provider::populate_account_models(catalog.available_models.clone());
+    jcode_base::provider::populate_context_limits(catalog.context_limits.clone());
+    jcode_base::provider::populate_account_models(catalog.available_models.clone());
 
     assert!(
         catalog
@@ -18,7 +18,7 @@ async fn live_openai_catalog_lists_gpt_5_4_family() -> Result<()> {
         catalog.available_models
     );
     assert!(
-        crate::provider::known_openai_model_ids()
+        jcode_base::provider::known_openai_model_ids()
             .iter()
             .any(|model| model == "gpt-5.4"),
         "expected GPT-5.4 in display model list"
@@ -31,7 +31,7 @@ async fn live_openai_catalog_lists_gpt_5_4_family() -> Result<()> {
         .unwrap_or_default()
         >= 1_000_000;
     assert_eq!(
-        crate::provider::known_openai_model_ids()
+        jcode_base::provider::known_openai_model_ids()
             .iter()
             .any(|model| model == "gpt-5.4[1m]"),
         reports_long_context,
@@ -48,8 +48,8 @@ async fn live_openai_gpt_5_4_and_fast_requests_succeed() -> Result<()> {
         eprintln!("skipping live OpenAI response test: no real OAuth credentials");
         return Ok(());
     };
-    crate::provider::populate_context_limits(catalog.context_limits.clone());
-    crate::provider::populate_account_models(catalog.available_models.clone());
+    jcode_base::provider::populate_context_limits(catalog.context_limits.clone());
+    jcode_base::provider::populate_account_models(catalog.available_models.clone());
 
     let Some(plain_response) = live_openai_smoke("gpt-5.4", "JCODE_GPT54_OK").await? else {
         eprintln!("skipping live OpenAI response test: no real OAuth credentials");
@@ -79,7 +79,7 @@ async fn live_openai_gpt_5_4_and_fast_requests_succeed() -> Result<()> {
         );
     }
 
-    if crate::provider::known_openai_model_ids()
+    if jcode_base::provider::known_openai_model_ids()
         .iter()
         .any(|model| model == "gpt-5.4[1m]")
     {
@@ -391,7 +391,7 @@ fn test_websocket_activity_timeout_kind_labels_first_and_next() {
 
 #[test]
 fn test_websocket_completion_timeout_extends_with_configured_idle_budget() {
-    use crate::provider::openai::websocket_health::websocket_next_activity_timeout_secs_with_completion;
+    use crate::websocket_health::websocket_next_activity_timeout_secs_with_completion;
     // A custom completion budget larger than the default should be honored
     // once API activity has been seen (issue #434).
     let ws_started_at = Instant::now() - Duration::from_secs(400);

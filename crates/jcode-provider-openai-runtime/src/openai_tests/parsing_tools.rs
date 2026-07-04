@@ -262,7 +262,7 @@ fn test_parse_openai_response_output_item_done_emits_reasoning_item() {
 
 #[test]
 fn test_parse_openai_response_image_generation_saves_metadata_and_emits_event() {
-    let _lock = crate::storage::lock_test_env();
+    let _lock = jcode_base::storage::lock_test_env();
     let original_dir = std::env::current_dir().expect("current dir");
     let temp = tempfile::Builder::new()
         .prefix("jcode-openai-image-test-")
