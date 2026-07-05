@@ -63,6 +63,18 @@ fn probe(name: &str, src: &str) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ok = true;
 
+    // Ad hoc mode: pass a path to a JSON array of plan items to render just
+    // that plan (prints the generated mermaid source and probes it).
+    if let Some(path) = std::env::args().nth(1) {
+        let raw = std::fs::read_to_string(&path)?;
+        let items: Vec<PlanItem> = serde_json::from_str(&raw)?;
+        println!("external plan: {} items", items.len());
+        let src = swarm_plan_mermaid(&items).ok_or("graph render returned None")?;
+        println!("--- external plan mermaid ---\n{src}");
+        let ok = probe("external-plan", &src);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     // (a) real plan fixture (35 items at snapshot time, so it also exercises
     // real truncation) + (a23) the original 23-item shape.
     let fixture = include_str!("swarm_plan_fixture.json");
