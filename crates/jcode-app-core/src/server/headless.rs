@@ -18,7 +18,7 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
     clippy::too_many_arguments,
     reason = "headless session creation wires provider, global session, swarm state, interrupts, and MCP pool together"
 )]
-pub(super) async fn create_headless_session(
+pub async fn create_headless_session(
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn Provider>,
