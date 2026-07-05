@@ -1856,6 +1856,17 @@ impl Provider for MultiProvider {
             && let Some(target) = provider_from_model_key(target_provider)
         {
             self.set_model_on_provider(target, model)
+        } else if self.active_provider() == ActiveProvider::OpenRouter
+            && let Some(profile_id) = ProviderRegistry::new(self)
+                .active_compatible_profile_id()
+            && let Some(profile) =
+                crate::provider_catalog::openai_compatible_profile_by_id(&profile_id)
+        {
+            // When the active slot is OpenRouter with a compatible profile
+            // (e.g. DeepSeek), route the unknown model through that profile
+            // instead of falling through to set_model_on_provider which would
+            // clear the profile and fail on missing real-OpenRouter credentials.
+            self.set_model_on_openai_compatible_profile(profile, model)
         } else {
             // Unknown model - try current provider.
             self.set_model_on_provider(self.active_provider(), model)
