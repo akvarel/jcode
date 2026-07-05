@@ -3266,7 +3266,7 @@ fn move_tool_to_background(
 }
 
 /// Process a message and stream events (mpsc channel - per-client)
-pub(super) async fn process_message_streaming_mpsc(
+pub async fn process_message_streaming_mpsc(
     agent: Arc<Mutex<Agent>>,
     content: &str,
     images: Vec<(String, String)>,

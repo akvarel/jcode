@@ -8,7 +8,7 @@ mod client_comm_channels;
 mod client_comm_context;
 mod client_comm_message;
 mod client_disconnect_cleanup;
-mod client_lifecycle;
+pub mod client_lifecycle;
 mod client_lifecycle_logging;
 mod client_lightweight_control;
 mod client_session;
@@ -32,7 +32,7 @@ mod debug_swarm_read;
 mod debug_swarm_write;
 mod debug_testers;
 mod durable_state;
-mod headless;
+pub mod headless;
 mod jade_relay;
 mod lifecycle;
 mod live_turn;
@@ -106,7 +106,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OnceCell, RwLock, broadcast, mpsc};
 
-pub(super) type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+pub type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 pub(super) type ChannelSubscriptions =
     Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
