@@ -583,7 +583,7 @@ async fn capture_runtime_memory_attribution_sample(
     sample
 }
 
-mod state;
+pub mod state;
 
 use self::state::latest_peer_touches;
 pub use self::state::{
