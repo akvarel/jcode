@@ -4,7 +4,7 @@
 //! need the full Agent SDK infrastructure.
 //!
 //! Automatically selects the best available backend:
-//! - OpenAI (gpt-5.3-codex-spark) if Codex credentials are available
+//! - OpenAI (gpt-5.6-luna, reasoning=none) if Codex credentials are available
 //! - Claude (claude-haiku-4-5-20241022) if Claude credentials are available
 
 use crate::auth;
@@ -13,7 +13,8 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 /// Fast/cheap OpenAI model used when Codex credentials are available.
-pub const SIDECAR_OPENAI_MODEL: &str = "gpt-5.3-codex-spark";
+pub const SIDECAR_OPENAI_MODEL: &str = "gpt-5.6-luna";
+const SIDECAR_OPENAI_REASONING: &str = "none";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL: &str = "gpt-5.4";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING: &str = "low";
 
@@ -74,7 +75,7 @@ pub struct Sidecar {
 
 impl Sidecar {
     /// Create a new sidecar client, auto-selecting the best available backend.
-    /// Prefers OpenAI (codex-spark) if creds exist, falls back to Claude.
+    /// Prefers OpenAI (GPT-5.6 Luna with no reasoning) if creds exist, falls back to Claude.
     pub fn new() -> Self {
         let configured_model = crate::config::config().agents.memory_model.clone();
         Self::with_configured_model(configured_model)
@@ -109,7 +110,7 @@ impl Sidecar {
     /// Pick the best available sidecar backend.
     ///
     /// Preference order:
-    /// 1. OpenAI codex-spark (dedicated fast/cheap OAuth path) if Codex creds exist.
+    /// 1. OpenAI GPT-5.6 Luna at reasoning=none if Codex creds exist.
     /// 2. Claude haiku (dedicated fast/cheap OAuth path) if Claude creds exist.
     /// 3. The live agent provider (works for EVERY provider jcode supports:
     ///    Copilot, Antigravity, Gemini, Cursor, Bedrock, OpenRouter, and even
@@ -299,7 +300,7 @@ impl Sidecar {
                         if is_openai_model_unavailable(status, &body)
                             && auth::claude::load_credentials().is_ok() =>
                     {
-                        // Both the codex-spark model and the gpt-5.4 OAuth
+                        // Both GPT-5.6 Luna and the gpt-5.4 OAuth
                         // fallback are denied for this ChatGPT account. Rather
                         // than dead-end the sidecar, fall back to Claude haiku
                         // when Claude credentials are available.
@@ -681,16 +682,19 @@ fn resolve_openai_request_model(
     preferred_model: &str,
     is_chatgpt_mode: bool,
 ) -> (&str, Option<&'static str>) {
-    if !is_chatgpt_mode || preferred_model != SIDECAR_OPENAI_MODEL {
+    if preferred_model != SIDECAR_OPENAI_MODEL {
         return (preferred_model, None);
     }
 
-    match crate::provider::is_model_available_for_account(SIDECAR_OPENAI_MODEL) {
-        Some(false) => (
+    match (
+        is_chatgpt_mode,
+        crate::provider::is_model_available_for_account(SIDECAR_OPENAI_MODEL),
+    ) {
+        (true, Some(false)) => (
             SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
             Some(SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING),
         ),
-        _ => (SIDECAR_OPENAI_MODEL, None),
+        _ => (SIDECAR_OPENAI_MODEL, Some(SIDECAR_OPENAI_REASONING)),
     }
 }
 
@@ -1032,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_sidecar_fast_model() {
-        assert_eq!(SIDECAR_FAST_MODEL, "gpt-5.3-codex-spark");
+        assert_eq!(SIDECAR_FAST_MODEL, "gpt-5.6-luna");
     }
 
     #[test]
@@ -1064,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chatgpt_oauth_keeps_spark_when_available() {
+    fn test_chatgpt_oauth_uses_luna_with_no_reasoning_when_available() {
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::TempDir::new().expect("create temp jcode home");
         let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
@@ -1077,13 +1081,13 @@ mod tests {
 
         let (model, reasoning) = resolve_openai_request_model(SIDECAR_OPENAI_MODEL, true);
         assert_eq!(model, SIDECAR_OPENAI_MODEL);
-        assert_eq!(reasoning, None);
+        assert_eq!(reasoning, Some(SIDECAR_OPENAI_REASONING));
 
         codex::set_active_account_override(None);
     }
 
     #[test]
-    fn test_chatgpt_oauth_falls_back_to_gpt_5_4_low_when_spark_unavailable() {
+    fn test_chatgpt_oauth_falls_back_to_gpt_5_4_low_when_luna_unavailable() {
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::TempDir::new().expect("create temp jcode home");
         let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
@@ -1101,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_openai_request_adds_low_reasoning_only_for_fallback() {
+    fn test_build_openai_request_uses_configured_default_and_fallback_reasoning() {
         let request = build_openai_request(
             SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
             "system",
@@ -1115,9 +1119,25 @@ mod tests {
             serde_json::json!({"effort": SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING})
         );
 
-        let spark_request =
-            build_openai_request(SIDECAR_OPENAI_MODEL, "system", "hello", true, None);
-        assert!(spark_request.get("reasoning").is_none());
+        let luna_request = build_openai_request(
+            SIDECAR_OPENAI_MODEL,
+            "system",
+            "hello",
+            true,
+            Some(SIDECAR_OPENAI_REASONING),
+        );
+        assert_eq!(luna_request["model"], SIDECAR_OPENAI_MODEL);
+        assert_eq!(
+            luna_request["reasoning"],
+            serde_json::json!({"effort": SIDECAR_OPENAI_REASONING})
+        );
+    }
+
+    #[test]
+    fn test_openai_api_key_mode_uses_luna_with_no_reasoning() {
+        let (model, reasoning) = resolve_openai_request_model(SIDECAR_OPENAI_MODEL, false);
+        assert_eq!(model, SIDECAR_OPENAI_MODEL);
+        assert_eq!(reasoning, Some(SIDECAR_OPENAI_REASONING));
     }
 
     // ---- Provider-backed sidecar (works on ALL providers) -------------------
