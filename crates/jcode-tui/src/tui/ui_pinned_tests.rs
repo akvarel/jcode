@@ -52,6 +52,19 @@ fn sample_mermaid_page(content: impl Into<String>) -> crate::side_panel::SidePan
 }
 
 #[test]
+fn side_panel_mermaid_measurement_reserves_scrollbar_in_render_profile() {
+    let full = Rect::new(10, 5, 48, 30);
+    let profiled = side_panel_mermaid_profile_area(full, true);
+
+    assert_eq!(profiled, Rect::new(10, 5, 47, 30));
+    assert_eq!(side_panel_mermaid_profile_area(full, false), full);
+    assert_eq!(
+        super::diagram_pane::content_area_preferred_aspect_ratio(profiled),
+        super::diagram_pane::content_area_preferred_aspect_ratio(Rect::new(10, 5, 47, 30)),
+    );
+}
+
+#[test]
 fn clamp_side_panel_image_rows_leaves_room_for_following_content() {
     let rows = clamp_side_panel_image_rows(18, 16, 2, true);
     assert_eq!(rows, 15);
