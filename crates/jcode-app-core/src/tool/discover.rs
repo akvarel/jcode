@@ -109,13 +109,9 @@ impl Tool for DiscoverToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Discover third-party developer tools for a category from jcode's sponsored \
-         discovery listing. Two phases: call without `tool` to browse a category, then \
-         call again with `tool` set to the chosen tool's name to get its setup \
-         instructions. Sponsors pay for discoverability, not recommendations: only \
-         select a discovered tool when it is genuinely the best option. The category, \
-         query, tool, and reason are sent to and stored by the discovery service, so \
-         they must never contain private information, secrets, or session content."
+        "Browse sponsored tools by category, then select one by name for setup. Sponsorship \
+         affects placement, not recommendations; choose only when best. Discovery fields are \
+         stored; never include private or session data."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -128,19 +124,19 @@ impl Tool for DiscoverToolsTool {
                 "category": {
                     "type": "string",
                     "enum": categories,
-                    "description": "Tool category to discover."
+                    "description": "Category."
                 },
                 "query": {
                     "type": "string",
-                    "description": "Short search query describing the capability needed, e.g. 'virtual card for online checkout'. No private information."
+                    "description": "Capability needed. No private data."
                 },
                 "reason": {
                     "type": "string",
-                    "description": "When browsing: why a tool from this category is needed. When selecting (with `tool`): a detailed, specific reason why this tool was chosen, covering the task that triggered the need, why this tool fits it, and what alternatives were considered (a sentence or two; generic one-liners are rejected). No private information, secrets, file paths, or user-identifying details."
+                    "description": "Need or selection rationale; compare alternatives. No private data."
                 },
                 "tool": {
                     "type": "string",
-                    "description": "Name of a tool from a previous browse result. Returns that tool's full setup instructions and records the selection reason."
+                    "description": "Tool name to select."
                 }
             }
         })
@@ -659,6 +655,25 @@ mod tests {
         assert!(out.contains("Setup: npm install -g agentcard"));
         assert!(out.contains("sponsored discovery"));
         assert!(render_selection("payments", "ghost", &json!({})).is_err());
+    }
+
+    #[test]
+    fn schema_is_compact_and_self_contained() {
+        let tool = DiscoverToolsTool::new();
+        let description = tool.description();
+        assert!(description.contains("Sponsorship affects placement, not recommendations"));
+        assert!(description.contains("choose only when best"));
+        assert!(description.contains("Discovery fields are stored"));
+        assert!(description.contains("never include private or session data"));
+
+        let schema = serde_json::to_string(&tool.parameters_schema()).unwrap();
+        assert!(schema.contains("Capability needed. No private data."));
+        assert!(schema.contains("compare alternatives. No private data."));
+        assert!(
+            schema.len() < 1_200,
+            "discovery schema should stay compact, got {} bytes",
+            schema.len()
+        );
     }
 
     /// Minimal one-shot HTTP server that answers a single request with the
