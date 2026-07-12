@@ -1,9 +1,11 @@
 use image::GenericImageView;
 use ratatui::prelude::Line;
 use std::fs;
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
@@ -11,6 +13,32 @@ const RENDERER_VERSION: u8 = 2;
 const MAX_SOURCE_BYTES: usize = 32 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const FOREGROUND: (u8, u8, u8) = (130, 210, 235);
+
+static LOG_HOOK: LazyLock<Mutex<fn(&str)>> = LazyLock::new(|| Mutex::new(|_| {}));
+static LAST_REPORTED_ERROR: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+pub(crate) fn set_log_hook(hook: fn(&str)) {
+    if let Ok(mut current) = LOG_HOOK.lock() {
+        *current = hook;
+    }
+}
+
+pub(crate) fn report_error(error: &str) {
+    let should_report = LAST_REPORTED_ERROR
+        .lock()
+        .map(|mut last| {
+            if last.as_deref() == Some(error) {
+                false
+            } else {
+                *last = Some(error.to_string());
+                true
+            }
+        })
+        .unwrap_or(false);
+    if should_report && let Ok(hook) = LOG_HOOK.lock() {
+        hook(error);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Toolchain {
@@ -229,6 +257,12 @@ fn run_command<const N: usize>(
     args: [&str; N],
     working_dir: &Path,
 ) -> Result<(), String> {
+    let output_path = working_dir.join(".jcode-command-output.log");
+    let stdout = File::create(&output_path)
+        .map_err(|e| format!("create {} diagnostics: {e}", executable.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|e| format!("capture {} diagnostics: {e}", executable.display()))?;
     let mut child = Command::new(executable)
         .args(args)
         .current_dir(working_dir)
@@ -236,22 +270,41 @@ fn run_command<const N: usize>(
         .env("openout_any", "p")
         .env("TEXMFOUTPUT", working_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|e| format!("start {}: {e}", executable.display()))?;
     match child
         .wait_timeout(COMMAND_TIMEOUT)
         .map_err(|e| format!("wait for {}: {e}", executable.display()))?
     {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err(format!("{} exited with {status}", executable.display())),
+        Some(status) if status.success() => {
+            let _ = fs::remove_file(&output_path);
+            Ok(())
+        }
+        Some(status) => Err(format!(
+            "{} exited with {status}: {}",
+            executable.display(),
+            command_diagnostics(&output_path)
+        )),
         None => {
             let _ = child.kill();
             let _ = child.wait();
             Err(format!("{} timed out", executable.display()))
         }
     }
+}
+
+fn command_diagnostics(path: &Path) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+    let Ok(output) = fs::read(path) else {
+        return "no diagnostic output".to_string();
+    };
+    let start = output.len().saturating_sub(MAX_DIAGNOSTIC_BYTES);
+    String::from_utf8_lossy(&output[start..])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn cache_key(source: &str, display: bool) -> u64 {
@@ -264,6 +317,7 @@ fn cache_key(source: &str, display: bool) -> u64 {
 }
 
 fn latex_document(source: &str, display: bool) -> String {
+    let source = source.trim();
     let math = if display {
         format!("\\[\\displaystyle\n{source}\n\\]")
     } else {
@@ -310,9 +364,11 @@ mod tests {
         let inline = latex_document(r"x^2 + \\alpha", false);
         assert!(inline.contains(r"$x^2 + \\alpha$"));
         assert!(!inline.contains("shell-escape"));
-        let display = latex_document(r"\\frac{a}{b}", true);
+        let display = latex_document("\n\\frac{a}{b}\n", true);
         assert!(display.contains("\\[\\displaystyle"));
-        assert!(display.contains(r"\\frac{a}{b}"));
+        assert!(display.contains(r"\frac{a}{b}"));
+        assert!(display.contains("\\displaystyle\n\\frac{a}{b}\n\\]"));
+        assert!(!display.contains("\\displaystyle\n\n"));
     }
 
     #[test]
@@ -453,5 +509,34 @@ mod tests {
         assert!(rendered.pixels().all(|pixel| {
             [pixel[0], pixel[1], pixel[2]] == [FOREGROUND.0, FOREGROUND.1, FOREGROUND.2]
         }));
+    }
+
+    #[test]
+    fn installed_toolchain_renders_gaussian_integral_when_available() {
+        let toolchain = Toolchain::from_environment();
+        let has_pdf_fallback = Command::new(&toolchain.pdflatex)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+            && Command::new(&toolchain.pdftocairo)
+                .arg("-v")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+        if !has_pdf_fallback {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let artifact = render_artifact_in(
+            "\n\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}\n",
+            true,
+            &toolchain,
+            cache.path(),
+        )
+        .expect("installed PDF toolchain should render the Gaussian integral");
+        assert!(artifact.width > 0 && artifact.height > 0);
     }
 }
