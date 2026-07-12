@@ -94,7 +94,7 @@ wrangler d1 execute jcode-telemetry --remote --file=migrations/0005_workflow_tur
 
 (...and so on through the latest numbered migration; each also has an
 `npm run migrate:<name>` alias, see Ops helpers below. The newest is
-`migrations/0016_web_subscription_analytics.sql` / `npm run migrate:web-subscription`.)
+`migrations/0018_web_quality_telemetry.sql` / `npm run migrate:web-quality`.)
 
 Then redeploy the worker:
 
@@ -128,6 +128,8 @@ npm run migrate:detail-fields
 npm run migrate:dau-full-backfill
 npm run migrate:auth-failure-reason
 npm run migrate:web-subscription
+npm run migrate:discovery
+npm run migrate:web-quality
 
 # Run the health dashboard query
 npm run health
@@ -139,7 +141,7 @@ CLI events (sent by jcode itself): `install`, `upgrade`, `auth_success`,
 `onboarding_step`, `feedback`, `session_start`, `turn_end`, `session_end`,
 `session_crash`.
 
-### Website analytics events (migration 0016)
+### Website analytics and quality events (migrations 0016 and 0018)
 
 Sent by the beacon on `https://jcode.sh` (and the
 `https://solosystems.pages.dev` preview). The browser mints an anonymous
@@ -153,6 +155,13 @@ like `session_details`/`turn_details`) because `events` is near D1's
   `utm_medium`, `utm_campaign`
 - `web_cta_click`: `path`, `cta` (e.g. `plus_early_access`,
   `flagship_early_access`, `install`), `visitor_id`
+- `web_vital`: `path`, `visitor_id`, standard `metric_name` (`CLS`, `FCP`,
+  `INP`, `LCP`, or `TTFB`), finite nonnegative `metric_value`, and `rating`
+  (`good`, `needs-improvement`, or `poor`). Values are capped at 10 for CLS
+  and 300000 ms for the other metrics. D1 retention is 30 days.
+- `web_error`: `path`, `visitor_id`, and coarse `error_kind` (`script`,
+  `promise`, or `resource`). Error messages, stacks, filenames, and URLs are
+  never stored. D1 retention is 90 days.
 
 ### Token subscription plan events (migration 0016)
 
@@ -171,12 +180,25 @@ Web + subscription events are firehosed to the separate `jcode_web_firehose`
 dataset (`FIREHOSE_WEB_SCHEMA` in `src/worker.js`, also append-only): the
 main `FIREHOSE_SCHEMA` is at Analytics Engine's 20-blob/20-double capacity.
 For web events `index1` is the `visitor_id`.
+The 0018 fields were appended without reordering: `blob18=metric_name`,
+`blob19=rating`, `blob20=error_kind`, and `double2=metric_value`.
 
 ## Querying Data
 
 ```bash
 # Total installs (raw, and excluding CI runners which mint a fresh id per job)
 wrangler d1 execute jcode-telemetry --command "SELECT COUNT(DISTINCT telemetry_id) AS raw_installs, COUNT(DISTINCT CASE WHEN is_ci = 0 THEN telemetry_id END) AS installs_noci FROM events WHERE event = 'install'"
+
+# Web vitals by route and rating over the retained 30-day D1 window
+wrangler d1 execute jcode-telemetry --command "SELECT w.path, w.metric_name, w.rating, COUNT(*) AS samples, AVG(w.metric_value) AS avg_value FROM events e JOIN web_details w USING (event_id) WHERE e.event = 'web_vital' AND e.created_at > datetime('now', '-30 days') GROUP BY 1, 2, 3 ORDER BY 1, 2, 3"
+
+# Classified web errors by route over the retained 90-day D1 window
+wrangler d1 execute jcode-telemetry --command "SELECT w.path, w.error_kind, COUNT(*) AS errors FROM events e JOIN web_details w USING (event_id) WHERE e.event = 'web_error' AND e.created_at > datetime('now', '-90 days') GROUP BY 1, 2 ORDER BY errors DESC"
+
+# Analytics Engine web-vital sample counts (append-only positions from 0018)
+curl -s "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/analytics_engine/sql" \
+  -H "Authorization: Bearer $CF_ANALYTICS_TOKEN" \
+  -d "SELECT blob18 AS metric_name, blob19 AS rating, SUM(_sample_interval) AS samples, AVG(double2) AS avg_value FROM jcode_web_firehose WHERE blob1 = 'web_vital' AND timestamp > NOW() - INTERVAL '7' DAY GROUP BY metric_name, rating ORDER BY metric_name, rating"
 
 # Weekly / monthly active users (canonical: use the rollup so every window
 # shares one "meaningful" definition and includes session_crash + turn_end days).

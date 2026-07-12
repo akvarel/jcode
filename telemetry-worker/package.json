@@ -27,7 +27,8 @@
     "migrate:dau-full-backfill": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0014_full_history_dau_backfill.sql",
     "migrate:auth-failure-reason": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0015_auth_failure_reason.sql",
     "migrate:web-subscription": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0016_web_subscription_analytics.sql",
-    "migrate:discovery": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0017_discovery_telemetry.sql"
+    "migrate:discovery": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0017_discovery_telemetry.sql",
+    "migrate:web-quality": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0018_web_quality_telemetry.sql"
   },
   "devDependencies": {
     "wrangler": "^4"
