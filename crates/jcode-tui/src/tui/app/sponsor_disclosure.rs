@@ -1,4 +1,4 @@
-//! Sponsored discovery disclosure placement.
+//! Tool-partner disclosure placement.
 //!
 //! The first `discover_tools` result in a session carries a subtle inline
 //! policy notice. Keeping the notice attached to the result preserves the
@@ -49,7 +49,7 @@ impl App {
             return None;
         }
         self.sponsor_disclosure_shown_this_session = true;
-        Some(crate::sponsors::SPONSORED_DISCOVERY_TAG.to_string())
+        Some(crate::sponsors::DISCOVERY_DISCLOSURE_TAG.to_string())
     }
 }
 

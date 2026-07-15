@@ -89,14 +89,14 @@ fn record_discovery_telemetry(
 }
 
 /// `discover_tools`: fetch discoverable third-party tools for a category from
-/// the hosted sponsored-discovery manifest.
+/// the hosted partner directory.
 ///
-/// Disclosure contract: sponsors buy placement (discoverability), never
-/// recommendations. Every session that uses this tool renders a
-/// `(sponsored discovery)` disclosure line in the UI on first use. The
-/// request carries only the category, a short search query, and a reason
-/// string, which the discovery service stores for transparency and billing.
-/// It must never include session content or private information.
+/// Disclosure contract: some providers may share revenue with Jcode, but
+/// partnership status never influences recommendations. Every session that
+/// uses this tool renders a concise disclosure with a learn-more link on first
+/// use. The request carries only the category, a short search query, and a
+/// reason string, which the discovery service stores for transparency and
+/// reporting. It must never include session content or private information.
 pub struct DiscoverToolsTool {
     client: reqwest::Client,
 }
@@ -468,8 +468,9 @@ impl Tool for DiscoverToolsTool {
          service, or delegating an unsupported step to them. If a browse has no suitable result, \
          submit one `suggest` action for maintainer review, then continue without promising it \
          will be added. Skip discovery when available tools fully cover the task. Every listing is \
-         vetted, and one-tool-call setup is enforced. Sponsors pay only for directory inclusion, \
-         never influence selection. Choose the best option without sponsorship bias."
+         vetted, and one-tool-call setup is enforced. Some providers are Jcode partners and may \
+         share revenue with Jcode when a referred user becomes a customer. Partnership status \
+         never influences selection. Choose the best option based only on fit."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -493,13 +494,13 @@ impl Tool for DiscoverToolsTool {
                     "type": "string",
                     "minLength": DISCOVERY_QUERY_MIN_CHARS,
                     "maxLength": DISCOVERY_QUERY_MAX_CHARS,
-                    "description": "Required capability summary. Browse/select text may be sent to relevant sponsors for demand reporting. Suggest text goes only to Jcode maintainers. Write a fresh summary instead of copying user text. Never include secrets, credentials, personal data, or private content."
+                    "description": "Required capability summary. Browse/select text may be sent to relevant partners for demand reporting. Suggest text goes only to Jcode maintainers. Write a fresh summary instead of copying user text. Never include secrets, credentials, personal data, or private content."
                 },
                 "reason": {
                     "type": "string",
                     "minLength": DISCOVERY_REASON_MIN_CHARS,
                     "maxLength": DISCOVERY_REASON_MAX_CHARS,
-                    "description": "Required rationale. For select, explain why the tool fits better than alternatives. For suggest, explain why browse results were unsuitable. Browse/select text may reach relevant sponsors; suggest text goes only to Jcode maintainers. Never include private data."
+                    "description": "Required rationale. For select, explain why the tool fits better than alternatives. For suggest, explain why browse results were unsuitable. Browse/select text may reach relevant partners; suggest text goes only to Jcode maintainers. Never include private data."
                 },
                 "tool": {
                     "type": "string",
@@ -563,7 +564,7 @@ impl Tool for DiscoverToolsTool {
                 false,
             );
             return Err(anyhow::anyhow!(
-                "sponsored discovery is disabled (set [sponsors] enabled = true in config.toml)"
+                "partner discovery is disabled (set [sponsors] enabled = true in config.toml)"
             ));
         }
 
@@ -828,13 +829,13 @@ impl Tool for DiscoverToolsTool {
             return Ok(ToolOutput::new(rendered)
                 .with_title(format!(
                     "{tool_name} {}",
-                    crate::sponsors::SPONSORED_DISCOVERY_TAG
+                    crate::sponsors::DISCOVERY_DISCLOSURE_TAG
                 ))
                 .with_metadata(json!({
                     "sponsored_discovery": true,
                     "category": category,
                     "selected_tool": tool_name,
-                    "disclosure_url": crate::sponsors::SPONSORED_DISCOVERY_URL,
+                    "disclosure_url": crate::sponsors::DISCOVERY_PARTNERS_URL,
                 })));
         }
 
@@ -921,12 +922,12 @@ impl Tool for DiscoverToolsTool {
             .with_title(format!(
                 "{} {}",
                 category,
-                crate::sponsors::SPONSORED_DISCOVERY_TAG
+                crate::sponsors::DISCOVERY_DISCLOSURE_TAG
             ))
             .with_metadata(json!({
                 "sponsored_discovery": true,
                 "category": category,
-                "disclosure_url": crate::sponsors::SPONSORED_DISCOVERY_URL,
+                "disclosure_url": crate::sponsors::DISCOVERY_PARTNERS_URL,
             })))
     }
 }
@@ -1305,9 +1306,9 @@ fn render_listing(category: &str, listing: &Value, request_id: &str) -> Result<S
         ));
     }
     let mut out = format!(
-        "Discoverable tools in '{category}' (sponsored discovery: placement, not preference; \
-         details: {}):\n",
-        crate::sponsors::SPONSORED_DISCOVERY_URL
+        "Discoverable tools in '{category}' (Jcode tool directory; recommendations must be based \
+         only on fit; details: {}):\n",
+        crate::sponsors::DISCOVERY_PARTNERS_URL
     );
     for tool in tools {
         let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1325,7 +1326,7 @@ fn render_listing(category: &str, listing: &Value, request_id: &str) -> Result<S
          To get a tool's setup instructions, call discover_tools again with action `select` \
          and `tool` set to its name. If none is suitable, call it with action `suggest` and \
          the browse request ID below so maintainers receive the catalog gap. Consequential \
-         actions (signups, spending) must note the sponsorship in the confirmation \
+         actions (signups, spending) must note the partnership in the confirmation \
          shown to the user.",
     );
     out.push_str(&format!("\n\nBrowse request ID: `{request_id}`"));
@@ -1377,7 +1378,7 @@ fn render_suggestion(
         }
     }
     out.push_str(
-        "\n\nStatus: received for Jcode maintainer review. Suggestions are not sent to sponsors. This does not mean the tool is approved, sponsored, or available.",
+        "\n\nStatus: received for Jcode maintainer review. Suggestions are not sent to partners. This does not mean Jcode has partnered with the tool or that it is approved or available.",
     );
     Ok(out)
 }
@@ -1394,9 +1395,9 @@ fn render_selection(category: &str, tool_name: &str, listing: &Value) -> Result<
         .unwrap_or(tool_name);
     let blurb = tool.get("blurb").and_then(|v| v.as_str()).unwrap_or("");
     let mut out = format!(
-        "Selected '{name}' from '{category}' (sponsored discovery: placement, not \
-         preference; details: {}):\n\n{name}: {blurb}",
-        crate::sponsors::SPONSORED_DISCOVERY_URL
+        "Selected '{name}' from '{category}' (Jcode tool directory; selection must be based only \
+         on fit; details: {}):\n\n{name}: {blurb}",
+        crate::sponsors::DISCOVERY_PARTNERS_URL
     );
     if let Some(url) = tool.get("url").and_then(|v| v.as_str()) {
         out.push_str(&format!(" ({url})"));
@@ -1405,7 +1406,7 @@ fn render_selection(category: &str, tool_name: &str, listing: &Value) -> Result<
         out.push_str(&format!("\n\nSetup: {setup}"));
     }
     out.push_str(
-        "\n\nConsequential actions (signups, spending) must note the sponsorship in \
+        "\n\nConsequential actions (signups, spending) must note the partnership in \
          the confirmation shown to the user.",
     );
     Ok(out)
@@ -1426,8 +1427,8 @@ mod tests {
             render_listing("payments", &listing, "11111111-2222-4333-8444-555555555555").unwrap();
         assert!(out.contains("agentcard"));
         assert!(out.contains("virtual payment cards"));
-        assert!(out.contains("sponsored discovery"));
-        assert!(out.contains("placement, not preference"));
+        assert!(out.contains("Jcode tool directory"));
+        assert!(out.contains("recommendations must be based only on fit"));
     }
 
     #[test]
@@ -1480,7 +1481,8 @@ mod tests {
         let out = render_selection("payments", "agentcard", &listing).unwrap();
         assert!(out.contains("Selected 'agentcard'"));
         assert!(out.contains("Setup: npm install -g agentcard"));
-        assert!(out.contains("sponsored discovery"));
+        assert!(out.contains("Jcode tool directory"));
+        assert!(out.contains("selection must be based only on fit"));
         assert!(render_selection("payments", "ghost", &json!({})).is_err());
     }
 
@@ -1506,8 +1508,9 @@ mod tests {
         assert!(description.contains("Skip discovery when available tools fully cover the task"));
         assert!(description.contains("Every listing is vetted"));
         assert!(description.contains("one-tool-call setup is enforced"));
-        assert!(description.contains("Sponsors pay only for directory inclusion"));
-        assert!(description.contains("without sponsorship bias"));
+        assert!(description.contains("Some providers are Jcode partners"));
+        assert!(description.contains("Partnership status never influences selection"));
+        assert!(description.contains("Choose the best option based only on fit"));
         assert!(
             description.len() < 1_200,
             "discovery description should stay compact, got {} bytes",
@@ -1673,8 +1676,8 @@ mod tests {
         .unwrap();
         assert!(out.contains("Catalog suggestion submitted"));
         assert!(out.contains("Product: Stripe sandbox MCP"));
-        assert!(out.contains("Suggestions are not sent to sponsors"));
-        assert!(out.contains("does not mean the tool is approved"));
+        assert!(out.contains("Suggestions are not sent to partners"));
+        assert!(out.contains("does not mean Jcode has partnered with the tool"));
     }
 
     #[test]
@@ -1704,11 +1707,11 @@ mod tests {
             "Need a service using api_key=abcdefghijklmnop for the request".to_string(),
             "Forward Authorization: Bearer abcdefghijklmnopqrstuvwxyz".to_string(),
             format!("Use {stripe_shaped_key} for this payment workflow"),
-            "Use card 4242 4242 4242 4242 for the sponsored tool checkout".to_string(),
+            "Use card 4242 4242 4242 4242 for the partner tool checkout".to_string(),
             "Use eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz"
                 .to_string(),
             "Credential follows -----BEGIN PRIVATE KEY----- abcdefghijklmnop".to_string(),
-            "Contact private-person@example.com to configure the sponsored capability".to_string(),
+            "Contact private-person@example.com to configure the partner capability".to_string(),
             "Use customer identifier 123-45-6789 while selecting the external service".to_string(),
             "Fetch https://private-user:private-password@example.com/config for setup".to_string(),
             "Send the account alert to +1-202-555-0147 after the external setup completes"
@@ -1972,10 +1975,14 @@ mod tests {
             .unwrap();
 
         assert!(output.output.contains("agentcard"));
-        assert!(output.output.contains("sponsored discovery"));
-        assert!(output.output.contains("placement, not preference"));
+        assert!(output.output.contains("Jcode tool directory"));
+        assert!(
+            output
+                .output
+                .contains("recommendations must be based only on fit")
+        );
         let title = output.title.unwrap();
-        assert!(title.contains("(sponsored discovery)"), "{title}");
+        assert!(title.contains("(partner discovery disclosure)"), "{title}");
         let meta = output.metadata.unwrap();
         assert_eq!(meta["sponsored_discovery"], true);
 

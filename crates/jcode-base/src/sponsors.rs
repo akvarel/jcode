@@ -1,14 +1,14 @@
-//! Sponsored discovery: shared constants and provenance tracking.
+//! Partner discovery: shared constants and provenance tracking.
 //!
-//! Sponsored discovery makes third-party developer tools discoverable to the
+//! Partner discovery makes third-party developer tools discoverable to the
 //! agent through the `discover_tools` tool, backed by a hosted manifest. All
 //! agent-facing guidance lives in that tool's schema rather than the system
 //! prompt.
-//! Sponsors buy placement (discoverability), never recommendations. The
-//! policy is disclosed in the UI with a `(sponsored discovery)` tag whose
-//! definition lives at <https://jcode.sh/sponsored-discovery>.
+//! Some providers may share revenue with Jcode when users choose their tools.
+//! Partnership status never influences recommendations. The relationship is
+//! disclosed in the UI with a link to <https://jcode.sh/discovery-tools>.
 //!
-//! Design constraints (see the sponsored-discovery page for the public
+//! Design constraints (see the discovery-tools page for the public
 //! version of this policy):
 //! - Solo Systems vets every listing and enforces one-tool-call setup at the
 //!   sponsor-platform admission layer for seamless harness integration.
@@ -22,19 +22,19 @@
 //! - Requests carry only discovery fields (category, query, tool, and reason),
 //!   never session content.
 
-/// Public URL explaining what sponsored discovery is.
-pub const SPONSORED_DISCOVERY_URL: &str = "https://jcode.sh/sponsored-discovery";
+/// Public URL explaining Jcode's tool-provider partnerships.
+pub const DISCOVERY_PARTNERS_URL: &str = "https://jcode.sh/discovery-tools";
 
 /// Provenance tagging and coarse usage metering for MCP servers connected
 /// as a result of a discovery listing.
 pub mod provenance;
 
-/// Disclosure tag rendered in the UI whenever discovery is used.
-pub const SPONSORED_DISCOVERY_TAG: &str = "(sponsored discovery)";
+/// Internal marker used to render the first discovery disclosure in a session.
+pub const DISCOVERY_DISCLOSURE_TAG: &str = "(partner discovery disclosure)";
 
 /// First-use-per-session disclosure detail rendered inline with discovery.
-pub const SPONSORED_DISCOVERY_NOTICE: &str = "sponsors make tools discoverable, never recommended \
-     \u{b7} jcode.sh/sponsored-discovery";
+pub const DISCOVERY_DISCLOSURE_NOTICE: &str = "Jcode partners with tool providers to make their \
+     tools discoverable. Learn more: https://jcode.sh/discovery-tools";
 
 /// Categories in which discoverable tools exist. Shipped as a constant so the
 /// tool schema never depends on the network. The tools within each category are
