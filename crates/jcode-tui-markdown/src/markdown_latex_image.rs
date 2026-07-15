@@ -9,10 +9,10 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
-const RENDERER_VERSION: u8 = 3;
+const RENDERER_VERSION: u8 = 4;
 const MAX_SOURCE_BYTES: usize = 32 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
-const FOREGROUND: (u8, u8, u8) = (130, 210, 235);
+const FOREGROUND: (u8, u8, u8) = super::MATH_FOREGROUND;
 const FALLBACK_RENDER_DPI: u16 = 240;
 const MIN_RENDER_DPI: u16 = 240;
 const MAX_RENDER_DPI: u16 = 480;
@@ -167,6 +167,7 @@ fn render_artifact_in(
         .map_err(|e| format!("write LaTeX source: {e}"))?;
 
     let dpi_arg = dpi.to_string();
+    let foreground_arg = format!("rgb {} {} {}", FOREGROUND.0, FOREGROUND.1, FOREGROUND.2);
     let dvi_result = run_command(
         &toolchain.latex,
         [
@@ -188,7 +189,7 @@ fn render_artifact_in(
                 "-bg",
                 "Transparent",
                 "-fg",
-                "rgb 130 210 235",
+                foreground_arg.as_str(),
                 "-o",
                 "formula.png",
                 "formula.dvi",

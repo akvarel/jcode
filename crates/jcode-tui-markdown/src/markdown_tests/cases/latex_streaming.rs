@@ -10,6 +10,22 @@ fn exact_multiline_latex_response() -> &'static str {
 }
 
 #[test]
+fn latex_foreground_is_saturated_blue_and_styles_inline_math() {
+    assert_eq!(MATH_FOREGROUND, (100, 160, 255));
+    assert!(MATH_FOREGROUND.2 > MATH_FOREGROUND.1);
+    assert!(MATH_FOREGROUND.1 > MATH_FOREGROUND.0);
+
+    let lines = with_streaming_render_context(|| render_markdown("Inline $x^2$ math."));
+    let math_spans: Vec<_> = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .filter(|span| span.content.contains("x²"))
+        .collect();
+    assert_eq!(math_spans.len(), 1);
+    assert_eq!(math_spans[0].style.fg, Some(math_fg()));
+}
+
+#[test]
 fn exact_multiline_response_renders_all_five_equations() {
     let mut renderer = IncrementalMarkdownRenderer::new(Some(90));
     let rendered = lines_to_string(&renderer.update(exact_multiline_latex_response()));
