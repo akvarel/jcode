@@ -1168,6 +1168,20 @@ impl MemoryManager {
         .map(|(entry, _)| entry)
         .collect();
 
+        // Enrich with external sources (graphify, vault, pgvector).
+        // These go through the same sidecar relevance check below.
+        let mut candidates = candidates;
+        let external = crate::memory_external::enrich_context(context).await;
+        if !external.is_empty() {
+            let prev = candidates.len();
+            candidates.extend(external);
+            crate::logging::info(&format!(
+                "Memory enrichment: added {} external candidate(s) to {} jcode memories",
+                candidates.len() - prev,
+                prev,
+            ));
+        }
+
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -1437,7 +1451,7 @@ impl MemoryManager {
 
         // Filter out memories that have already been injected in this session
         let pre_filter_count = candidates.len();
-        let candidates: Vec<_> = candidates
+        let mut candidates: Vec<_> = candidates
             .into_iter()
             .filter(|(entry, _)| !is_memory_injected_any(&entry.id))
             .collect();
@@ -1458,7 +1472,31 @@ impl MemoryManager {
             });
             set_state(MemoryState::Idle);
             emit_memory_activity(event_tx.as_ref());
+            // Even with no jcode candidates, try external enrichment (graphify/vault)
+            let external = crate::memory_external::enrich_context(&context).await;
+            if !external.is_empty() {
+                crate::logging::info(&format!(
+                    "Memory enrichment: {} external result(s) with no jcode candidates",
+                    external.len()
+                ));
+                let prompt = format_relevant_prompt(&external, MEMORY_RELEVANCE_MAX_RESULTS);
+                let display_prompt =
+                    format_relevant_display_prompt(&external, MEMORY_RELEVANCE_MAX_RESULTS);
+                return Ok((prompt, Vec::new(), display_prompt));
+            }
             return Ok((None, Vec::new(), None));
+        }
+
+        // Enrich existing candidates with external sources.
+        let external = crate::memory_external::enrich_context(&context).await;
+        if !external.is_empty() {
+            let prev = candidates.len();
+            candidates.extend(external.into_iter().map(|e| (e, 0.5)));
+            crate::logging::info(&format!(
+                "Memory enrichment: added {} external candidate(s) to {} jcode memories",
+                candidates.len() - prev,
+                prev,
+            ));
         }
 
         if !memory_sidecar_enabled() {
