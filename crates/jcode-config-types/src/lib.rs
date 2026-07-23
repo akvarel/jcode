@@ -594,6 +594,10 @@ pub struct AgentsConfig {
     /// Whether to enrich memory context with pgvector RAG search.
     #[serde(default = "default_memory_pgvector_enabled")]
     pub memory_pgvector_enabled: bool,
+    /// Root directory for Obsidian vault notes enrichment.
+    /// Default: "/sharedssd/vault" when vault enrichment is enabled.
+    #[serde(default)]
+    pub memory_vault_root: Option<String>,
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
@@ -652,6 +656,7 @@ impl Default for AgentsConfig {
             memory_graphify_enabled: default_memory_graphify_enabled(),
             memory_vault_enabled: default_memory_vault_enabled(),
             memory_pgvector_enabled: default_memory_pgvector_enabled(),
+            memory_vault_root: None,
         }
     }
 }
