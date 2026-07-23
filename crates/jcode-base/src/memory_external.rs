@@ -6,11 +6,15 @@
 //! those instructions — it calls:
 //!
 //! - **Graphify** — AST-based codebase knowledge graph (`graphify query`)
-//! - **Obsidian vault** — Zettelkasten notes under `/sharedssd/vault/`
+//! - **Obsidian vault** — Zettelkasten notes under configurable root
 //! - **Pgvector RAG** — vector DB-backed vault search (OrangeHat infra)
 //!
 //! Each source is controlled by a config flag (opt-in, default off) and runs with
 //! a configurable timeout.
+//!
+//! **Smart trigger**: enrichment only fires when the context contains codebase
+//! signals (file paths, function names, architecture terms), to avoid injecting
+//! noise on everyday chat turns.
 
 use anyhow::Result;
 use std::time::Duration;
@@ -18,23 +22,105 @@ use std::time::Duration;
 use crate::config::config;
 use crate::memory::{MemoryCategory, MemoryEntry};
 
-/// A single external-enrichment result, analogous to a memory retrieval hit.
-#[derive(Debug, Clone)]
-pub struct ExternalEnrichment {
-    /// The content text.
-    pub content: String,
-    /// Source label for display ("graphify", "vault", "pgvector").
-    pub source: &'static str,
-    /// Optional short identifier (e.g. file path, node id).
-    pub source_id: Option<String>,
-    /// Optional relevance / similarity hint (range 0.0-1.0).
-    pub relevance: Option<f32>,
-}
+/// Default vault root when `memory_vault_root` is not configured.
+const DEFAULT_VAULT_ROOT: &str = "/sharedssd/vault";
 
-/// Configurable timeouts and limits for each enrichment source.
-struct EnrichmentLimits {
-    pub max_results: usize,
-    pub timeout: Duration,
+// ---------------------------------------------------------------------------
+// Smart trigger — enrichment only on codebase-relevant context
+// ---------------------------------------------------------------------------
+
+/// Signal terms that suggest a codebase or architecture question.
+const CODEBASE_KEYWORDS: &[&str] = &[
+    // File system signals
+    "src/", "lib/", "crates/", "Cargo.toml", "Cargo.lock",
+    ".rs", ".py", ".js", ".ts", ".go", ".rs ", ".py ", ".ts ",
+    // Architecture / design
+    "architecture", "design", "pattern", "struct", "trait", "impl",
+    "module", "function", "method", "class", "interface", "type",
+    "pipeline", "flow", "diagram", "graph", "memory", "hook",
+    // Codebase verbs
+    "how does", "where is", "what is", "how is", "show me",
+    "find", "search", "locate", "explain", "implement",
+    // OrangeHat / system paths
+    "/sharedssd/", "~/.jcode", "config.toml", "AGENTS.md",
+    ".jcode", "$HOME", "$PATH",
+    // English technical
+    "codebase", "code base", "repository", "repo", "api",
+    "endpoint", "route", "middleware", "service", "handler",
+    // Russian technical (code/architecture questions)
+    "код", "архитектура", "память", "структура", "функция",
+    "класс", "метод", "модуль", "схема", "поток",
+];
+
+/// Signal characters that strongly suggest a codebase query.
+const CODEBASE_PATTERNS: &[char] = &[
+    '/',    // path separator
+    '.',    // extension
+    '_',    // snake_case
+];
+
+/// Return `true` when the context contains enough signal to warrant enrichment.
+///
+/// Checks for codebase-related terms, file paths, identifiers with underscores,
+/// and known system paths. Short or query-free contexts are skipped to avoid
+/// triggering on simple greetings or small-talk.
+pub fn should_enrich_context(context: &str) -> bool {
+    let ctx = context.trim();
+    if ctx.len() < 20 {
+        // Too short to be a meaningful codebase question
+        return false;
+    }
+
+    let ctx_lower = ctx.to_ascii_lowercase();
+
+    // Check for explicit codebase keywords
+    for kw in CODEBASE_KEYWORDS {
+        if ctx_lower.contains(kw) {
+            return true;
+        }
+    }
+
+    // Check for path-like patterns
+    if ctx_lower.contains('/') || ctx_lower.contains("\\") {
+        return true;
+    }
+
+    // Check for identifier patterns (snake_case or CamelCase)
+    let words: Vec<&str> = ctx_lower.split_whitespace().collect();
+    let word_count = words.len();
+    let mut identifier_count = 0;
+    for w in &words {
+        // snake_case signal
+        if w.contains('_') && w.chars().any(|c| c.is_ascii_lowercase()) && !w.contains("__") {
+            identifier_count += 1;
+        }
+        // CamelCase signal
+        let upper_count = w.chars().filter(|c| c.is_ascii_uppercase()).count();
+        if upper_count >= 2 && w.len() >= 4 {
+            identifier_count += 1;
+        }
+    }
+
+    if identifier_count > 0 && identifier_count as f64 / word_count as f64 > 0.15 {
+        return true;
+    }
+
+    // Check for file extensions
+    if ctx_lower.contains(".rs")
+        || ctx_lower.contains(".py")
+        || ctx_lower.contains(".js")
+        || ctx_lower.contains(".ts")
+        || ctx_lower.contains(".toml")
+        || ctx_lower.contains(".json")
+        || ctx_lower.contains(".yaml")
+        || ctx_lower.contains(".yml")
+        || ctx_lower.contains(".md")
+        || ctx_lower.contains(".go")
+    {
+        return true;
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -48,11 +134,18 @@ struct EnrichmentLimits {
 /// so downstream code (and the sidecar) can distinguish jcode memories from
 /// external enrichments.
 ///
+/// **Smart trigger**: enrichment is skipped when `should_enrich_context()`
+/// returns false, avoiding noise on non-codebase turns.
+///
 /// Sources are only queried when their corresponding config flag is `true`:
 /// - `agents.memory_graphify_enabled`
 /// - `agents.memory_vault_enabled`
 /// - `agents.memory_pgvector_enabled`
 pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
+    if !should_enrich_context(context) {
+        return Vec::new();
+    }
+
     let cfg = config();
     let mut all: Vec<MemoryEntry> = Vec::new();
 
@@ -66,7 +159,12 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
     }
 
     if cfg.agents.memory_vault_enabled {
-        let mut res = search_vault(context).await.unwrap_or_default();
+        let vault_root = cfg
+            .agents
+            .memory_vault_root
+            .as_deref()
+            .unwrap_or(DEFAULT_VAULT_ROOT);
+        let mut res = search_vault(context, vault_root).await.unwrap_or_default();
         all.append(&mut entries_from_enrichments(
             &mut res,
             "vault",
@@ -97,11 +195,7 @@ const GRAPHIFY_LIMITS: EnrichmentLimits = EnrichmentLimits {
 };
 
 /// Query the graphify codebase knowledge graph via `graphify query`.
-///
-/// The `graphify` binary must be on `$PATH`. Returns structured results parsed
-/// from the CLI output (node path, content snippet, community label).
 async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
-    // Truncate long queries to avoid shell-argument blow-up.
     let truncated = if query_text.len() > 240 {
         &query_text[..240]
     } else {
@@ -135,10 +229,8 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
         if line.is_empty() || line.starts_with("NODE") {
             continue;
         }
-        // graphify compact format: "path:content"
-        let content = line.to_string();
         results.push(ExternalEnrichment {
-            content,
+            content: line.to_string(),
             source: "graphify",
             source_id: None,
             relevance: None,
@@ -154,34 +246,30 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
 
 /// Limits for vault search.
 const VAULT_LIMITS: EnrichmentLimits = EnrichmentLimits {
-    max_results: 8,
+    max_results: 6,
     timeout: Duration::from_secs(10),
 };
 
-const VAULT_ROOT: &str = "/sharedssd/vault";
-
 /// Search the Obsidian vault for notes matching the query.
 ///
-/// Performs a content search over `.md` files under `/sharedssd/vault/`,
-/// returning matching file paths and their title (from YAML frontmatter).
-async fn search_vault(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
-    let vault = std::path::Path::new(VAULT_ROOT);
+/// `vault_root` comes from config `agents.memory_vault_root` or defaults to
+/// `/sharedssd/vault`.
+async fn search_vault(query_text: &str, vault_root: &str) -> Result<Vec<ExternalEnrichment>> {
+    let vault = std::path::Path::new(vault_root);
     if !vault.exists() {
         return Ok(Vec::new());
     }
 
-    // Use ripgrep for fast content search; fall back to a slow find+grep.
     let output = tokio::time::timeout(
         VAULT_LIMITS.timeout,
         async {
-            // Try rg first
             let rg_result = tokio::process::Command::new("rg")
                 .arg("-l")
                 .arg("-i")
                 .arg("--max-count")
                 .arg("5")
                 .arg(query_text)
-                .arg(VAULT_ROOT)
+                .arg(vault_root)
                 .arg("--type")
                 .arg("md")
                 .output()
@@ -191,11 +279,13 @@ async fn search_vault(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
                 Ok(out) if out.status.success() => Ok(out),
                 Ok(_) | Err(_) => {
                     // Fallback to find + grep
+                    let escaped = query_text.replace('\'', "'\\''");
                     tokio::process::Command::new("sh")
                         .arg("-c")
                         .arg(format!(
-                            "find {VAULT_ROOT} -name '*.md' -exec grep -li -m1 '{q}' {{}} \\; 2>/dev/null | head -{n}",
-                            q = query_text.replace('\'', "'\\''"),
+                            "find {root} -name '*.md' -exec grep -li -m1 '{q}' {{}} \\; 2>/dev/null | head -{n}",
+                            root = vault_root,
+                            q = escaped,
                             n = VAULT_LIMITS.max_results,
                         ))
                         .output()
@@ -224,10 +314,9 @@ async fn search_vault(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
             .unwrap_or("unknown")
             .to_string();
 
-        // Extract title from YAML frontmatter (first 3 lines)
         let title = extract_vault_title(path).unwrap_or_else(|| file_name.clone());
         let rel_path = path
-            .strip_prefix(VAULT_ROOT)
+            .strip_prefix(vault_root)
             .unwrap_or(path)
             .display()
             .to_string();
@@ -253,7 +342,7 @@ fn extract_vault_title(path: &std::path::Path) -> Option<String> {
         let trimmed = line.trim();
         if trimmed == "---" {
             if in_frontmatter {
-                break; // end of frontmatter
+                break;
             }
             in_frontmatter = true;
             continue;
@@ -273,14 +362,11 @@ fn extract_vault_title(path: &std::path::Path) -> Option<String> {
 
 /// Limits for pgvector RAG search.
 const PGVECTOR_LIMITS: EnrichmentLimits = EnrichmentLimits {
-    max_results: 8,
+    max_results: 6,
     timeout: Duration::from_secs(10),
 };
 
 /// Search the OrangeHat pgvector-backed vault via the `search_memory.py` script.
-///
-/// The script lives at `/sharedssd/scripts/search_memory.py` and accepts a
-/// query string argument, returning results as newline-separated text.
 async fn search_pgvector(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
     let script = std::path::Path::new("/sharedssd/scripts/search_memory.py");
     if !script.exists() {
@@ -325,14 +411,29 @@ async fn search_pgvector(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Internal types and helpers
 // ---------------------------------------------------------------------------
+
+/// A single external-enrichment result, analogous to a memory retrieval hit.
+#[derive(Debug, Clone)]
+struct ExternalEnrichment {
+    content: String,
+    source: &'static str,
+    source_id: Option<String>,
+    relevance: Option<f32>,
+}
+
+/// Configurable timeouts and limits for each enrichment source.
+struct EnrichmentLimits {
+    max_results: usize,
+    timeout: Duration,
+}
 
 /// Convert external enrichment results into injectable MemoryEntry values.
 ///
 /// Each entry is tagged with a unique synthetic category
-/// (`MemoryCategory::External`) so the sidecar and downstream code can
-/// distinguish external enrichments from native jcode memories.
+/// (`MemoryCategory::Custom("external:...")`) so the sidecar and downstream code
+/// can distinguish external enrichments from native jcode memories.
 fn entries_from_enrichments(
     enrichments: &mut Vec<ExternalEnrichment>,
     source_label: &'static str,
@@ -343,8 +444,7 @@ fn entries_from_enrichments(
         .map(|e| {
             let cat = MemoryCategory::Custom(format!("external:{category_label}"));
             let prefixed = format!("[{}] {}", source_label, e.content);
-            let mut entry = MemoryEntry::new(cat, prefixed)
-                .with_source(e.source);
+            let mut entry = MemoryEntry::new(cat, prefixed).with_source(e.source);
             if let Some(id) = e.source_id {
                 entry.tags.push(id);
             }
