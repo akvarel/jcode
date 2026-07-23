@@ -22,8 +22,12 @@ use std::time::Duration;
 use crate::config::config;
 use crate::memory::{MemoryCategory, MemoryEntry};
 
-/// Default vault root when `memory_vault_root` is not configured.
-const DEFAULT_VAULT_ROOT: &str = "/sharedssd/vault";
+/// Default vault root when `memory_vault_root` is not configured — user's home.
+fn default_vault_root() -> String {
+    dirs::home_dir()
+        .map(|h| h.join("vault").to_string_lossy().to_string())
+        .unwrap_or_else(|| "/sharedssd/vault".to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Smart trigger — enrichment only on codebase-relevant context
@@ -162,9 +166,9 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
         let vault_root = cfg
             .agents
             .memory_vault_root
-            .as_deref()
-            .unwrap_or(DEFAULT_VAULT_ROOT);
-        let mut res = search_vault(context, vault_root).await.unwrap_or_default();
+            .clone()
+            .unwrap_or_else(default_vault_root);
+        let mut res = search_vault(context, &vault_root).await.unwrap_or_default();
         all.append(&mut entries_from_enrichments(
             &mut res,
             "vault",
