@@ -100,6 +100,7 @@ impl Config {
 - Judge: {}
 - Memory: {}
 - Memory sidecar: {}
+- Memory enrichment: graphify={}, vault={}, pgvector={}
 - Ambient: {}
 
 **Gateway:**
@@ -291,6 +292,9 @@ impl Config {
             } else {
                 "disabled"
             },
+            self.agents.memory_graphify_enabled,
+            self.agents.memory_vault_enabled,
+            self.agents.memory_pgvector_enabled,
             self.ambient
                 .model
                 .as_deref()
