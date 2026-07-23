@@ -595,7 +595,7 @@ pub struct AgentsConfig {
     #[serde(default = "default_memory_pgvector_enabled")]
     pub memory_pgvector_enabled: bool,
     /// Root directory for Obsidian vault notes enrichment.
-    /// Default: "/sharedssd/vault" when vault enrichment is enabled.
+    /// Default: "~/vault" (expanded from $HOME).
     #[serde(default)]
     pub memory_vault_root: Option<String>,
 }

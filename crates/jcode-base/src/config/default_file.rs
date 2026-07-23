@@ -417,7 +417,7 @@ swarm_max_concurrent_agents = 32
 # Graphify codebase knowledge graph (requires `graphify` on $PATH):
 memory_graphify_enabled = false
 #
-# Obsidian vault notes under /sharedssd/vault/:
+# Obsidian vault notes under ~/vault/ (or agents.memory_vault_root if set):
 memory_vault_enabled = false
 #
 # Pgvector RAG search via /sharedssd/scripts/search_memory.py:

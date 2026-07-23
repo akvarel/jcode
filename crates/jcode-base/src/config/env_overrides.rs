@@ -395,6 +395,14 @@ impl Config {
                 self.agents.memory_pgvector_enabled = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_VAULT_ROOT") {
+            let trimmed = v.trim();
+            self.agents.memory_vault_root = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
 
         // Terminal spawning
         if let Ok(v) = std::env::var("JCODE_SPAWN_HOOK") {
