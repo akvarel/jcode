@@ -6,7 +6,7 @@
 //! those instructions — it calls:
 //!
 //! - **Graphify** — AST-based codebase knowledge graph (`graphify query`)
-//! - **Obsidian vault** — Zettelkasten notes under configurable root
+//! - **Obsidian vault** — Zettelkasten notes under `~/vault/` (configurable)
 //! - **Pgvector RAG** — vector DB-backed vault search (OrangeHat infra)
 //!
 //! Each source is controlled by a config flag (opt-in, default off) and runs with
