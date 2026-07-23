@@ -1465,38 +1465,36 @@ impl MemoryManager {
         }
 
         if candidates.is_empty() {
-            pipeline_update(|p| {
-                p.verify = StepStatus::Skipped;
-                p.inject = StepStatus::Skipped;
-                p.maintain = StepStatus::Skipped;
-            });
-            set_state(MemoryState::Idle);
-            emit_memory_activity(event_tx.as_ref());
-            // Even with no jcode candidates, try external enrichment (graphify/vault)
+            // No jcode memories — try external enrichment, but only through sidecar below
             let external = crate::memory_external::enrich_context(&context).await;
             if !external.is_empty() {
                 crate::logging::info(&format!(
-                    "Memory enrichment: {} external result(s) with no jcode candidates",
+                    "Memory enrichment: {} external candidate(s) with no jcode candidates",
                     external.len()
                 ));
-                let prompt = format_relevant_prompt(&external, MEMORY_RELEVANCE_MAX_RESULTS);
-                let display_prompt =
-                    format_relevant_display_prompt(&external, MEMORY_RELEVANCE_MAX_RESULTS);
-                return Ok((prompt, Vec::new(), display_prompt));
+                candidates = external.into_iter().map(|e| (e, 0.5)).collect();
+            } else {
+                pipeline_update(|p| {
+                    p.verify = StepStatus::Skipped;
+                    p.inject = StepStatus::Skipped;
+                    p.maintain = StepStatus::Skipped;
+                });
+                set_state(MemoryState::Idle);
+                emit_memory_activity(event_tx.as_ref());
+                return Ok((None, Vec::new(), None));
             }
-            return Ok((None, Vec::new(), None));
-        }
-
-        // Enrich existing candidates with external sources.
-        let external = crate::memory_external::enrich_context(&context).await;
-        if !external.is_empty() {
-            let prev = candidates.len();
-            candidates.extend(external.into_iter().map(|e| (e, 0.5)));
-            crate::logging::info(&format!(
-                "Memory enrichment: added {} external candidate(s) to {} jcode memories",
-                candidates.len() - prev,
-                prev,
-            ));
+        } else {
+            // Enrich existing candidates with external sources.
+            let external = crate::memory_external::enrich_context(&context).await;
+            if !external.is_empty() {
+                let prev = candidates.len();
+                candidates.extend(external.into_iter().map(|e| (e, 0.5)));
+                crate::logging::info(&format!(
+                    "Memory enrichment: added {} external candidate(s) to {} jcode memories",
+                    candidates.len() - prev,
+                    prev,
+                ));
+            }
         }
 
         if !memory_sidecar_enabled() {
