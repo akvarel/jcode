@@ -380,6 +380,21 @@ impl Config {
                 self.agents.memory_embedding_dim = Some(parsed);
             }
         }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_GRAPHIFY_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_graphify_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_VAULT_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_vault_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_PGVECTOR_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_pgvector_enabled = parsed;
+            }
+        }
 
         // Terminal spawning
         if let Ok(v) = std::env::var("JCODE_SPAWN_HOOK") {

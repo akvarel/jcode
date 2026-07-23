@@ -408,6 +408,21 @@ swarm_max_concurrent_agents = 32
 # memory_embedding_base_url = "https://api.openai.com/v1"
 # memory_embedding_dim = 1536
 
+#
+# External memory enrichment sources (opt-in, default off).
+# When enabled, the memory pipeline queries these sources alongside jcode's
+# built-in memory store and injects relevant results into agent context.
+# All depend on external tools/scripts on this machine:
+#
+# Graphify codebase knowledge graph (requires `graphify` on $PATH):
+memory_graphify_enabled = false
+#
+# Obsidian vault notes under /sharedssd/vault/:
+memory_vault_enabled = false
+#
+# Pgvector RAG search via /sharedssd/scripts/search_memory.py:
+memory_pgvector_enabled = false
+
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.
 # Set JCODE_TERMINAL to force a supported terminal emulator instead.

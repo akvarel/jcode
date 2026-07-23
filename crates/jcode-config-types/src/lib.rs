@@ -585,10 +585,31 @@ pub struct AgentsConfig {
     /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
     #[serde(default = "default_swarm_max_concurrent_agents")]
     pub swarm_max_concurrent_agents: usize,
+    /// Whether to enrich memory context with graphify codebase knowledge.
+    #[serde(default = "default_memory_graphify_enabled")]
+    pub memory_graphify_enabled: bool,
+    /// Whether to enrich memory context with Obsidian vault notes.
+    #[serde(default = "default_memory_vault_enabled")]
+    pub memory_vault_enabled: bool,
+    /// Whether to enrich memory context with pgvector RAG search.
+    #[serde(default = "default_memory_pgvector_enabled")]
+    pub memory_pgvector_enabled: bool,
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
     32
+}
+
+fn default_memory_graphify_enabled() -> bool {
+    false
+}
+
+fn default_memory_vault_enabled() -> bool {
+    false
+}
+
+fn default_memory_pgvector_enabled() -> bool {
+    false
 }
 
 fn default_memory_embedding_backend() -> String {
@@ -628,6 +649,9 @@ impl Default for AgentsConfig {
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+            memory_graphify_enabled: default_memory_graphify_enabled(),
+            memory_vault_enabled: default_memory_vault_enabled(),
+            memory_pgvector_enabled: default_memory_pgvector_enabled(),
         }
     }
 }
