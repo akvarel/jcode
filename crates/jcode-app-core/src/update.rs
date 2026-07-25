@@ -8,16 +8,34 @@ use jcode_update_core::{
 };
 pub use jcode_update_core::{
     DownloadProgress, GIT_PULL_DIVERGED_SUMMARY, GitHubAsset, GitHubRelease, PreparedUpdate,
-    UpdateCheckResult, UpdateEstimate, format_download_progress_bar, summary_is_divergence,
+    UpdateCheckResult, UpdateEstimate, format_download_progress_bar, summarize_update_error,
+    summary_is_divergence,
 };
-use serde::{Deserialize, Serialize};
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "update_metadata.rs"]
+mod update_metadata;
+#[path = "update_rate_limit.rs"]
+mod update_rate_limit;
+pub use update_metadata::UpdateMetadata;
+use update_metadata::{record_release_update_duration, record_source_update_duration};
+pub use update_rate_limit::{RATE_LIMIT_ERROR_PREFIX, is_rate_limit_error};
+use update_rate_limit::{clear_rate_limit_backoff, rate_limit_error};
+
 const GITHUB_REPO: &str = "1jehuang/jcode";
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // minimum gap between checks
+/// Minimum gap between *automatic* update checks.
+///
+/// Every automatic check costs one or two unauthenticated `api.github.com`
+/// requests, which share a 60 req/hour per-IP bucket with everything else on
+/// the machine (and everything behind the same NAT). A 60s gap meant a user
+/// who opens jcode a few dozen times an hour exhausted the bucket and then saw
+/// spurious 403s. Half an hour is far below any realistic release cadence and
+/// keeps automatic checks to at most a couple of requests per hour.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time allowed for the initial TCP/TLS connect to the download host.
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -82,82 +100,12 @@ fn current_update_semver() -> &'static str {
     jcode_build_meta::update_semver()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateMetadata {
-    pub last_check: SystemTime,
-    pub installed_version: Option<String>,
-    pub installed_from: Option<String>,
-    #[serde(default)]
-    pub last_release_update_secs: Option<f64>,
-    #[serde(default)]
-    pub last_source_update_secs: Option<f64>,
-}
-
-impl Default for UpdateMetadata {
-    fn default() -> Self {
-        Self {
-            last_check: SystemTime::UNIX_EPOCH,
-            installed_version: None,
-            installed_from: None,
-            last_release_update_secs: None,
-            last_source_update_secs: None,
-        }
-    }
-}
-
-impl UpdateMetadata {
-    pub fn load() -> Result<Self> {
-        let path = metadata_path()?;
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = metadata_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, content)?;
-        Ok(())
-    }
-
-    pub fn should_check(&self) -> bool {
-        match self.last_check.elapsed() {
-            Ok(elapsed) => elapsed > UPDATE_CHECK_INTERVAL,
-            Err(_) => true,
-        }
-    }
-}
-
-fn metadata_path() -> Result<PathBuf> {
-    Ok(storage::jcode_dir()?.join("update_metadata.json"))
-}
-
 fn source_build_root() -> Result<PathBuf> {
     Ok(storage::jcode_dir()?.join("builds").join("source"))
 }
 
 fn source_build_repo_dir() -> Result<PathBuf> {
     Ok(source_build_root()?.join("jcode"))
-}
-
-fn record_release_update_duration(duration: Duration) {
-    if let Ok(mut metadata) = UpdateMetadata::load() {
-        metadata.last_release_update_secs = Some(duration.as_secs_f64());
-        let _ = metadata.save();
-    }
-}
-
-fn record_source_update_duration(duration: Duration) {
-    if let Ok(mut metadata) = UpdateMetadata::load() {
-        metadata.last_source_update_secs = Some(duration.as_secs_f64());
-        let _ = metadata.save();
-    }
 }
 
 pub fn should_auto_update() -> bool {
@@ -231,12 +179,16 @@ pub fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
         anyhow::bail!("No releases found");
     }
 
+    if let Some(error) = rate_limit_error(&response) {
+        return Err(error);
+    }
+
     if !response.status().is_success() {
         anyhow::bail!("GitHub API error: {}", response.status());
     }
 
     let release: GitHubRelease = response.json().context("Failed to parse release info")?;
-
+    clear_rate_limit_backoff();
     Ok(release)
 }
 
@@ -270,6 +222,9 @@ fn latest_main_sha_blocking() -> Result<String> {
     let response = github_api_request(&client, &url)
         .send()
         .context("Failed to check main branch")?;
+    if let Some(error) = rate_limit_error(&response) {
+        return Err(error);
+    }
     if !response.status().is_success() {
         anyhow::bail!("GitHub API error checking main: {}", response.status());
     }
@@ -488,6 +443,15 @@ pub fn prepare_update_blocking() -> Result<PreparedUpdate> {
     }
 }
 
+/// Log the full error and return a single short line for the UI.
+///
+/// Update failures come from many layers and are often multi-line, so the
+/// verbose text belongs in the log while the card/notice stay one line.
+fn short_update_error(context: &str, error: &anyhow::Error) -> String {
+    crate::logging::warn(&format!("update: {}: {:#}", context, error));
+    summarize_update_error(&format!("{:#}", error))
+}
+
 pub fn spawn_background_session_update(session_id: String) {
     std::thread::spawn(move || {
         use crate::bus::{Bus, BusEvent, ClientMaintenanceAction, SessionUpdateStatus};
@@ -539,7 +503,7 @@ pub fn spawn_background_session_update(session_id: String) {
                     Err(error) => publish(SessionUpdateStatus::Error {
                         session_id,
                         action,
-                        message: format!("Update failed: {}", error),
+                        message: short_update_error("update failed", &error),
                     }),
                 }
             }
@@ -570,14 +534,14 @@ pub fn spawn_background_session_update(session_id: String) {
                     Err(error) => publish(SessionUpdateStatus::Error {
                         session_id,
                         action,
-                        message: format!("Update failed: {}", error),
+                        message: short_update_error("update failed", &error),
                     }),
                 }
             }
             Err(error) => publish(SessionUpdateStatus::Error {
                 session_id,
                 action,
-                message: format!("Update check failed: {}", error),
+                message: short_update_error("update check failed", &error),
             }),
         }
     });
@@ -1195,7 +1159,15 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
             UpdateCheckResult::NoUpdate
         }
         Err(e) => {
-            let msg = format!("Check failed: {}", e);
+            let msg = short_update_error("update check failed", &e);
+            if is_rate_limit_error(&msg) {
+                // Throttling is not an update failure and there is nothing the
+                // user needs to do, so keep it out of the UI. The backoff was
+                // already persisted, so we stop retrying too.
+                crate::logging::info(&msg);
+                Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
+                return UpdateCheckResult::NoUpdate;
+            }
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(msg.clone())));
             UpdateCheckResult::Error(msg)
         }

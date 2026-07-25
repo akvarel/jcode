@@ -20,7 +20,7 @@ use crate::transport::WriteHalf;
 use anyhow::Result;
 use jcode_agent_runtime::InterruptSignal;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -427,13 +427,92 @@ async fn ensure_client_swarm_member(
     inserted
 }
 
+/// Resolve the working directory a subscribe should actually bind to.
+///
+/// Returns the reported dir when it is acceptable, or the session's existing
+/// dir when the report is rejected by [`subscribe_working_dir_replacement`].
+/// Every consumer of a subscribe cwd (agent state, swarm id, project-local MCP
+/// resolution) must agree on this one answer, otherwise the session's tools,
+/// swarm grouping, and MCP config can each resolve against a different
+/// directory (issue #481).
+pub(super) fn effective_subscribe_working_dir(
+    current: Option<&str>,
+    reported: &str,
+    home: Option<&Path>,
+) -> String {
+    match subscribe_working_dir_replacement(current, reported, home) {
+        Some(accepted) => accepted,
+        None => current
+            .map(str::to_string)
+            .unwrap_or_else(|| reported.trim().to_string()),
+    }
+}
+
+/// Decide whether a client-reported subscribe cwd may replace the session's
+/// current working directory.
+///
+/// Requiring a subscribe cwd to be non-empty and absolute (the earlier
+/// require-cwd change) is necessary but not sufficient: a client that launches
+/// with an inherited environment can report the user's *home* directory even
+/// though the real project lives elsewhere. Accepting that silently re-pins the
+/// session to home, so bash/file tools run against home while the header still
+/// shows the project path (issue #481).
+///
+/// The rule is deliberately narrow so it cannot break legitimate directory
+/// changes: a reported cwd that is exactly the home directory is ignored *only*
+/// when the session already has a different working directory. Working in home
+/// on purpose (no prior cwd, or a session already pinned to home) still works,
+/// and every other path is accepted as before.
+pub(super) fn subscribe_working_dir_replacement(
+    current: Option<&str>,
+    reported: &str,
+    home: Option<&Path>,
+) -> Option<String> {
+    let reported_trimmed = reported.trim();
+    if reported_trimmed.is_empty() {
+        return None;
+    }
+    let current = current.map(str::trim).filter(|dir| !dir.is_empty());
+    if current == Some(reported_trimmed) {
+        return None;
+    }
+    if let (Some(current), Some(home)) = (current, home)
+        && Path::new(reported_trimmed) == home
+        && Path::new(current) != home
+    {
+        return None;
+    }
+    Some(reported_trimmed.to_string())
+}
+
+fn log_ignored_subscribe_working_dir(session_id: &str, current: &str, reported: &str) {
+    crate::logging::warn(&format!(
+        "Ignoring subscribe working_dir {} for session {}: it is the home directory while the session is already bound to {} (issue #481)",
+        reported, session_id, current
+    ));
+}
+
 fn apply_or_defer_subscribe_working_dir(
     agent: &Arc<Mutex<Agent>>,
     working_dir: &str,
     session_id: &str,
 ) {
+    let home = dirs::home_dir();
     if let Ok(mut agent_guard) = agent.try_lock() {
-        agent_guard.set_working_dir(working_dir);
+        match subscribe_working_dir_replacement(
+            agent_guard.working_dir(),
+            working_dir,
+            home.as_deref(),
+        ) {
+            Some(accepted) => agent_guard.set_working_dir(&accepted),
+            None => {
+                if let Some(current) = agent_guard.working_dir()
+                    && current != working_dir
+                {
+                    log_ignored_subscribe_working_dir(session_id, current, working_dir);
+                }
+            }
+        }
         return;
     }
 
@@ -442,11 +521,26 @@ fn apply_or_defer_subscribe_working_dir(
     let session_id = session_id.to_string();
     tokio::spawn(async move {
         let mut agent_guard = agent.lock().await;
-        agent_guard.set_working_dir(&working_dir);
-        crate::logging::info(&format!(
-            "Applied deferred subscribe working directory for session {}",
-            session_id
-        ));
+        match subscribe_working_dir_replacement(
+            agent_guard.working_dir(),
+            &working_dir,
+            home.as_deref(),
+        ) {
+            Some(accepted) => {
+                agent_guard.set_working_dir(&accepted);
+                crate::logging::info(&format!(
+                    "Applied deferred subscribe working directory for session {}",
+                    session_id
+                ));
+            }
+            None => {
+                if let Some(current) = agent_guard.working_dir()
+                    && current != working_dir
+                {
+                    log_ignored_subscribe_working_dir(&session_id, current, &working_dir);
+                }
+            }
+        }
     });
 }
 
@@ -531,7 +625,17 @@ pub(super) async fn handle_subscribe(
     if let Some(ref dir) = subscribe_working_dir {
         apply_or_defer_subscribe_working_dir(agent, dir, client_session_id);
 
-        let new_path = PathBuf::from(dir);
+        // Swarm grouping must use the *bound* directory, not the raw report, or
+        // a home-dir subscribe would still re-key the session's swarm even
+        // though its agent stayed in the project (issue #481).
+        let bound_dir = {
+            let current = agent
+                .try_lock()
+                .ok()
+                .and_then(|guard| guard.working_dir().map(str::to_string));
+            effective_subscribe_working_dir(current.as_deref(), dir, dirs::home_dir().as_deref())
+        };
+        let new_path = PathBuf::from(&bound_dir);
         let new_swarm_id = swarm_id_for_dir(Some(new_path.clone()));
         let mut old_swarm_id: Option<String> = None;
         let mut updated_swarm_id: Option<String> = None;
@@ -675,7 +779,19 @@ pub(super) async fn handle_subscribe(
         // not the server process cwd (issue #420). Prefer the subscribe
         // request's dir; fall back to the agent's stored session dir.
         let mcp_working_dir = match subscribe_working_dir.as_ref() {
-            Some(dir) => Some(PathBuf::from(dir)),
+            // Resolve against the bound directory so a rejected home-dir report
+            // cannot point project-local MCP discovery at home (issue #481).
+            Some(dir) => {
+                let current = agent
+                    .try_lock()
+                    .ok()
+                    .and_then(|guard| guard.working_dir().map(str::to_string));
+                Some(PathBuf::from(effective_subscribe_working_dir(
+                    current.as_deref(),
+                    dir,
+                    dirs::home_dir().as_deref(),
+                )))
+            }
             None => agent
                 .try_lock()
                 .ok()

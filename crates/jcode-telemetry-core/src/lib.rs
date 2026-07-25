@@ -114,6 +114,8 @@ struct TurnTelemetry {
     tool_cat_todo: u32,
     todo_gate_ownership_count: u32,
     todo_gate_hill_count: u32,
+    todo_gate_alignment_count: u32,
+    todo_gate_intent_count: u32,
     todo_gate_completion_count: u32,
     todo_gate_spike_count: u32,
 }
@@ -198,6 +200,8 @@ struct SessionTelemetry {
     tool_cat_todo: u32,
     todo_gate_ownership_count: u32,
     todo_gate_hill_count: u32,
+    todo_gate_alignment_count: u32,
+    todo_gate_intent_count: u32,
     todo_gate_completion_count: u32,
     todo_gate_spike_count: u32,
     command_login_used: bool,
@@ -291,6 +295,8 @@ impl TurnTelemetry {
             tool_cat_todo: 0,
             todo_gate_ownership_count: 0,
             todo_gate_hill_count: 0,
+            todo_gate_alignment_count: 0,
+            todo_gate_intent_count: 0,
             todo_gate_completion_count: 0,
             todo_gate_spike_count: 0,
         }
@@ -308,13 +314,59 @@ pub fn is_enabled() -> bool {
         logging::debug("telemetry disabled by environment");
         return false;
     }
-    if let Ok(dir) = storage::jcode_dir()
-        && dir.join("no_telemetry").exists()
-    {
+    if opt_out_marker_path().map(|p| p.exists()).unwrap_or(false) {
         logging::debug("telemetry disabled by no_telemetry marker");
         return false;
     }
     true
+}
+
+/// Marker file recording that the user opted out of anonymous usage telemetry.
+/// Its presence is equivalent to setting `JCODE_NO_TELEMETRY=1`, but persists
+/// across shells so the onboarding "Telemetry settings" screen can honor the
+/// choice without asking the user to edit their environment.
+fn opt_out_marker_path() -> Option<std::path::PathBuf> {
+    storage::jcode_dir().ok().map(|d| d.join("no_telemetry"))
+}
+
+/// Whether telemetry is disabled by an environment variable rather than by the
+/// persisted marker. Env opt-outs win, so UI should present themselves as
+/// read-only in that case.
+pub fn opt_out_forced_by_env() -> bool {
+    std::env::var("JCODE_NO_TELEMETRY").is_ok() || std::env::var("DO_NOT_TRACK").is_ok()
+}
+
+/// Persist the user's anonymous-usage telemetry choice. `enabled == false`
+/// writes the `no_telemetry` marker; `true` removes it. Returns whether the
+/// change was persisted (an env-var opt-out still overrides at runtime).
+pub fn set_usage_telemetry_enabled(enabled: bool) -> bool {
+    let Some(path) = opt_out_marker_path() else {
+        return false;
+    };
+    if enabled {
+        match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                logging::debug(&format!("failed to remove no_telemetry marker: {err}"));
+                false
+            }
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, b"1") {
+            Ok(()) => {
+                logging::debug("usage telemetry opted out via marker");
+                true
+            }
+            Err(err) => {
+                logging::debug(&format!("failed to write no_telemetry marker: {err}"));
+                false
+            }
+        }
+    }
 }
 
 /// Marker file recording that the user opted in to sharing prompt and
@@ -1262,6 +1314,8 @@ fn finalize_current_turn(
         tool_cat_todo: turn.tool_cat_todo,
         todo_gate_ownership_count: turn.todo_gate_ownership_count,
         todo_gate_hill_count: turn.todo_gate_hill_count,
+        todo_gate_alignment_count: turn.todo_gate_alignment_count,
+        todo_gate_intent_count: turn.todo_gate_intent_count,
         todo_gate_completion_count: turn.todo_gate_completion_count,
         todo_gate_spike_count: turn.todo_gate_spike_count,
         workflow_chat_only,
@@ -1661,6 +1715,8 @@ fn begin_session_with_mode(
         tool_cat_todo: 0,
         todo_gate_ownership_count: 0,
         todo_gate_hill_count: 0,
+        todo_gate_alignment_count: 0,
+        todo_gate_intent_count: 0,
         todo_gate_completion_count: 0,
         todo_gate_spike_count: 0,
         command_login_used: false,
@@ -1951,6 +2007,10 @@ pub enum TodoGateKind {
     Ownership,
     /// Hill-climbability was too low; the goal needs a measurable objective.
     HillClimbability,
+    /// Plan-level alignment with the user's intention was too low.
+    Alignment,
+    /// Plan-level understanding of the user's intent was too low.
+    IntentUnderstanding,
     /// Completion confidence was missing or too low at wrap-up.
     Completion,
     /// Completion confidence rose too sharply to count as validated.
@@ -1966,6 +2026,8 @@ pub fn record_todo_gate(kind: TodoGateKind) {
         let counter = match kind {
             TodoGateKind::Ownership => &mut state.todo_gate_ownership_count,
             TodoGateKind::HillClimbability => &mut state.todo_gate_hill_count,
+            TodoGateKind::Alignment => &mut state.todo_gate_alignment_count,
+            TodoGateKind::IntentUnderstanding => &mut state.todo_gate_intent_count,
             TodoGateKind::Completion => &mut state.todo_gate_completion_count,
             TodoGateKind::ConfidenceSpike => &mut state.todo_gate_spike_count,
         };
@@ -1974,6 +2036,8 @@ pub fn record_todo_gate(kind: TodoGateKind) {
             let counter = match kind {
                 TodoGateKind::Ownership => &mut turn.todo_gate_ownership_count,
                 TodoGateKind::HillClimbability => &mut turn.todo_gate_hill_count,
+                TodoGateKind::Alignment => &mut turn.todo_gate_alignment_count,
+                TodoGateKind::IntentUnderstanding => &mut turn.todo_gate_intent_count,
                 TodoGateKind::Completion => &mut turn.todo_gate_completion_count,
                 TodoGateKind::ConfidenceSpike => &mut turn.todo_gate_spike_count,
             };

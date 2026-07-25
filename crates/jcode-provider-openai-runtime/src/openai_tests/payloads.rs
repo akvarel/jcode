@@ -86,7 +86,10 @@ fn test_websocket_payload_preserves_required_fields() {
     assert!(request["input"].is_array());
     assert!(request["tools"].is_array());
     assert_eq!(request["max_output_tokens"], serde_json::json!(16384));
-    assert_eq!(request["reasoning"], serde_json::json!({"effort": "high"}));
+    assert_eq!(
+        request["reasoning"],
+        serde_json::json!({"effort": "high", "summary": "auto"})
+    );
     assert_eq!(request["tool_choice"], "auto");
 }
 
@@ -250,4 +253,38 @@ fn max_and_swarm_efforts_are_preserved_at_the_strongest_api_level() {
         None,
     );
     assert_eq!(request["reasoning"]["effort"], serde_json::json!("max"));
+    assert_eq!(request["reasoning"]["summary"], serde_json::json!("auto"));
+}
+
+/// Regression guard for issue #203: prompt overlays (`AGENTS.md`,
+/// `.jcode/prompt-overlay.md`) were silently dropped in ChatGPT/Codex OAuth
+/// mode because the provider replaced the caller's fully-built system prompt
+/// with a hardcoded ChatGPT instruction block. The composed system prompt must
+/// reach the Responses API verbatim in *both* ChatGPT-OAuth and API-key modes,
+/// otherwise user boot instructions are counted in prompt accounting but never
+/// actually sent.
+#[test]
+fn test_build_response_request_passes_system_prompt_through_verbatim() {
+    let system = "BASE PROMPT\n\n# Project Instructions (AGENTS.md)\nmarker-xyz";
+
+    for is_chatgpt_mode in [true, false] {
+        let request = OpenAIProvider::build_response_request(
+            "gpt-5.4",
+            system.to_string(),
+            &[],
+            &[],
+            is_chatgpt_mode,
+            Some(DEFAULT_MAX_OUTPUT_TOKENS),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            request["instructions"],
+            serde_json::json!(system),
+            "system prompt must not be rewritten (is_chatgpt_mode={is_chatgpt_mode})"
+        );
+    }
 }

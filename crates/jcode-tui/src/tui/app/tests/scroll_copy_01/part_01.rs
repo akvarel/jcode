@@ -253,13 +253,38 @@ fn prompt_up_key(app: &App) -> (KeyCode, KeyModifiers) {
     )
 }
 
+/// Delegates to the single shared render-state lock so scroll/render tests
+/// serialize against viewport-snapshot tests too, not just each other (#593).
 fn scroll_render_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
+    crate::tui::ui::render_state_test_lock()
+}
 
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Whether wall-clock performance budgets should be asserted rather than merely
+/// reported.
+///
+/// Latency budgets (e.g. a 60fps frame budget) measure the host scheduler as
+/// much as jcode. On a loaded developer machine or a shared CI runner they fail
+/// for reasons unrelated to the code under test, which trains everyone to
+/// ignore the suite. Correctness assertions stay always-on; opt into the timing
+/// ones with `JCODE_TEST_PERF_ASSERTIONS=1` on an idle machine (refs #592).
+fn perf_assertions_enabled() -> bool {
+    std::env::var("JCODE_TEST_PERF_ASSERTIONS")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
+
+/// Assert a wall-clock performance budget only when [`perf_assertions_enabled`],
+/// otherwise report the breach so the signal survives without failing the run.
+#[track_caller]
+fn assert_perf_budget(within_budget: bool, message: impl FnOnce() -> String) {
+    if perf_assertions_enabled() {
+        assert!(within_budget, "{}", message());
+    } else if !within_budget {
+        eprintln!(
+            "note: perf budget exceeded ({}); set JCODE_TEST_PERF_ASSERTIONS=1 \
+             on an idle machine to enforce it",
+            message()
+        );
+    }
 }
 
 /// Render app to TestBackend and return the buffer text.

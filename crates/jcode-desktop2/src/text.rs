@@ -51,19 +51,10 @@ impl Default for ParagraphStyle {
 }
 
 impl TextSystem {
-    /// Layout and draw a paragraph at `origin` wrapped to `max_width`.
-    /// Returns the layout height in pixels.
-    pub fn draw_paragraph_styled(
-        &mut self,
-        scene: &mut Scene,
-        text: &str,
-        origin: (f64, f64),
-        max_width: f32,
-        style: ParagraphStyle,
-    ) -> f64 {
-        let mut builder = self
-            .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, true);
+    /// Apply the design-language defaults for `style` to a layout builder.
+    /// Shared by drawing and measurement so a measured caret position can
+    /// never disagree with the drawn glyphs.
+    fn push_defaults(builder: &mut parley::RangedBuilder<'_, Brush>, style: ParagraphStyle) {
         builder.push_default(StyleProperty::FontFamily(parley::FontFamily::Source(
             std::borrow::Cow::Borrowed(FONT_STACK),
         )));
@@ -80,9 +71,61 @@ impl TextSystem {
             parley::LineHeight::FontSizeRelative(style.line_height),
         ));
         builder.push_default(StyleProperty::Brush(Brush::Solid(style.color)));
+    }
+
+    /// Width in logical pixels of `text` on one line, used to place the caret
+    /// at a cursor offset. Measured with the same font and size as the drawn
+    /// text so the caret lands exactly between glyphs.
+    pub fn measure_width(&mut self, text: &str, style: ParagraphStyle, scale: f64) -> f64 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let scale32 = scale as f32;
+        let mut builder = self
+            .layouts
+            .ranged_builder(&mut self.fonts, text, scale32, true);
+        Self::push_defaults(&mut builder, style);
         let mut layout: Layout<Brush> = builder.build(text);
-        layout.break_all_lines(Some(max_width));
+        layout.break_all_lines(None);
+        f64::from(layout.width()) / scale
+    }
+
+    /// Measure a paragraph without drawing it. Returns the wrapped height in
+    /// logical pixels, so callers can bottom-align or paginate text.
+    pub fn measure_paragraph(
+        &mut self,
+        text: &str,
+        max_width: f32,
+        style: ParagraphStyle,
+        scale: f64,
+    ) -> f64 {
+        let mut scratch = Scene::new();
+        self.draw_paragraph_scaled(&mut scratch, text, (0.0, 0.0), max_width, style, scale)
+    }
+
+    /// Layout and draw a paragraph at `origin`, wrapped to `max_width`.
+    /// All inputs are in logical (device-independent) units; `scale` is the
+    /// window scale factor. Returns the layout height in logical pixels.
+    /// Text is laid out and rasterized at physical size, so glyphs stay crisp
+    /// instead of being scaled up from a 1x layout.
+    pub fn draw_paragraph_scaled(
+        &mut self,
+        scene: &mut Scene,
+        text: &str,
+        origin: (f64, f64),
+        max_width: f32,
+        style: ParagraphStyle,
+        scale: f64,
+    ) -> f64 {
+        let scale32 = scale as f32;
+        let mut builder = self
+            .layouts
+            .ranged_builder(&mut self.fonts, text, scale32, true);
+        Self::push_defaults(&mut builder, style);
+        let mut layout: Layout<Brush> = builder.build(text);
+        layout.break_all_lines(Some(max_width * scale32));
         layout.align(Alignment::Start, parley::AlignmentOptions::default());
+        let origin = (origin.0 * scale, origin.1 * scale);
         for line in layout.lines() {
             for item in line.items() {
                 if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -90,7 +133,7 @@ impl TextSystem {
                 }
             }
         }
-        f64::from(layout.height())
+        f64::from(layout.height()) / scale
     }
 }
 

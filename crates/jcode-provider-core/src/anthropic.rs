@@ -62,39 +62,129 @@ impl AnthropicContextMode {
 /// Classify how a Claude model exposes long context. Accepts both canonical
 /// (`claude-opus-4-8`) and dotted (`claude-opus-4.8`) forms, with or without a
 /// trailing `[1m]` suffix.
+///
+/// Known generations are pinned to behavior verified against the live API.
+/// Unknown *future* generations are classified by parsed family/version rather
+/// than a hardcoded prefix list, and default optimistically to `Native1M` from
+/// version 5 on. Failing closed at 200K is the worse error: it silently
+/// under-reports the context meter and shrinks compaction budgets ~5x with no
+/// diagnostic (issues #450, #577, #578).
 pub fn anthropic_context_mode(model: &str) -> AnthropicContextMode {
-    let base = anthropic_strip_1m_suffix(model.trim()).to_ascii_lowercase();
-
-    // Native 1M (default, no opt-in): Opus 5, Opus 4.8 and 4.7, Sonnet 5, Fable 5.
-    // Sonnet 5 supports the 1M window by default (1M is both the default and
-    // the maximum; there is no smaller context variant).
-    if base.starts_with("claude-opus-5")
-        || base.starts_with("claude-opus-4-8")
-        || base.starts_with("claude-opus-4.8")
-        || base.starts_with("claude-opus-4-7")
-        || base.starts_with("claude-opus-4.7")
-        || base.starts_with("claude-sonnet-5")
-        || base.starts_with("claude-fable-5")
-    {
-        return AnthropicContextMode::Native1M;
+    let base = normalized_claude_caps_key(model);
+    if !base.starts_with("claude") {
+        return AnthropicContextMode::Standard;
     }
+    let (family, version) = parse_claude_family_version(&base);
+    let Some(version) = version else {
+        return AnthropicContextMode::Standard;
+    };
 
-    // Opt-in 1M via the context-1m beta: Opus 4.6 and Sonnet 4.6.
-    if base.starts_with("claude-opus-4-6")
-        || base.starts_with("claude-opus-4.6")
-        || base.starts_with("claude-sonnet-4-6")
-        || base.starts_with("claude-sonnet-4.6")
-    {
-        return AnthropicContextMode::OptIn1M;
+    match family {
+        // Opus/Sonnet: 4.7+ and 5+ are native 1M; 4.6 opts in via the
+        // context-1m beta; 4.5 and older are hard-capped at 200K.
+        Some("opus") | Some("sonnet") => {
+            if version >= (4, 7) {
+                AnthropicContextMode::Native1M
+            } else if version == (4, 6) {
+                AnthropicContextMode::OptIn1M
+            } else {
+                AnthropicContextMode::Standard
+            }
+        }
+        // Haiku 4.5 is 200K. Newer small models are covered by the
+        // version-5 optimistic default below.
+        Some("haiku") if version < (5, 0) => AnthropicContextMode::Standard,
+        // Optimistic default for new generations (Fable 5, Haiku 5, future
+        // families): assume native 1M from version 5 on.
+        _ => {
+            if version >= (5, 0) {
+                AnthropicContextMode::Native1M
+            } else {
+                AnthropicContextMode::Standard
+            }
+        }
     }
-
-    AnthropicContextMode::Standard
 }
 
 /// Check if a model name explicitly requests 1M context via suffix
 /// (for example `claude-opus-4-6[1m]`).
 pub fn anthropic_is_1m_model(model: &str) -> bool {
     model.ends_with("[1m]")
+}
+
+/// Whether `model` looks like a Claude id with a parseable family/version, i.e.
+/// one [`anthropic_context_mode`] can classify rather than guess about.
+pub fn claude_id_has_parseable_version(model: &str) -> bool {
+    let base = normalized_claude_caps_key(model);
+    base.starts_with("claude") && parse_claude_family_version(&base).1.is_some()
+}
+
+/// Whether [`anthropic_context_mode`]'s answer for `model` comes from a
+/// generation whose long-context behavior was verified against the live
+/// Anthropic API, as opposed to the optimistic default for new generations.
+///
+/// Callers use this to decide precedence: a verified classification beats the
+/// live catalog (whose `max_input_tokens` over-advertises 1M for 200K-capped
+/// models), while an unverified one should yield to catalog/config data and be
+/// used only as a last resort instead of the 200K default.
+pub fn anthropic_context_mode_is_verified(model: &str) -> bool {
+    let base = normalized_claude_caps_key(model);
+    let (family, version) = parse_claude_family_version(&base);
+    let Some(version) = version else {
+        return false;
+    };
+    match family {
+        // Opus/Sonnet 3.x-4.8 and Sonnet 5 were probed with raw long-context
+        // requests on a live subscription.
+        Some("opus") => version <= (4, 8),
+        Some("sonnet") => version <= (5, 0),
+        Some("haiku") => version <= (4, 5),
+        _ => false,
+    }
+}
+
+/// Maximum output tokens Anthropic's synchronous Messages API accepts for a
+/// model, per the published model comparison table.
+///
+/// This matters more than it looks. Adaptive-thinking models spend their output
+/// budget on thinking *and* the visible tool call, so a budget that is too
+/// small truncates mid-tool-call and silently ends an agent turn. jcode used a
+/// flat 32K default for every Claude model, which cut long agentic turns on
+/// models that actually allow 128K.
+pub fn anthropic_max_output_tokens(model: &str) -> u32 {
+    let base = anthropic_strip_1m_suffix(model.trim()).to_ascii_lowercase();
+
+    // Opus 5, Opus 4.6-4.8, Sonnet 5, Sonnet 4.6, and Fable/Mythos 5 all
+    // advertise 128K max output on the synchronous Messages API.
+    const LARGE_OUTPUT_PREFIXES: &[&str] = &[
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4.8",
+        "claude-opus-4-7",
+        "claude-opus-4.7",
+        "claude-opus-4-6",
+        "claude-opus-4.6",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4.6",
+        "claude-fable-5",
+        "claude-fable",
+        "claude-mythos",
+    ];
+    if LARGE_OUTPUT_PREFIXES
+        .iter()
+        .any(|prefix| base.starts_with(prefix))
+    {
+        return 128_000;
+    }
+
+    // Haiku 4.5 tops out at 64K.
+    if base.starts_with("claude-haiku-4-5") || base.starts_with("claude-haiku-4.5") {
+        return 64_000;
+    }
+
+    // Older/unknown generations keep the conservative 32K jcode has always used.
+    32_768
 }
 
 /// Check if a model explicitly requests 1M context via the `[1m]` suffix.
@@ -326,6 +416,7 @@ pub fn anthropic_stainless_os() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ALL_CLAUDE_MODELS;
 
     #[test]
     fn model_suffix_helpers_require_explicit_1m_suffix() {
@@ -421,6 +512,62 @@ mod tests {
             assert!(
                 !anthropic_reasoning_caps(model).supports_reasoning_effort(),
                 "{model} should not support effort"
+            );
+        }
+    }
+
+    #[test]
+    fn max_output_tokens_match_published_model_limits() {
+        // 128K-output generations, including dotted and [1m]/dated aliases.
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4.8",
+            "claude-opus-4-7",
+            "claude-opus-4-6[1m]",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+            "Claude-Opus-5-20260724",
+        ] {
+            assert_eq!(
+                anthropic_max_output_tokens(model),
+                128_000,
+                "{model} should allow 128K output"
+            );
+        }
+
+        // Haiku 4.5 is a 64K-output model.
+        assert_eq!(anthropic_max_output_tokens("claude-haiku-4-5"), 64_000);
+        assert_eq!(
+            anthropic_max_output_tokens("claude-haiku-4-5-20251001"),
+            64_000
+        );
+
+        // Older generations keep the conservative legacy budget.
+        for model in [
+            "claude-opus-4-5",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-20250514",
+            "claude-instant",
+        ] {
+            assert_eq!(
+                anthropic_max_output_tokens(model),
+                32_768,
+                "{model} should keep the conservative default"
+            );
+        }
+    }
+
+    #[test]
+    fn max_output_tokens_never_undercut_the_legacy_default() {
+        // Regression guard: a per-model budget must never be *smaller* than the
+        // flat 32K default jcode shipped before, or turns that used to fit would
+        // start truncating.
+        for model in ALL_CLAUDE_MODELS {
+            assert!(
+                anthropic_max_output_tokens(model) >= 32_768,
+                "{model} regressed below the legacy 32K output budget"
             );
         }
     }

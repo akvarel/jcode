@@ -3,13 +3,12 @@ use super::*;
 #[path = "openai_rate_limit_format.rs"]
 mod openai_rate_limit_format;
 use self::openai_rate_limit_format::format_rate_limit_error;
-/// Effective websocket completion/idle budget in seconds. Uses the built-in
-/// default, extended by `[provider] stream_idle_timeout_secs` when the user
-/// raises it above the default so slow reasoning models don't get cut off at
-/// the hardcoded budget on one transport but not another (issue #434).
-pub(super) fn effective_ws_completion_timeout_secs() -> u64 {
-    WEBSOCKET_COMPLETION_TIMEOUT_SECS.max(jcode_base::provider::stream_idle_timeout().as_secs())
-}
+#[path = "openai_stream_timeout.rs"]
+mod openai_stream_timeout;
+pub(super) use self::openai_stream_timeout::reasoning_payload;
+use self::openai_stream_timeout::{
+    effective_https_idle_timeout, effective_ws_completion_timeout_secs,
+};
 
 pub(super) async fn openai_access_token(
     credentials: &Arc<RwLock<CodexCredentials>>,
@@ -251,7 +250,7 @@ pub(super) async fn stream_response(
     // minutes get cancelled prematurely. Resolved from
     // `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
     // (issue #434).
-    let idle_timeout = jcode_base::provider::stream_idle_timeout();
+    let idle_timeout = effective_https_idle_timeout(&request);
 
     use futures::StreamExt;
     loop {
@@ -773,7 +772,7 @@ pub(super) async fn try_persistent_ws_continuation(
     let mut last_api_activity_at = stream_started;
     let mut saw_api_activity = false;
     let mut logged_first_server_event = false;
-    let ws_completion_timeout_secs = effective_ws_completion_timeout_secs();
+    let ws_completion_timeout_secs = effective_ws_completion_timeout_secs(&continuation_request);
 
     loop {
         if stream_started.elapsed() >= Duration::from_secs(ws_completion_timeout_secs) {
@@ -1189,7 +1188,7 @@ pub(super) async fn stream_response_websocket_persistent(
     let mut response_id: Option<String> = None;
     let connected_at = Instant::now();
     let mut logged_first_server_event = false;
-    let ws_completion_timeout_secs = effective_ws_completion_timeout_secs();
+    let ws_completion_timeout_secs = effective_ws_completion_timeout_secs(&request_event);
 
     loop {
         if !saw_response_completed

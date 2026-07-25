@@ -301,6 +301,7 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
 
     detect_and_cancel_stall(app, remote).await;
     needs_redraw |= recover_stuck_remote_history(app, remote).await;
+    needs_redraw |= detect_starved_queued_followup(app);
     needs_redraw
 }
 
@@ -1448,19 +1449,66 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
     }
 }
 
+/// How long a queued follow-up may sit undispatched on an idle client before
+/// the starvation watchdog treats it as stranded.
+const QUEUED_FOLLOWUP_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Recover the "👉 Auto-poking: N incomplete todos" + spinner-forever state
+/// where no request is actually in flight.
+///
+/// `schedule_auto_poke_followup_if_needed` pushes the continuation onto
+/// `queued_messages` and sets `pending_queued_dispatch`. The event loop clears
+/// that flag and calls `process_remote_followups`, which returns early WITHOUT
+/// sending whenever one of its gates is closed (history not loaded, an earlier
+/// pending prompt/split/transfer branch returning first, or `is_processing`
+/// still true from a turn whose terminal event was dropped). The flag is
+/// already consumed by then, and nothing re-arms it: the follow-up sits in
+/// `queued_messages`, `App::is_processing()` keeps reporting true because the
+/// queue is non-empty, and the spinner spins while the model is idle.
+///
+/// `detect_and_cancel_stall` does not cover this: it only runs while
+/// `app.is_processing`, which is false in this variant. So track how long a
+/// queued follow-up has been idle-but-undispatched and re-arm the dispatch past
+/// the timeout, logging it so a recurrence is diagnosable from logs alone.
+fn detect_starved_queued_followup(app: &mut App) -> bool {
+    let starved_candidate =
+        !app.is_processing && !app.pending_queued_dispatch && app.has_queued_followups();
+    if !starved_candidate {
+        app.queued_followup_starved_since = None;
+        return false;
+    }
+    let since = *app
+        .queued_followup_starved_since
+        .get_or_insert_with(Instant::now);
+    let idle_for = since.elapsed();
+    if idle_for < QUEUED_FOLLOWUP_STARVATION_TIMEOUT {
+        return false;
+    }
+    crate::logging::warn(&format!(
+        "QUEUED_FOLLOWUP_STARVED queued_messages={} hidden_reminders={} interleave={} idle_for_secs={} re-arming dispatch",
+        app.queued_messages.len(),
+        app.hidden_queued_system_messages.len(),
+        app.interleave_message.is_some(),
+        idle_for.as_secs(),
+    ));
+    app.queued_followup_starved_since = None;
+    app.pending_queued_dispatch = true;
+    true
+}
+
 /// Client-side stall budget before the TUI cancels an in-flight turn.
 ///
 /// The server relays provider events over the local socket; when the upstream
 /// model reasons silently, no events cross the socket, so a hardcoded short
 /// watchdog cannot distinguish a dead connection from a healthy long think
-/// (issue #434). Derive the budget from the provider-agnostic
-/// `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
-/// setting plus grace time so the server-side idle timeout (which produces a
-/// visible error event) always fires first. Never below 2 minutes.
+/// (issue #434). Derive it from `[provider] stream_idle_timeout_secs`, scaled by
+/// the largest reasoning-effort multiplier because effort is invisible here,
+/// plus grace so the server-side idle timeout (which produces a visible error
+/// event) always fires first. Never below 2 minutes.
 fn stall_timeout() -> Duration {
     const MIN_STALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
     const GRACE: Duration = Duration::from_secs(30);
-    let provider_idle = crate::provider::stream_idle_timeout();
+    let provider_idle = crate::provider::max_stream_idle_timeout();
     provider_idle.saturating_add(GRACE).max(MIN_STALL_TIMEOUT)
 }
 
@@ -1672,6 +1720,7 @@ fn handle_disconnected_local_command(app: &mut App, trimmed: &str) -> bool {
         || super::commands::handle_model_command(app, trimmed)
         || super::commands::handle_usage_command(app, trimmed)
         || super::commands::handle_feedback_command(app, trimmed)
+        || super::commands::handle_telemetry_command(app, trimmed)
         || super::support::handle_support_command(app, trimmed)
         || super::state_ui::handle_info_command(app, trimmed)
         || super::auth::handle_auth_command(app, trimmed)
@@ -1910,10 +1959,10 @@ mod stall_guard_tests {
             timeout >= Duration::from_secs(2 * 60),
             "stall timeout regressed below 2 minutes: {timeout:?}"
         );
-        // And it must exceed the provider idle timeout so a healthy silent
+        // And it must exceed the max provider idle budget so a healthy silent
         // reasoning stretch is cancelled server-side (visible error + retry)
         // rather than by the client watchdog (issue #434).
-        let provider_idle = crate::provider::stream_idle_timeout();
+        let provider_idle = crate::provider::max_stream_idle_timeout();
         assert!(
             timeout > provider_idle,
             "stall timeout {timeout:?} must exceed provider idle timeout {provider_idle:?}"
@@ -1932,5 +1981,66 @@ mod stall_guard_tests {
             format_stall_duration(Duration::from_secs(430)),
             "7.2 minutes"
         );
+    }
+
+    /// The stranded-auto-poke bug: a continuation sits in `queued_messages`
+    /// with `pending_queued_dispatch` already consumed, so nothing ever sends
+    /// it while `is_processing()` (queue-aware) keeps the spinner up.
+    #[test]
+    fn starved_queued_followup_is_rearmed_after_timeout() {
+        let mut app = App::new_for_remote(None);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        app.queued_messages
+            .push(crate::todo::build_auto_poke_message(2));
+
+        // First observation only arms the timer; it must not re-dispatch yet.
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(app.queued_followup_starved_since.is_some());
+        assert!(!app.pending_queued_dispatch);
+
+        // Backdate past the timeout to simulate a stranded follow-up.
+        app.queued_followup_starved_since =
+            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
+        assert!(detect_starved_queued_followup(&mut app));
+        assert!(
+            app.pending_queued_dispatch,
+            "watchdog must re-arm dispatch so the queued poke is actually sent"
+        );
+        assert!(app.queued_followup_starved_since.is_none());
+        assert_eq!(
+            app.queued_messages.len(),
+            1,
+            "watchdog must not drop the queued continuation"
+        );
+    }
+
+    /// A live turn (or an already-armed dispatch) is normal, not starvation.
+    #[test]
+    fn starvation_watchdog_ignores_healthy_states() {
+        let mut app = App::new_for_remote(None);
+
+        // Empty queue: nothing to starve.
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(app.queued_followup_starved_since.is_none());
+
+        // Queued but a turn is in flight: the queue drains at turn end.
+        app.queued_messages.push("poke".to_string());
+        app.is_processing = true;
+        app.queued_followup_starved_since =
+            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(
+            app.queued_followup_starved_since.is_none(),
+            "timer must reset once the state is healthy again"
+        );
+
+        // Dispatch already armed: the event loop will send on the next pass.
+        app.is_processing = false;
+        app.pending_queued_dispatch = true;
+        app.queued_followup_starved_since =
+            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(app.queued_followup_starved_since.is_none());
     }
 }

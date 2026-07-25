@@ -884,10 +884,40 @@ pub struct LoginImportPrompt {
     /// `false` = the default summary screen (detected logins listed read-only,
     /// with Continue / Choose pills). `true` = the per-login checkbox list.
     pub choosing: bool,
+    /// Which summary pill is focused (only meaningful when `choosing` is false).
+    pub summary_pill: ImportSummaryPill,
+    /// `Some` while the telemetry settings sub-page is open, holding the
+    /// highlighted choice.
+    pub telemetry: Option<TelemetryChoice>,
+    /// Whether the environment (JCODE_NO_TELEMETRY / DO_NOT_TRACK) already
+    /// forces telemetry off, so the sub-page should say so.
+    pub telemetry_env_forced_off: bool,
     /// How many rows are currently checked for import.
     pub checked_count: usize,
     /// Seconds left before the screen auto-imports all checked logins.
     pub seconds_left: u64,
+}
+
+/// The three actions on the import summary screen, left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSummaryPill {
+    /// Import everything we detected (default).
+    Continue,
+    /// Open the per-login checkbox list to import fewer logins.
+    ImportLess,
+    /// Open the telemetry settings sub-page.
+    Telemetry,
+}
+
+/// The highlighted option on the telemetry settings sub-page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryChoice {
+    /// Usage stats plus prompt/transcript content.
+    Everything,
+    /// Usage stats and crash reports only.
+    NoContent,
+    /// Nothing at all.
+    Nothing,
 }
 
 /// One row in the login-import checkbox list.
@@ -1051,7 +1081,15 @@ impl PickerKind {
                 let provider = route.map(|option| option.provider.as_str()).unwrap_or("");
                 let method = route.map(|option| option.api_method.as_str()).unwrap_or("");
                 let detail = route.map(|option| option.detail.as_str()).unwrap_or("");
-                format!("{} {} {} {}", entry.name, provider, method, detail)
+                // Include the pretty name so a query like "opus 4.8" matches
+                // the row even though the underlying id is `claude-opus-4-8`.
+                let pretty =
+                    crate::tui::app::helpers::model_names::pretty_known_model_family(&entry.name)
+                        .unwrap_or_default();
+                format!(
+                    "{} {} {} {} {}",
+                    entry.name, pretty, provider, method, detail
+                )
             }
         }
     }

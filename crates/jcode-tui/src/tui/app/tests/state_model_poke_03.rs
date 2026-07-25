@@ -1720,7 +1720,7 @@ fn test_local_model_picker_render_shows_antigravity_models_exactly_as_user_sees_
         claude_text
     );
     assert!(
-        claude_text.contains("claude-sonnet-4-6"),
+        claude_text.contains("Claude Sonnet 4.6"),
         "rendered /model view should show the Antigravity Claude row, got:
 {}",
         claude_text
@@ -1793,7 +1793,7 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         openai_text
     );
     assert!(
-        openai_text.contains("gpt-5.4")
+        openai_text.contains("GPT-5.4")
             && openai_text.contains("OpenAI")
             && openai_text.contains("oauth")
             && openai_text.contains("api key"),
@@ -1820,7 +1820,7 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         comtegra_text
     );
     assert!(
-        copilot_text.contains("claude-opus-4.6") && copilot_text.contains("Copilot"),
+        copilot_text.contains("Claude Opus 4.6") && copilot_text.contains("Copilot"),
         "Copilot route should be visible, got:\n{}",
         copilot_text
     );

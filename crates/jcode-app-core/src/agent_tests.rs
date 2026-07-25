@@ -1270,6 +1270,46 @@ async fn tool_snapshot_is_stable_without_new_mcp_tools() {
 }
 
 #[test]
+fn empty_post_tool_response_gets_more_than_one_retry() {
+    // Regression guard for the Claude Opus 5 benchmark incident. A provider can
+    // return an empty response immediately after tool results; that is a
+    // transient hiccup, not a finished task. With only one retry allowed, a
+    // single empty response (observed once in 43 turns) ended a 20-hour agent
+    // run with the work half-done and the submission unoptimized.
+    assert!(
+        Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS > 1,
+        "a single retry lets one transient empty response end a long run"
+    );
+    // Bounded, so a genuinely finished agent still exits instead of looping.
+    assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS <= 10);
+}
+
+#[test]
+fn output_budget_truncation_requests_a_continuation() {
+    // Regression guard for the Claude Opus 5 benchmark incident. A turn cut off
+    // by the output budget reports stop_reason=max_tokens and can contain zero
+    // tool calls, which otherwise looks exactly like a finished turn. The agent
+    // must treat it as incomplete and continue rather than ending the run.
+    assert!(Agent::should_continue_after_stop_reason("max_tokens"));
+    assert!(Agent::should_continue_after_stop_reason("MAX_TOKENS"));
+    assert!(Agent::should_continue_after_stop_reason(" max_tokens "));
+    assert!(Agent::should_continue_after_stop_reason(
+        "max_output_tokens"
+    ));
+    assert!(Agent::should_continue_after_stop_reason("length"));
+    assert!(Agent::should_continue_after_stop_reason("truncated"));
+    assert!(Agent::should_continue_after_stop_reason("incomplete"));
+
+    // Normal completions must not trigger a continuation loop.
+    assert!(!Agent::should_continue_after_stop_reason("end_turn"));
+    assert!(!Agent::should_continue_after_stop_reason("tool_use"));
+    assert!(!Agent::should_continue_after_stop_reason("stop"));
+    // An absent reason is the pre-fix wire behaviour: it cannot be recovered
+    // from, which is precisely why MessageEnd must forward the real reason.
+    assert!(!Agent::should_continue_after_stop_reason(""));
+}
+
+#[test]
 fn guardrail_stop_reason_detection() {
     assert!(Agent::is_guardrail_stop_reason(Some("refusal")));
     assert!(Agent::is_guardrail_stop_reason(Some("REFUSAL")));

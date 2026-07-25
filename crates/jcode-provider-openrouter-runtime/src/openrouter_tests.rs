@@ -10,9 +10,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-struct SharedEnvLock;
+pub(crate) struct SharedEnvLock;
 
-static ENV_LOCK: SharedEnvLock = SharedEnvLock;
+pub(crate) static ENV_LOCK: SharedEnvLock = SharedEnvLock;
 
 impl SharedEnvLock {
     /// Acquire the process-global test env lock.
@@ -22,24 +22,24 @@ impl SharedEnvLock {
     /// process env state, so a panic in one test must not cascade into a
     /// flood of unrelated `PoisonError` failures across every other test
     /// that takes this lock.
-    fn lock(&self) -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'static, ()> {
         jcode_base::storage::lock_test_env()
     }
 }
 
-struct EnvVarGuard {
+pub(crate) struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,
 }
 
 impl EnvVarGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         jcode_base::env::set_var(key, value);
         Self { key, previous }
     }
 
-    fn remove(key: &'static str) -> Self {
+    pub(crate) fn remove(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
         jcode_base::env::remove_var(key);
         Self { key, previous }

@@ -53,6 +53,7 @@ fn route_provider_display(provider: &str, api_method: &str) -> String {
 }
 
 fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
+    let base = picker_entry_pretty_name(entry);
     let default_marker = if entry.is_default { " default" } else { "" };
     let is_new = entry
         .options
@@ -80,7 +81,35 @@ fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
         default_marker.to_string()
     };
 
-    format!("{}{}", entry.name, suffix)
+    format!("{}{}", base, suffix)
+}
+
+/// Human-friendly rendering of a model picker row's model name.
+///
+/// `/model` rows historically showed the raw provider model id
+/// (`claude-opus-4-8`, `gpt-5.5 (high)`), which reads worse than the pretty
+/// names every other surface uses (header, status line, info widgets). We
+/// prettify only the well-known families so unfamiliar or namespaced ids
+/// (OpenRouter `vendor/model`, local profiles) keep their exact spelling and
+/// stay copy-pasteable. Effort suffixes such as ` (high)` are preserved.
+fn picker_entry_pretty_name(entry: &crate::tui::PickerEntry) -> String {
+    if !matches!(
+        entry.action,
+        crate::tui::PickerAction::Model | crate::tui::PickerAction::AgentModelChoice { .. }
+    ) {
+        return entry.name.clone();
+    }
+    let (base, suffix) = match entry.effort.as_deref() {
+        Some(_) => match entry.name.rsplit_once(" (") {
+            Some((base, rest)) => (base, format!(" ({rest}")),
+            None => (entry.name.as_str(), String::new()),
+        },
+        None => (entry.name.as_str(), String::new()),
+    };
+    match crate::tui::app::helpers::model_names::pretty_known_model_family(base) {
+        Some(pretty) => format!("{pretty}{suffix}"),
+        None => entry.name.clone(),
+    }
 }
 
 fn picker_row_marker(is_row_selected: bool, unavailable: bool, limited: bool) -> &'static str {
@@ -723,7 +752,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         };
 
         let match_positions = if !picker.filter.is_empty() {
-            let raw = fuzzy_match_positions(&picker.filter, &entry.name);
+            let raw = fuzzy_match_positions(&picker.filter, display_name.as_str());
             if is_preview && !raw.is_empty() {
                 // Account for the single leading space in the preview model column.
                 raw.into_iter().map(|p| p + 1).collect()
@@ -1157,6 +1186,38 @@ mod tests {
         let hint = model_picker_top_hint(&picker).expect("swarm picker should show prompt hint");
         assert!(hint.contains("/swarm-prompt"));
         assert!(hint.contains("configured by a prompt"));
+    }
+
+    #[test]
+    fn picker_entry_display_name_prettifies_known_model_families() {
+        let mut picker = sample_picker();
+        let entry = &mut picker.entries[0];
+        entry.recommended = false;
+        entry.is_current = false;
+        entry.name = "claude-opus-4-8".to_string();
+        assert_eq!(picker_entry_display_name(entry), "Claude Opus 4.8");
+
+        entry.name = "gpt-5.5 (high)".to_string();
+        entry.effort = Some("high".to_string());
+        assert_eq!(picker_entry_display_name(entry), "GPT-5.5 (high)");
+    }
+
+    #[test]
+    fn picker_entry_display_name_keeps_unknown_and_namespaced_ids_verbatim() {
+        let mut picker = sample_picker();
+        let entry = &mut picker.entries[0];
+        entry.recommended = false;
+        entry.is_current = false;
+        for raw in [
+            "deepseek-ai/DeepSeek-V3",
+            "qwen3-coder-plus",
+            "openai/gpt-5.5",
+            "gpt-oss-120b",
+            "GLM-5.1",
+        ] {
+            entry.name = raw.to_string();
+            assert_eq!(picker_entry_display_name(entry), raw);
+        }
     }
 
     #[test]

@@ -1171,7 +1171,14 @@ impl OpenRouterProvider {
             }
         }
 
-        let _ = profile_id;
+        // Celeris rejects `max_tokens` values that are not a positive multiple
+        // of 256, and requires prompt + max_tokens <= 8,192. Its own default
+        // (2,048) leaves only ~6K of prompt room, so ask for a smaller
+        // completion budget to keep more of the context window usable.
+        if profile_id.is_some_and(|id| id.eq_ignore_ascii_case("celeris")) {
+            return Some(1_024);
+        }
+
         None
     }
 
@@ -1778,21 +1785,6 @@ impl OpenRouterProvider {
             .last_attempt_unix
             .map(|last| now.saturating_sub(last) >= MODEL_CATALOG_REFRESH_RETRY_SECS)
             .unwrap_or(true)
-    }
-
-    pub(crate) fn should_merge_static_models_with_live_catalog(&self) -> bool {
-        // Built-in OpenAI-compatible provider profiles use `static_models` as a
-        // startup/pre-catalog fallback so `/model` is useful immediately after
-        // login. Once a live `/models` catalog has been fetched, the live catalog
-        // is more authoritative for access control. Keeping built-in fallback
-        // entries after a successful fetch can advertise preview/stale models that
-        // the provider rejects at chat time, which is especially confusing for
-        // direct providers such as Cerebras.
-        //
-        // Preserve static models for OpenRouter itself and for custom/named
-        // profiles, where the user supplied the list explicitly and there may be
-        // no provider-side catalog contract.
-        self.supports_provider_features || self.profile_id.is_none()
     }
 
     pub(crate) fn filter_profile_chat_supported_models(&self, models: Vec<String>) -> Vec<String> {
@@ -2754,3 +2746,7 @@ mod openrouter_sse_stream;
 #[allow(clippy::await_holding_lock)]
 #[path = "openrouter_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "openrouter_catalog_merge_tests.rs"]
+mod openrouter_catalog_merge_tests;
