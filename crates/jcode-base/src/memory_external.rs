@@ -36,31 +36,79 @@ fn default_vault_root() -> String {
 /// Signal terms that suggest a codebase or architecture question.
 const CODEBASE_KEYWORDS: &[&str] = &[
     // File system signals
-    "src/", "lib/", "crates/", "Cargo.toml", "Cargo.lock",
-    ".rs", ".py", ".js", ".ts", ".go", ".rs ", ".py ", ".ts ",
+    "src/",
+    "lib/",
+    "crates/",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".rs",
+    ".py",
+    ".js",
+    ".ts",
+    ".go",
+    ".rs ",
+    ".py ",
+    ".ts ",
     // Architecture / design
-    "architecture", "design", "pattern", "struct", "trait", "impl",
-    "module", "function", "method", "class", "interface", "type",
-    "pipeline", "flow", "diagram", "graph", "memory", "hook",
+    "architecture",
+    "design",
+    "pattern",
+    "struct",
+    "trait",
+    "impl",
+    "module",
+    "function",
+    "method",
+    "class",
+    "interface",
+    "type",
+    "pipeline",
+    "flow",
+    "diagram",
+    "graph",
+    "memory",
+    "hook",
     // Codebase verbs
-    "how does", "where is", "what is", "how is", "show me",
-    "find", "search", "locate", "explain", "implement",
+    "how does",
+    "where is",
+    "what is",
+    "how is",
+    "show me",
+    "find",
+    "search",
+    "locate",
+    "explain",
+    "implement",
     // OrangeHat / system paths
-    "/sharedssd/", "~/.jcode", "config.toml", "AGENTS.md",
-    ".jcode", "$HOME", "$PATH",
+    "/sharedssd/",
+    "~/.jcode",
+    "config.toml",
+    "AGENTS.md",
+    ".jcode",
+    "$HOME",
+    "$PATH",
     // English technical
-    "codebase", "code base", "repository", "repo", "api",
-    "endpoint", "route", "middleware", "service", "handler",
+    "codebase",
+    "code base",
+    "repository",
+    "repo",
+    "api",
+    "endpoint",
+    "route",
+    "middleware",
+    "service",
+    "handler",
     // Russian technical (code/architecture questions)
-    "код", "архитектура", "память", "структура", "функция",
-    "класс", "метод", "модуль", "схема", "поток",
-];
-
-/// Signal characters that strongly suggest a codebase query.
-const CODEBASE_PATTERNS: &[char] = &[
-    '/',    // path separator
-    '.',    // extension
-    '_',    // snake_case
+    "код",
+    "архитектура",
+    "память",
+    "структура",
+    "функция",
+    "класс",
+    "метод",
+    "модуль",
+    "схема",
+    "поток",
 ];
 
 /// Return `true` when the context contains enough signal to warrant enrichment.
@@ -154,7 +202,7 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
     let mut all: Vec<MemoryEntry> = Vec::new();
 
     if cfg.agents.memory_graphify_enabled {
-        let mut res = query_graphify(context).await.unwrap_or_default();
+        let mut res = enrichment_or_empty("graphify", query_graphify(context).await);
         all.append(&mut entries_from_enrichments(
             &mut res,
             "graphify",
@@ -168,7 +216,7 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
             .memory_vault_root
             .clone()
             .unwrap_or_else(default_vault_root);
-        let mut res = search_vault(context, &vault_root).await.unwrap_or_default();
+        let mut res = enrichment_or_empty("vault", search_vault(context, &vault_root).await);
         all.append(&mut entries_from_enrichments(
             &mut res,
             "vault",
@@ -177,7 +225,7 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
     }
 
     if cfg.agents.memory_pgvector_enabled {
-        let mut res = search_pgvector(context).await.unwrap_or_default();
+        let mut res = enrichment_or_empty("pgvector", search_pgvector(context).await);
         all.append(&mut entries_from_enrichments(
             &mut res,
             "pgvector",
@@ -237,7 +285,6 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
             content: line.to_string(),
             source: "graphify",
             source_id: None,
-            relevance: None,
         });
     }
 
@@ -329,7 +376,6 @@ async fn search_vault(query_text: &str, vault_root: &str) -> Result<Vec<External
             content: format!("[{title}]({rel_path})"),
             source: "vault",
             source_id: Some(rel_path),
-            relevance: None,
         });
     }
 
@@ -339,7 +385,10 @@ async fn search_vault(query_text: &str, vault_root: &str) -> Result<Vec<External
 /// Extract YAML frontmatter `title:` from a vault markdown file.
 fn extract_vault_title(path: &std::path::Path) -> Option<String> {
     use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return None,
+    };
     let reader = std::io::BufReader::new(file);
     let mut in_frontmatter = false;
     for line in reader.lines().take(10).flatten() {
@@ -351,10 +400,8 @@ fn extract_vault_title(path: &std::path::Path) -> Option<String> {
             in_frontmatter = true;
             continue;
         }
-        if in_frontmatter {
-            if let Some(title) = trimmed.strip_prefix("title:") {
-                return Some(title.trim().trim_matches('"').to_string());
-            }
+        if in_frontmatter && let Some(title) = trimmed.strip_prefix("title:") {
+            return Some(title.trim().trim_matches('"').to_string());
         }
     }
     None
@@ -407,7 +454,6 @@ async fn search_pgvector(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
             content: line.to_string(),
             source: "pgvector",
             source_id: None,
-            relevance: None,
         });
     }
 
@@ -424,13 +470,25 @@ struct ExternalEnrichment {
     content: String,
     source: &'static str,
     source_id: Option<String>,
-    relevance: Option<f32>,
 }
 
 /// Configurable timeouts and limits for each enrichment source.
 struct EnrichmentLimits {
     max_results: usize,
     timeout: Duration,
+}
+
+fn enrichment_or_empty(
+    source: &str,
+    result: Result<Vec<ExternalEnrichment>>,
+) -> Vec<ExternalEnrichment> {
+    match result {
+        Ok(enrichments) => enrichments,
+        Err(error) => {
+            crate::logging::warn(&format!("{source} external enrichment failed: {error}"));
+            Vec::new()
+        }
+    }
 }
 
 /// Convert external enrichment results into injectable MemoryEntry values.
