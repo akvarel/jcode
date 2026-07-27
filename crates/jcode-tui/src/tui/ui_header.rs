@@ -1481,7 +1481,6 @@ mod tests {
             rendered.contains("anthropic(oauth+key*)"),
             "rendered: {rendered}"
         );
-
         if let Some(value) = prev {
             crate::env::set_var("JCODE_RUNTIME_PROVIDER", value);
         }
