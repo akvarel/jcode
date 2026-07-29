@@ -691,6 +691,8 @@ pub(super) async fn spawn_swarm_agent(
         }
     }?;
 
+    crate::tool::deny_session_team_memory_writes(&new_session_id);
+
     let startup_message = startup_message.clone();
     {
         let mut plans = swarm_plans.write().await;

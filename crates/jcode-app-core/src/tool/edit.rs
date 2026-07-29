@@ -106,6 +106,13 @@ impl Tool for EditTool {
             content.replacen(&params.old_string, &params.new_string, 1)
         };
 
+        super::team_memory_guard::validate_team_memory_session_log_update(
+            &path,
+            &content,
+            &new_content,
+            super::session_may_write_team_memory(&ctx.session_id),
+        )?;
+
         // Find line number where edit starts
         let start_line = find_line_number(&content, &params.old_string);
 
