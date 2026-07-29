@@ -125,6 +125,13 @@ impl Tool for MultiEditTool {
             }
         }
 
+        super::team_memory_guard::validate_team_memory_session_log_update(
+            &path,
+            &original_content,
+            &content,
+            super::session_may_write_team_memory(&ctx.session_id),
+        )?;
+
         // Write the result
         tokio::fs::write(&path, &content).await?;
 

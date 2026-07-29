@@ -28,6 +28,7 @@ mod session_search;
 pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
+mod team_memory_guard;
 mod todo;
 mod webfetch;
 mod websearch;
@@ -53,6 +54,7 @@ pub(crate) use session_search::spawn_recent_index_warmup;
 struct SessionToolPolicy {
     allowed_tools: Option<HashSet<String>>,
     disabled_tools: HashSet<String>,
+    team_memory_writer: bool,
 }
 
 static SESSION_TOOL_POLICIES: LazyLock<StdRwLock<HashMap<String, SessionToolPolicy>>> =
@@ -71,8 +73,28 @@ pub(crate) fn set_session_tool_policy(
         SessionToolPolicy {
             allowed_tools,
             disabled_tools,
+            team_memory_writer: true,
         },
     );
+}
+
+pub(crate) fn deny_session_team_memory_writes(session_id: &str) {
+    let mut policies = SESSION_TOOL_POLICIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    policies
+        .entry(session_id.to_string())
+        .or_default()
+        .team_memory_writer = false;
+}
+
+pub(crate) fn session_may_write_team_memory(session_id: &str) -> bool {
+    if std::env::var_os("JCODE_SPAWN_COORDINATOR_SESSION_ID").is_some() {
+        return false;
+    }
+    session_tool_policy(session_id)
+        .map(|policy| policy.team_memory_writer)
+        .unwrap_or(true)
 }
 
 pub(crate) fn clear_session_tool_policy(session_id: &str) {

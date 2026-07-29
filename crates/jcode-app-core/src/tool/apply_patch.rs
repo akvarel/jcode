@@ -88,6 +88,12 @@ impl Tool for ApplyPatchTool {
             match hunk {
                 PatchHunk::AddFile { path, contents } => {
                     let resolved = ctx.resolve_path(Path::new(path));
+                    super::team_memory_guard::validate_team_memory_session_log_update(
+                        &resolved,
+                        "",
+                        contents,
+                        super::session_may_write_team_memory(&ctx.session_id),
+                    )?;
                     if let Some(parent) = resolved.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
@@ -156,6 +162,12 @@ impl Tool for ApplyPatchTool {
                     let resolved = ctx.resolve_path(Path::new(path));
                     match apply_update_chunks(&resolved, chunks).await {
                         Ok((old_contents, new_contents)) => {
+                            super::team_memory_guard::validate_team_memory_session_log_update(
+                                &resolved,
+                                &old_contents,
+                                &new_contents,
+                                super::session_may_write_team_memory(&ctx.session_id),
+                            )?;
                             let diff = generate_diff_summary(&old_contents, &new_contents);
                             if let Some(dest) = move_to {
                                 let dest_resolved = ctx.resolve_path(Path::new(dest));
