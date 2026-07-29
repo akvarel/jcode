@@ -860,6 +860,14 @@ impl Tool for BashTool {
         let mut params: BashInput = serde_json::from_value(input)?;
         let run_in_background = params.run_in_background.unwrap_or(false);
 
+        if !super::session_may_write_team_memory(&ctx.session_id)
+            && command_targets_team_memory_session_log(&params.command)
+        {
+            return Err(anyhow::anyhow!(
+                "Only the root or coordinator session may modify TEAM_MEMORY/SESSION_LOG.md; swarm workers must report findings to their coordinator"
+            ));
+        }
+
         // Destructive-command gate (#604), before background dispatch.
         if let Some(refusal) = destructive_command_refusal(
             &params.command,
@@ -899,6 +907,30 @@ impl Tool for BashTool {
 
         // Foreground execution with stdin detection
         self.execute_foreground(&params, &ctx).await
+    }
+}
+
+fn command_targets_team_memory_session_log(command: &str) -> bool {
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("team_memory/session_log.md")
+        || (normalized.contains("team_memory") && normalized.contains("session_log.md"))
+}
+
+#[cfg(test)]
+mod team_memory_tests {
+    use super::command_targets_team_memory_session_log;
+
+    #[test]
+    fn detects_direct_and_split_team_memory_paths() {
+        assert!(command_targets_team_memory_session_log(
+            "cat summary >> TEAM_MEMORY/SESSION_LOG.md"
+        ));
+        assert!(command_targets_team_memory_session_log(
+            "cd TEAM_MEMORY && printf x >> SESSION_LOG.md"
+        ));
+        assert!(!command_targets_team_memory_session_log(
+            "cat TEAM_MEMORY/ARCHITECTURE.md"
+        ));
     }
 }
 
