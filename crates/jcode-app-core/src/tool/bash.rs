@@ -10,9 +10,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fs;
 #[cfg(unix)]
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command as StdCommand;
 use std::process::Stdio;
@@ -863,12 +864,17 @@ impl Tool for BashTool {
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let mut params: BashInput = serde_json::from_value(input)?;
         let run_in_background = params.run_in_background.unwrap_or(false);
+        let targets_team_memory = command_targets_team_memory_session_log(&params.command);
 
-        if !super::session_may_write_team_memory(&ctx.session_id)
-            && command_targets_team_memory_session_log(&params.command)
-        {
+        if !super::session_may_write_team_memory(&ctx.session_id) && targets_team_memory {
             return Err(anyhow::anyhow!(
                 "Only the root or coordinator session may modify TEAM_MEMORY/SESSION_LOG.md; swarm workers must report findings to their coordinator"
+            ));
+        }
+
+        if run_in_background && targets_team_memory {
+            return Err(anyhow::anyhow!(
+                "TEAM_MEMORY/SESSION_LOG.md may not be modified by a background shell command because its summary cannot be validated and rolled back safely"
             ));
         }
 
@@ -909,8 +915,60 @@ impl Tool for BashTool {
             }
         }
 
-        // Foreground execution with stdin detection
-        self.execute_foreground(&params, &ctx).await
+        // Foreground execution with stdin detection. Tool-level write guards cannot
+        // see filesystem changes made inside a shell, so snapshot the session log
+        // and validate the resulting content before returning success.
+        let team_memory_snapshot = targets_team_memory
+            .then(|| TeamMemorySnapshot::capture(ctx.working_dir.as_deref()))
+            .transpose()?;
+        let result = self.execute_foreground(&params, &ctx).await;
+        if let Some(snapshot) = team_memory_snapshot {
+            snapshot.validate_or_restore(super::session_may_write_team_memory(&ctx.session_id))?;
+        }
+        result
+    }
+}
+
+struct TeamMemorySnapshot {
+    path: PathBuf,
+    old_content: Option<String>,
+}
+
+impl TeamMemorySnapshot {
+    fn capture(working_dir: Option<&Path>) -> Result<Self> {
+        let root = working_dir.unwrap_or_else(|| Path::new("."));
+        let path = root.join("TEAM_MEMORY").join("SESSION_LOG.md");
+        let old_content = match fs::read_to_string(&path) {
+            Ok(content) => Some(content),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        Ok(Self { path, old_content })
+    }
+
+    fn validate_or_restore(self, writer_allowed: bool) -> Result<()> {
+        let new_content = match fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let old_content = self.old_content.as_deref().unwrap_or_default();
+        if let Err(err) = super::team_memory_guard::validate_team_memory_session_log_update(
+            &self.path,
+            old_content,
+            &new_content,
+            writer_allowed,
+        ) {
+            match self.old_content {
+                Some(content) => fs::write(&self.path, content)?,
+                None if self.path.exists() => fs::remove_file(&self.path)?,
+                None => {}
+            }
+            return Err(anyhow::anyhow!(
+                "Invalid TEAM_MEMORY shell update was rolled back: {err}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -922,7 +980,8 @@ fn command_targets_team_memory_session_log(command: &str) -> bool {
 
 #[cfg(test)]
 mod team_memory_tests {
-    use super::command_targets_team_memory_session_log;
+    use super::{TeamMemorySnapshot, command_targets_team_memory_session_log};
+    use std::fs;
 
     #[test]
     fn detects_direct_and_split_team_memory_paths() {
@@ -934,6 +993,36 @@ mod team_memory_tests {
         ));
         assert!(!command_targets_team_memory_session_log(
             "cat TEAM_MEMORY/ARCHITECTURE.md"
+        ));
+    }
+
+    #[test]
+    fn rolls_back_direct_shell_session_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("TEAM_MEMORY");
+        fs::create_dir(&memory_dir).unwrap();
+        let path = memory_dir.join("SESSION_LOG.md");
+        let original = "# Session log\n";
+        fs::write(&path, original).unwrap();
+        let snapshot = TeamMemorySnapshot::capture(Some(dir.path())).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{original}\n## 2026-07-29 — Session ended\n\n**Session:** session_worker_123456789\n"
+            ),
+        )
+        .unwrap();
+
+        let err = snapshot.validate_or_restore(true).unwrap_err();
+
+        assert!(err.to_string().contains("rolled back"));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn rejects_background_team_memory_writes() {
+        assert!(command_targets_team_memory_session_log(
+            "printf stub >> TEAM_MEMORY/SESSION_LOG.md"
         ));
     }
 }
