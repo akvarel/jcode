@@ -74,7 +74,12 @@ impl Tool for PatchTool {
 
         for patch in patches {
             let resolved_path = ctx.resolve_path(Path::new(&patch.path));
-            let result = apply_patch_with_diff(&patch, &resolved_path).await;
+            let result = apply_patch_with_diff(
+                &patch,
+                &resolved_path,
+                super::session_may_write_team_memory(&ctx.session_id),
+            )
+            .await;
             match result {
                 Ok((msg, diff)) => {
                     if diff.is_empty() {
@@ -211,11 +216,21 @@ fn parse_hunk(lines: &[&str], i: &mut usize) -> Option<Hunk> {
 }
 
 /// Apply a patch and return (status_message, diff_output)
-async fn apply_patch_with_diff(patch: &FilePatch, path: &Path) -> Result<(String, String)> {
+async fn apply_patch_with_diff(
+    patch: &FilePatch,
+    path: &Path,
+    team_memory_writer: bool,
+) -> Result<(String, String)> {
     // Handle deletion
     if patch.is_delete {
         if path.exists() {
             let old_content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+            super::team_memory_guard::validate_team_memory_session_log_update(
+                path,
+                &old_content,
+                "",
+                team_memory_writer,
+            )?;
             tokio::fs::remove_file(path).await?;
             let diff = generate_diff(&old_content, "", 1);
             return Ok(("deleted".to_string(), diff));
@@ -243,6 +258,12 @@ async fn apply_patch_with_diff(patch: &FilePatch, path: &Path) -> Result<(String
             .map(|l| format!("{}\n", l))
             .collect();
 
+        super::team_memory_guard::validate_team_memory_session_log_update(
+            path,
+            "",
+            &content,
+            team_memory_writer,
+        )?;
         tokio::fs::write(path, &content).await?;
         let diff = generate_diff("", &content, 1);
         return Ok(("created".to_string(), diff));
@@ -269,6 +290,12 @@ async fn apply_patch_with_diff(patch: &FilePatch, path: &Path) -> Result<(String
     }
 
     let new_content = lines.join("\n") + "\n";
+    super::team_memory_guard::validate_team_memory_session_log_update(
+        path,
+        &old_content,
+        &new_content,
+        team_memory_writer,
+    )?;
     tokio::fs::write(path, &new_content).await?;
 
     let diff = generate_diff(&old_content, &new_content, first_line);
