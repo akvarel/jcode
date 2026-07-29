@@ -216,11 +216,15 @@ async fn apply_patch_with_diff(
     path: &Path,
     ctx: &ToolContext,
 ) -> Result<(String, String)> {
+    let team_memory_writer = super::session_may_write_team_memory(&ctx.session_id);
     // Handle deletion
     if patch.is_delete {
         if path.exists() {
             let old = tokio::fs::read_to_string(path).await.ok();
             let old_content = old.as_deref().unwrap_or("");
+            super::team_memory_guard::validate_team_memory_session_log_update(
+                path, old_content, "", team_memory_writer,
+            )?;
             tokio::fs::remove_file(path).await?;
             super::edit_stats::record(ctx, old_content, "", old.is_none()).await;
             let diff = generate_diff(&old_content, "", 1);
@@ -249,6 +253,12 @@ async fn apply_patch_with_diff(
             .map(|l| format!("{}\n", l))
             .collect();
 
+        super::team_memory_guard::validate_team_memory_session_log_update(
+            path,
+            "",
+            &content,
+            team_memory_writer,
+        )?;
         tokio::fs::write(path, &content).await?;
         super::edit_stats::record(ctx, "", &content, false).await;
         let diff = generate_diff("", &content, 1);
@@ -276,6 +286,12 @@ async fn apply_patch_with_diff(
     }
 
     let new_content = lines.join("\n") + "\n";
+    super::team_memory_guard::validate_team_memory_session_log_update(
+        path,
+        &old_content,
+        &new_content,
+        team_memory_writer,
+    )?;
     tokio::fs::write(path, &new_content).await?;
     super::edit_stats::record(ctx, &old_content, &new_content, false).await;
 

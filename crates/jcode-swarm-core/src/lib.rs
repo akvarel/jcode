@@ -366,6 +366,7 @@ pub fn append_swarm_completion_report_instructions(message: &str) -> String {
     out.push_str(
         "\nBefore finishing, call the swarm tool with action=\"report\" to submit your completion report. \
 Include a concise message, validation/tests performed, and blockers or follow-ups. \
+Do not create, edit, append, or commit project TEAM_MEMORY files. Only the root/coordinator may consolidate worker reports into one substantive team-memory summary. \
 After the report tool succeeds, also write a brief final assistant response. \
 Do not finish with only tool output, a lifecycle status change, or no final response. \
 Do not send a separate DM for the final report unless you need interactive coordination before finishing.\n",
@@ -578,9 +579,12 @@ fn completion_followup(status: &str, has_report: bool) -> &'static str {
 pub fn completion_notification_message(name: &str, status: &str, report: Option<&str>) -> String {
     let intro = completion_status_intro(name, status);
     let followup = completion_followup(status, report.is_some());
+    let memory_followup = "Coordinator: consolidate substantive completed work into one concise TEAM_MEMORY summary when the repository uses TEAM_MEMORY. Never copy agent names, session IDs, transcript links, or empty completion stubs.";
     match report {
-        Some(report) => format!("{intro}\n\nReport:\n{report}\n\n{followup}"),
-        None => format!("{intro}\n\nNo final textual report was produced. {followup}"),
+        Some(report) => format!("{intro}\n\nReport:\n{report}\n\n{followup}\n\n{memory_followup}"),
+        None => format!(
+            "{intro}\n\nNo final textual report was produced. {followup}\n\n{memory_followup}"
+        ),
     }
 }
 
@@ -694,6 +698,18 @@ mod tests {
             append_swarm_completion_report_instructions(&with_instructions),
             with_instructions
         );
+        assert!(
+            with_instructions
+                .contains("Do not create, edit, append, or commit project TEAM_MEMORY files")
+        );
+        assert!(with_instructions.contains("root/coordinator"));
+    }
+
+    #[test]
+    fn completion_notification_reminds_coordinator_to_consolidate_team_memory() {
+        let notification = completion_notification_message("worker", "completed", Some("Done"));
+        assert!(notification.contains("consolidate substantive completed work"));
+        assert!(notification.contains("Never copy agent names, session IDs"));
     }
 
     #[test]
