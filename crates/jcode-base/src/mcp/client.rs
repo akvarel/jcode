@@ -26,6 +26,21 @@ pub struct McpHandle {
 }
 
 impl McpHandle {
+    /// Test-only constructor: a handle that is not backed by any process.
+    #[cfg(test)]
+    pub(crate) fn new_dummy_for_tests(name: String) -> Self {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(8);
+        Self {
+            name,
+            request_id: Arc::new(AtomicU64::new(1)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            writer_tx,
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
+    }
+
     /// Send a request and wait for response
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcResponse> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);

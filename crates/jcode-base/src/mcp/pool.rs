@@ -25,6 +25,7 @@ struct FailedConnectRecord {
     failed_at: Instant,
 }
 
+#[derive(Debug)]
 enum ConnectAttempt {
     Connected,
     Leader(Arc<Notify>),
@@ -287,7 +288,29 @@ impl SharedMcpPool {
         }
 
         if self.handles.read().await.contains_key(name) {
-            return ConnectAttempt::Connected;
+            // The pool may hold a handle whose child process died (e.g. the
+            // MCP server crashed or was killed externally). Detect that here
+            // so a reconnect spawns a fresh process instead of returning the
+            // stale handle, which would make every tool call fail with
+            // "Failed to send request" (writer channel closed).
+            let mut clients = self.clients.lock().await;
+            let dead = match clients.get_mut(name) {
+                Some(client) => !client.is_running(),
+                None => true, // handle without client -> treat as dead
+            };
+            if dead {
+                clients.remove(name);
+                drop(clients);
+                let mut handles = self.handles.write().await;
+                handles.remove(name);
+                let mut refs = self.ref_counts.lock().await;
+                refs.remove(name);
+                let mut errors = self.last_errors.write().await;
+                errors.remove(name);
+            } else {
+                drop(clients);
+                return ConnectAttempt::Connected;
+            }
         }
 
         let notify = Arc::new(Notify::new());
@@ -492,6 +515,42 @@ mod tests {
         };
 
         assert!(Arc::ptr_eq(&first_notify, &second_notify));
+    }
+
+    #[tokio::test]
+    async fn begin_connect_replaces_dead_client() {
+        // A handle whose child process has exited must not be returned as
+        // "Connected": every tool call on it would fail with a closed writer
+        // channel. begin_connect should drop the stale client/handle and
+        // return Leader so a fresh process is spawned.
+        let pool = Arc::new(SharedMcpPool::new(McpConfig::default()));
+
+        // A handle with no backing client is treated as dead (crashed
+        // process): begin_connect must clean it up and return Leader.
+        pool.handles
+            .write()
+            .await
+            .insert(
+                "stale".to_string(),
+                crate::mcp::McpHandle::new_dummy_for_tests("stale".to_string()),
+            );
+        pool.ref_counts
+            .lock()
+            .await
+            .insert("stale".to_string(), 1);
+
+        let attempt = pool.begin_connect("stale").await;
+        match attempt {
+            ConnectAttempt::Leader(_) => {
+                // Stale handle was cleaned up; a fresh connect will spawn.
+            }
+            other => panic!("stale handle must yield Leader, got {other:?}"),
+        }
+
+        // The stale handle must be gone from the pool.
+        assert!(!pool.handles.read().await.contains_key("stale"));
+        assert!(!pool.clients.lock().await.contains_key("stale"));
+        assert!(!pool.ref_counts.lock().await.contains_key("stale"));
     }
 
     #[tokio::test]
