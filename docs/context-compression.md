@@ -131,6 +131,13 @@ capability already existed in Jcode and was verified rather than duplicated.
 The committed project built the actual `jcode` executable. `jcode --help`,
 `jcode run --help`, and `jcode memory --help` completed successfully. The binary
 also started with all four `JCODE_CONTEXT_*` environment variables set. The
-end-to-end provider boundary was not invoked because it requires configured live
-provider credentials and can incur usage. Therefore this change is integrated
-and representative, but not claimed as provider-acceptance-complete.
+provider boundary was exercised with the already authenticated OpenAI
+subscription: baseline and GraphCompact `jcode run --json` requests both
+completed and returned usage records. That check exposed a runtime gate where
+GraphCompact enabled Graphify but not the memory prompt pipeline; the gate is now
+centralized in `Config::runtime_memory_enabled()` and covered directly. A full
+two-turn injection check requires the same persistent server because memory is
+prepared asynchronously. Starting an isolated persistent server was blocked by
+Jcode's existing singleton server, and restarting the active server is a
+production-action boundary. Therefore provider transport is accepted, while
+live Graphify injection remains acceptance-blocked rather than inferred.

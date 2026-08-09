@@ -1,10 +1,21 @@
 use super::{
-    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
-    ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig, config_env_fingerprint,
-    populate_context_limits_from_config_ref,
+    AmbientConfig, Config, ContextCompressionMode, DiffDisplayMode, DisplayConfig, HookCommands,
+    LatexRenderingMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
+    config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
+
+#[test]
+fn graph_compact_enables_runtime_memory_pipeline() {
+    let mut cfg = Config::default();
+    cfg.features.memory = false;
+    cfg.context_compression.mode = ContextCompressionMode::Off;
+    assert!(!cfg.runtime_memory_enabled());
+
+    cfg.context_compression.mode = ContextCompressionMode::GraphCompact;
+    assert!(cfg.runtime_memory_enabled());
+}
 
 fn restore_env_var(key: &str, previous: Option<OsString>) {
     if let Some(previous) = previous {

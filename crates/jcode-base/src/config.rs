@@ -551,6 +551,16 @@ pub struct Config {
     pub launch_hotkeys: LaunchHotkeysConfig,
 }
 
+impl Config {
+    /// Context compression depends on the memory prompt pipeline. Enabling
+    /// GraphCompact therefore enables runtime memory retrieval even when the
+    /// broader user-memory feature remains disabled.
+    pub fn runtime_memory_enabled(&self) -> bool {
+        self.features.memory
+            || self.context_compression.mode == ContextCompressionMode::GraphCompact
+    }
+}
+
 /// Agent Client Protocol adapter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

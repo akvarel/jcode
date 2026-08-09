@@ -296,7 +296,7 @@ impl Agent {
             locked_tools: None,
             mcp_late_register_resolved: false,
             system_prompt_override: None,
-            memory_enabled: crate::config::config().features.memory,
+            memory_enabled: crate::config::config().runtime_memory_enabled(),
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
