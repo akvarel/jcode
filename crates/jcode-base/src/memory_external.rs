@@ -288,10 +288,17 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     if cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact {
+        // A compression mode must not increase provider input merely because
+        // the compact IR has metadata overhead. Keep the configured ceiling,
+        // but tighten it to the size of Graphify's baseline compact response.
+        let effective_budget = cfg
+            .context_compression
+            .graph_token_budget
+            .min(crate::context_compiler::estimate_tokens(&stdout));
         let compiled = crate::context_compiler::compile_graphify_context(
             truncated,
             &stdout,
-            cfg.context_compression.graph_token_budget,
+            effective_budget,
             cfg.context_compression.max_graph_items,
         );
         if compiled.items.is_empty() {

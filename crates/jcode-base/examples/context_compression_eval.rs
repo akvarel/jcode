@@ -50,9 +50,10 @@ fn main() {
 
     let raw = String::from_utf8_lossy(&output.stdout);
     let candidate_items = raw.lines().filter(|line| line.starts_with("NODE ")).count();
-    let compiled = compile_graphify_context(&task, &raw, budget, max_items);
-    let compiled_json = compiled.to_prompt_json();
     let baseline_tokens = estimate_tokens(&raw);
+    let effective_budget = budget.min(baseline_tokens);
+    let compiled = compile_graphify_context(&task, &raw, effective_budget, max_items);
+    let compiled_json = compiled.to_prompt_json();
     let compressed_tokens = estimate_tokens(&compiled_json);
     let report = EvaluationReport {
         task,
