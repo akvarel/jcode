@@ -201,7 +201,9 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
     let cfg = config();
     let mut all: Vec<MemoryEntry> = Vec::new();
 
-    if cfg.agents.memory_graphify_enabled {
+    if cfg.agents.memory_graphify_enabled
+        || cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact
+    {
         let mut res = enrichment_or_empty("graphify", query_graphify(context).await);
         all.append(&mut entries_from_enrichments(
             &mut res,
@@ -248,24 +250,34 @@ const GRAPHIFY_LIMITS: EnrichmentLimits = EnrichmentLimits {
 
 /// Query the graphify codebase knowledge graph via `graphify query`.
 async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
-    let truncated = if query_text.len() > 240 {
-        &query_text[..240]
-    } else {
-        query_text
-    };
+    let cfg = config();
+    let truncated = query_text
+        .char_indices()
+        .nth(240)
+        .map_or(query_text, |(index, _)| &query_text[..index]);
 
-    let output = tokio::time::timeout(
-        GRAPHIFY_LIMITS.timeout,
-        tokio::process::Command::new("graphify")
-            .arg("query")
-            .arg(truncated)
-            .arg("--format")
-            .arg("compact")
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("graphify query timed out after 15s"))?
-    .map_err(|e| anyhow::anyhow!("failed to run graphify: {e}"))?;
+    let mut command = tokio::process::Command::new("graphify");
+    command
+        .arg("query")
+        .arg(truncated)
+        .arg("--format")
+        .arg("compact");
+    if cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact {
+        // Retrieve more candidates than we emit so ranking and deduplication
+        // can choose the best bounded package. OFF intentionally preserves
+        // Graphify's existing default retrieval for baseline comparison.
+        command.arg("--budget").arg(
+            cfg.context_compression
+                .graph_token_budget
+                .saturating_mul(2)
+                .to_string(),
+        );
+    }
+
+    let output = tokio::time::timeout(GRAPHIFY_LIMITS.timeout, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("graphify query timed out after 15s"))?
+        .map_err(|e| anyhow::anyhow!("failed to run graphify: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -274,21 +286,57 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut results: Vec<ExternalEnrichment> = Vec::new();
 
-    for line in stdout.lines().take(GRAPHIFY_LIMITS.max_results) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("NODE") {
-            continue;
+    if cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact {
+        let compiled = crate::context_compiler::compile_graphify_context(
+            truncated,
+            &stdout,
+            cfg.context_compression.graph_token_budget,
+            cfg.context_compression.max_graph_items,
+        );
+        if compiled.items.is_empty() {
+            return Ok(Vec::new());
         }
-        results.push(ExternalEnrichment {
-            content: line.to_string(),
+        crate::logging::event(
+            crate::logging::LogLevel::Info,
+            "CONTEXT_COMPILATION",
+            vec![
+                ("mode", compiled.mode.to_string()),
+                ("version", compiled.version.to_string()),
+                ("context_items", compiled.items.len().to_string()),
+                ("candidate_items", compiled.candidate_items.to_string()),
+                (
+                    "deduplicated_items",
+                    compiled.deduplicated_items.to_string(),
+                ),
+                ("dropped_items", compiled.dropped_items.to_string()),
+                (
+                    "context_tokens_estimated",
+                    compiled.estimated_tokens.to_string(),
+                ),
+                ("budget_tokens", compiled.budget_tokens.to_string()),
+            ],
+        );
+        return Ok(vec![ExternalEnrichment {
+            content: compiled.to_prompt_json(),
             source: "graphify",
-            source_id: None,
-        });
+            source_id: compiled.root_nodes.first().cloned(),
+        }]);
     }
 
-    Ok(results)
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // OFF is the reproducible baseline: inject Graphify's compact response
+    // unchanged. The old line filter discarded every `NODE` row and therefore
+    // silently returned no code graph context with current Graphify versions.
+    Ok(vec![ExternalEnrichment {
+        content: raw.to_string(),
+        source: "graphify",
+        source_id: None,
+    }])
 }
 
 // ---------------------------------------------------------------------------

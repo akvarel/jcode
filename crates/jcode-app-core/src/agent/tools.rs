@@ -4,7 +4,28 @@ use crate::tool::ToolOutput;
 
 pub(super) const MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY: usize = 512 * 1024;
 
+fn graph_compact_tool_limit() -> Option<usize> {
+    let config = crate::config::config();
+    (config.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact)
+        .then_some(config.context_compression.max_tool_output_chars)
+}
+
+fn compact_tool_output_if_enabled(tool_name: &str, content: &str) -> Option<String> {
+    let limit = graph_compact_tool_limit()?;
+    if content.chars().count() <= limit {
+        return None;
+    }
+    let store_root = crate::storage::jcode_dir().ok()?.join("context-store");
+    crate::context_compiler::store_and_compact_tool_output(tool_name, content, limit, &store_root)
+        .ok()
+        .map(|stored| stored.compact_content)
+}
+
 pub(super) fn cap_tool_output_for_history(tool_name: &str, mut output: ToolOutput) -> ToolOutput {
+    if let Some(compact) = compact_tool_output_if_enabled(tool_name, &output.output) {
+        output.output = compact;
+        return output;
+    }
     if output.output.chars().count() <= MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY {
         return output;
     }
@@ -19,6 +40,9 @@ pub(super) fn cap_tool_output_for_history(tool_name: &str, mut output: ToolOutpu
 }
 
 pub(super) fn cap_sdk_tool_content_for_history(tool_name: &str, content: String) -> String {
+    if let Some(compact) = compact_tool_output_if_enabled(tool_name, &content) {
+        return compact;
+    }
     if content.chars().count() <= MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY {
         return content;
     }

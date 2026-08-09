@@ -414,6 +414,26 @@ impl Config {
                 self.agents.memory_graphify_enabled = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_CONTEXT_COMPRESSION_MODE") {
+            if let Some(parsed) = ContextCompressionMode::parse(&v) {
+                self.context_compression.mode = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_CONTEXT_GRAPH_TOKEN_BUDGET") {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                self.context_compression.graph_token_budget = parsed.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_CONTEXT_MAX_GRAPH_ITEMS") {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                self.context_compression.max_graph_items = parsed.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS") {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                self.context_compression.max_tool_output_chars = parsed.max(1);
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_MEMORY_VAULT_ENABLED") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.agents.memory_vault_enabled = parsed;

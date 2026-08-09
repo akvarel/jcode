@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "repository_commit": "dd5924266a257ebae0cfb29b1806d8e68d35dff3",
+  "estimation": "bytes_div_4; provider token/cost metrics unavailable in offline harness",
+  "cases": [
+    {
+      "task": "fix config display summary formatting",
+      "baseline": {
+        "context_bytes": 6457,
+        "context_tokens_estimated": 1615,
+        "context_items": 57,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4686,
+        "context_tokens_estimated": 1172,
+        "context_items": 19,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.377986348122867,
+      "root_nodes_preserved": 3,
+      "category": "small_bug_fix"
+    },
+    {
+      "task": "trace messages_for_provider compaction provider flow",
+      "baseline": {
+        "context_bytes": 6590,
+        "context_tokens_estimated": 1648,
+        "context_items": 55,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4616,
+        "context_tokens_estimated": 1154,
+        "context_items": 18,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.4280762564991334,
+      "root_nodes_preserved": 3,
+      "category": "cross_file_bug"
+    },
+    {
+      "task": "add graph-aware context compiler",
+      "baseline": {
+        "context_bytes": 6530,
+        "context_tokens_estimated": 1633,
+        "context_items": 60,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4700,
+        "context_tokens_estimated": 1175,
+        "context_items": 19,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.3897872340425532,
+      "root_nodes_preserved": 3,
+      "category": "new_feature"
+    },
+    {
+      "task": "test ContextCompressionMode environment overrides",
+      "baseline": {
+        "context_bytes": 6456,
+        "context_tokens_estimated": 1614,
+        "context_items": 59,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4599,
+        "context_tokens_estimated": 1150,
+        "context_items": 19,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.4034782608695653,
+      "root_nodes_preserved": 3,
+      "category": "test_generation"
+    },
+    {
+      "task": "diagnose memory_external graphify query failure",
+      "baseline": {
+        "context_bytes": 6435,
+        "context_tokens_estimated": 1609,
+        "context_items": 62,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4576,
+        "context_tokens_estimated": 1144,
+        "context_items": 18,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.4064685314685315,
+      "root_nodes_preserved": 3,
+      "category": "test_failure_diagnosis"
+    },
+    {
+      "task": "refactor CompactionManager message selection",
+      "baseline": {
+        "context_bytes": 6436,
+        "context_tokens_estimated": 1609,
+        "context_items": 60,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4661,
+        "context_tokens_estimated": 1166,
+        "context_items": 19,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.3799313893653515,
+      "root_nodes_preserved": 3,
+      "category": "refactoring"
+    },
+    {
+      "task": "configure graph token budget",
+      "baseline": {
+        "context_bytes": 6424,
+        "context_tokens_estimated": 1606,
+        "context_items": 58,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4767,
+        "context_tokens_estimated": 1192,
+        "context_items": 19,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.3473154362416107,
+      "root_nodes_preserved": 3,
+      "category": "configuration_change"
+    },
+    {
+      "task": "review tool output truncation safety",
+      "baseline": {
+        "context_bytes": 6467,
+        "context_tokens_estimated": 1617,
+        "context_items": 60,
+        "compression_mode": "off",
+        "compression_version": "baseline"
+      },
+      "graph_compact": {
+        "context_bytes": 4619,
+        "context_tokens_estimated": 1155,
+        "context_items": 19,
+        "compression_mode": "graph_compact",
+        "compression_version": "1"
+      },
+      "input_compression_ratio": 1.4,
+      "root_nodes_preserved": 3,
+      "category": "code_review"
+    }
+  ],
+  "aggregate": {
+    "cases": 8,
+    "baseline_tokens_estimated": 12951,
+    "compressed_tokens_estimated": 9308,
+    "input_compression_ratio": 1.3913837559088955
+  }
+}

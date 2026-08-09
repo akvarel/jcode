@@ -23,6 +23,58 @@ pub enum CompactionMode {
     Semantic,
 }
 
+/// Controls graph-aware context compilation before an LLM request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompressionMode {
+    /// Preserve the existing context strategy for baseline comparisons.
+    #[default]
+    Off,
+    /// Compile bounded, revision-addressed Graphify context.
+    GraphCompact,
+}
+
+impl ContextCompressionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::GraphCompact => "graph_compact",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "off" | "baseline" => Some(Self::Off),
+            "graph_compact" | "graph-compact" | "graphcompact" => Some(Self::GraphCompact),
+            _ => None,
+        }
+    }
+}
+
+/// Graph-aware context compiler settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextCompressionConfig {
+    pub mode: ContextCompressionMode,
+    /// Maximum Graphify context tokens injected into a request.
+    pub graph_token_budget: usize,
+    /// Hard bound on graph nodes emitted in one compiled package.
+    pub max_graph_items: usize,
+    /// Tool output characters retained in prompt history in graph-compact mode.
+    pub max_tool_output_chars: usize,
+}
+
+impl Default for ContextCompressionConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextCompressionMode::Off,
+            graph_token_budget: 1_200,
+            max_graph_items: 24,
+            max_tool_output_chars: 64 * 1024,
+        }
+    }
+}
+
 impl CompactionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1574,5 +1626,36 @@ mod reasoning_display_defaults_tests {
         display.set_reasoning_display(ReasoningDisplayMode::Off);
         assert!(display.has_explicit_reasoning_display());
         assert!(!display.show_thinking);
+    }
+}
+
+#[cfg(test)]
+mod context_compression_tests {
+    use super::*;
+
+    #[test]
+    fn mode_parser_accepts_config_and_environment_spellings() {
+        assert_eq!(
+            ContextCompressionMode::parse("graph_compact"),
+            Some(ContextCompressionMode::GraphCompact)
+        );
+        assert_eq!(
+            ContextCompressionMode::parse("graph-compact"),
+            Some(ContextCompressionMode::GraphCompact)
+        );
+        assert_eq!(
+            ContextCompressionMode::parse("baseline"),
+            Some(ContextCompressionMode::Off)
+        );
+        assert_eq!(ContextCompressionMode::parse("aggressive"), None);
+    }
+
+    #[test]
+    fn defaults_preserve_existing_behavior() {
+        let config = ContextCompressionConfig::default();
+        assert_eq!(config.mode, ContextCompressionMode::Off);
+        assert_eq!(config.graph_token_budget, 1_200);
+        assert_eq!(config.max_graph_items, 24);
+        assert_eq!(config.max_tool_output_chars, 64 * 1024);
     }
 }

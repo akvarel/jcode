@@ -100,6 +100,7 @@ impl Config {
 - Memory: {}
 - Memory sidecar: {}
 - Memory enrichment: graphify={}, vault={}, pgvector={}
+- Context compression: {} (graph budget={} tokens, max items={}, tool chars={})
 - Ambient: {}
 
 **Gateway:**
@@ -293,6 +294,10 @@ impl Config {
             self.agents.memory_graphify_enabled,
             self.agents.memory_vault_enabled,
             self.agents.memory_pgvector_enabled,
+            self.context_compression.mode.as_str(),
+            self.context_compression.graph_token_budget,
+            self.context_compression.max_graph_items,
+            self.context_compression.max_tool_output_chars,
             self.ambient
                 .model
                 .as_deref()

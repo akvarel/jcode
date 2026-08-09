@@ -470,6 +470,22 @@ memory_vault_enabled = false
 # Pgvector RAG search via /sharedssd/scripts/search_memory.py:
 memory_pgvector_enabled = false
 
+[context_compression]
+# Graph-aware context compilation. "off" preserves the current strategy and is
+# the reproducible baseline. "graph_compact" queries Graphify and injects a
+# bounded, revision-addressed JSON context package. Env:
+# JCODE_CONTEXT_COMPRESSION_MODE
+mode = "off"
+# Maximum estimated Graphify tokens injected per compiled package.
+# Env: JCODE_CONTEXT_GRAPH_TOKEN_BUDGET
+graph_token_budget = 1200
+# Maximum graph nodes emitted per package. Env: JCODE_CONTEXT_MAX_GRAPH_ITEMS
+max_graph_items = 24
+# Tool output characters retained in prompt history in graph-compact mode. Full
+# oversized output is stored under JCODE_HOME/context-store and referenced from
+# the compact result. Env: JCODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS
+max_tool_output_chars = 65536
+
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.
 # Set JCODE_TERMINAL to force a supported terminal emulator instead.
