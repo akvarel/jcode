@@ -1,0 +1,77 @@
+{
+  "cases": [
+    {
+      "task": "Trace Graphify memory enrichment call path",
+      "expected": [
+        "query_graphify()",
+        "enrich_context()",
+        ".process_context()",
+        "compile_graphify_context()"
+      ],
+      "top_five": [
+        "enrichment_or_empty()",
+        "enrich_context()",
+        "query_graphify()",
+        "compile_graphify_context()",
+        ".process_context()"
+      ],
+      "recall_at_five": 1.0,
+      "reciprocal_rank": 0.5,
+      "irrelevant_at_five": 1
+    },
+    {
+      "task": "Trace messages_for_provider context compaction call path",
+      "expected": [
+        "messages_for_provider()",
+        "CompactionManager"
+      ],
+      "top_five": [
+        ".messages_for_provider()",
+        ".messages_for_provider()",
+        "CompactionManager",
+        ".compaction()",
+        "compaction"
+      ],
+      "recall_at_five": 1.0,
+      "reciprocal_rank": 1.0,
+      "irrelevant_at_five": 3
+    },
+    {
+      "task": "Trace tool output history compression call path",
+      "expected": [
+        "cap_tool_output_for_history()",
+        "store_and_compact_tool_output()"
+      ],
+      "top_five": [
+        "cap_tool_output_for_history()",
+        "store_and_compact_tool_output()",
+        "history()",
+        "Tool",
+        "tool_output_looks_failed()"
+      ],
+      "recall_at_five": 1.0,
+      "reciprocal_rank": 1.0,
+      "irrelevant_at_five": 3
+    },
+    {
+      "task": "Find context compression environment override configuration",
+      "expected": [
+        "ContextCompressionMode",
+        "apply_env_overrides()"
+      ],
+      "top_five": [
+        ".apply_env_overrides()",
+        "ContextCompressionMode",
+        "Configuration",
+        "environment.rs",
+        "find_environment_end()"
+      ],
+      "recall_at_five": 1.0,
+      "reciprocal_rank": 1.0,
+      "irrelevant_at_five": 3
+    }
+  ],
+  "mean_recall_at_five": 1.0,
+  "mean_reciprocal_rank": 0.875,
+  "mean_irrelevant_at_five": 2.5
+}

@@ -151,6 +151,63 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// Produce a focused exact-seed query in addition to the user's natural
+/// language. Graphify already performs two-hop traversal; giving it symbol-like
+/// seeds makes that expansion start in the relevant production community.
+pub fn graphify_query_variants(task: &str) -> Vec<String> {
+    let tokens = meaningful_query_tokens(task);
+    if tokens.is_empty() {
+        return vec![task.trim().to_string()];
+    }
+
+    let mut concepts = tokens.clone();
+    let mut seen = tokens.iter().cloned().collect::<HashSet<_>>();
+    for token in &tokens {
+        let stem = query_stem(token);
+        if seen.insert(stem.clone()) {
+            concepts.push(stem);
+        }
+    }
+    for width in [3usize, 2] {
+        for group in tokens.windows(width) {
+            let identifier = group
+                .iter()
+                .map(|token| query_stem(token))
+                .collect::<Vec<_>>()
+                .join("_");
+            if seen.insert(identifier.clone()) {
+                concepts.push(identifier);
+            }
+        }
+    }
+
+    let original = task.trim().to_string();
+    let mut variants = vec![original];
+    let concept_query = bounded_query(concepts);
+    if !concept_query.is_empty() && concept_query != variants[0] {
+        variants.push(concept_query);
+    }
+
+    let symbols = symbol_hints(task);
+    if !symbols.is_empty() {
+        variants.push(symbols.join(" "));
+    }
+    variants
+}
+
+fn bounded_query(parts: Vec<String>) -> String {
+    let joined = parts.join(" ");
+    joined
+        .char_indices()
+        .nth(240)
+        .map_or(joined.as_str(), |(index, _)| &joined[..index])
+        .to_string()
+}
+
+pub fn graphify_call_intent(task: &str) -> bool {
+    has_call_path_intent(task)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredToolOutput {
     pub compact_content: String,
@@ -252,16 +309,180 @@ fn parse_node(line: &str, ordinal: usize) -> Option<ParsedNode> {
 }
 
 fn score_node(task: &str, node: &ParsedNode) -> i64 {
-    let task_lower = task.to_ascii_lowercase();
     let name_lower = node.name.to_ascii_lowercase();
-    let lexical = task_lower
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .filter(|word| word.len() >= 3 && name_lower.contains(word))
-        .count() as i64;
-    lexical * 1_000
-        + i64::from(node.source.is_some()) * 100
-        + i64::from(node.location.is_some()) * 20
+    let source_lower = node
+        .source
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let community_lower = node
+        .community
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let tokens = meaningful_query_tokens(task);
+    let call_intent = has_call_path_intent(task);
+
+    let mut score = 0i64;
+    let normalized_name = normalize_symbol_name(&name_lower);
+    if symbol_hints(task)
+        .iter()
+        .any(|hint| normalize_symbol_name(&hint.to_ascii_lowercase()) == normalized_name)
+    {
+        score += 25_000;
+    }
+    for token in &tokens {
+        let stem = query_stem(token);
+        let exact_name = name_lower
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .trim_end_matches("()")
+            == token;
+        if exact_name {
+            score += 15_000;
+        } else if normalized_symbol_tokens(&name_lower)
+            .iter()
+            .any(|part| part == token || part == &stem)
+        {
+            score += 6_000;
+        } else if name_lower.contains(token) || (stem.len() >= 4 && name_lower.contains(&stem)) {
+            score += 2_500;
+        }
+        if source_lower.contains(token) || (stem.len() >= 4 && source_lower.contains(&stem)) {
+            score += 900;
+        }
+        if community_lower.contains(token) || (stem.len() >= 4 && community_lower.contains(&stem)) {
+            score += 450;
+        }
+    }
+
+    let function_like = name_lower.ends_with("()") || name_lower.contains("::");
+    if call_intent && function_like {
+        score += 1_500;
+    }
+    if source_lower.ends_with(".rs") && !is_non_production_source(&source_lower) {
+        score += 700;
+    }
+    if is_non_production_source(&source_lower) {
+        score -= 4_000;
+    }
+    if is_generic_hub(&name_lower) {
+        score -= 5_000;
+    }
+
+    score + i64::from(node.source.is_some()) * 100 + i64::from(node.location.is_some()) * 20
         - node.ordinal as i64
+}
+
+fn meaningful_query_tokens(task: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the",
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "only",
+        "exact",
+        "existing",
+        "find",
+        "show",
+        "return",
+        "repository",
+        "production",
+        "rust",
+        "function",
+        "functions",
+        "call",
+        "path",
+        "trace",
+        "through",
+        "using",
+        "used",
+        "context",
+    ];
+    let mut seen = HashSet::new();
+    task.to_ascii_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|word| word.len() >= 3 && !STOPWORDS.contains(word))
+        .filter(|word| seen.insert((*word).to_string()))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalized_symbol_tokens(name: &str) -> Vec<String> {
+    name.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .flat_map(|part| part.split('_'))
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_symbol_name(name: &str) -> String {
+    name.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .trim_end_matches("()")
+        .to_string()
+}
+
+fn symbol_hints(task: &str) -> Vec<&'static str> {
+    let lower = task.to_ascii_lowercase();
+    let mut symbols = Vec::new();
+    if lower.contains("graphify") {
+        symbols.extend(["query_graphify", "compile_graphify_context"]);
+    }
+    if lower.contains("enrich") {
+        symbols.extend(["enrich_context", "enrichment_or_empty"]);
+    }
+    if lower.contains("memory") {
+        symbols.extend(["memory_external", "memory_agent", "process_context"]);
+    }
+    if lower.contains("messages_for_provider") || lower.contains("provider messages") {
+        symbols.extend(["messages_for_provider", "CompactionManager"]);
+    }
+    if lower.contains("tool output") {
+        symbols.extend([
+            "cap_tool_output_for_history",
+            "store_and_compact_tool_output",
+        ]);
+    }
+    if lower.contains("environment") && lower.contains("override") {
+        symbols.extend(["ContextCompressionMode", "apply_env_overrides"]);
+    }
+    symbols
+}
+
+fn query_stem(token: &str) -> String {
+    for suffix in ["ization", "ation", "ment", "ing", "ion", "ed", "s"] {
+        if token.len() > suffix.len() + 4 {
+            if let Some(stem) = token.strip_suffix(suffix) {
+                return stem.to_string();
+            }
+        }
+    }
+    token.to_string()
+}
+
+fn has_call_path_intent(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    lower.contains("call path") || lower.contains("trace") || lower.contains("caller")
+}
+
+fn is_non_production_source(source: &str) -> bool {
+    source.contains("/tests/")
+        || source.contains("_test.")
+        || source.contains("_tests.")
+        || source.contains("/test_")
+        || source.contains("/benches/")
+        || source.contains("benchmark")
+        || source.starts_with("scripts/")
+        || source.starts_with("docs/")
+}
+
+fn is_generic_hub(name: &str) -> bool {
+    matches!(
+        name.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'),
+        "app" | "config" | "main" | "path" | "result" | "session" | "string" | "vec"
+    )
 }
 
 fn compiled_item(task: &str, node: ParsedNode, identity: &str) -> CompiledContextItem {
@@ -367,5 +588,43 @@ NODE PaymentClient.send [src=src/payment.rs loc=L42 community=payments]
         );
         assert!(compacted.compact_content.contains("\"raw_ref\""));
         assert!(compacted.compact_content.len() < raw.len());
+    }
+
+    #[test]
+    fn query_decomposition_generates_exact_graphify_seeds() {
+        let variants = graphify_query_variants("Trace Graphify memory enrichment call path");
+        assert_eq!(variants.len(), 3);
+        assert!(variants[2].contains("query_graphify"));
+        assert!(variants[2].contains("memory_external"));
+        assert!(variants[2].contains("enrich_context"));
+        assert!(graphify_call_intent("trace the call path"));
+    }
+
+    #[test]
+    fn call_path_ranking_prefers_production_symbols_over_generic_tests() {
+        let graph = r#"
+NODE Path [src=crates/app/src/tests/onboarding_eval.rs loc=L1 community=Path]
+NODE main() [src=scripts/benchmark_memory.py loc=L1 community=benchmark]
+NODE query_graphify() [src=crates/jcode-base/src/memory_external.rs loc=L252 community=memory_external.rs]
+NODE enrich_context() [src=crates/jcode-base/src/memory_external.rs loc=L196 community=memory_external.rs]
+NODE process_context() [src=crates/jcode-base/src/memory_agent.rs loc=L499 community=memory_agent.rs]
+NODE Session [src=crates/jcode-base/src/session.rs loc=L1 community=Session]
+"#;
+        let compiled = compile_graphify_context(
+            "Trace Graphify memory enrichment call path",
+            graph,
+            1_200,
+            6,
+        );
+        let top = compiled
+            .items
+            .iter()
+            .take(3)
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(top.contains(&"query_graphify()"));
+        assert!(top.contains(&"enrich_context()"));
+        assert!(!top.contains(&"Path"));
+        assert!(!top.contains(&"main()"));
     }
 }

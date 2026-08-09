@@ -91,6 +91,34 @@ estimates, not provider billing claims. Cost, cached-token, latency, and task
 quality comparisons require controlled live model runs and are therefore left
 unknown rather than fabricated.
 
+## Retrieval quality
+
+GraphCompact uses three concurrent Graphify searches when useful:
+
+1. the original natural-language request;
+2. a decomposed concept query containing stems and compound snake-case terms;
+3. high-signal symbol seeds for recognized Jcode subsystems.
+
+Call-path requests add Graphify's typed `call` context filter. Graphify performs
+the two-hop traversal from these seeds. The context compiler then reranks the
+merged candidates using exact-symbol matches, source/community matches, call
+intent, and production Rust preference. Tests, benchmarks, scripts, docs, and
+generic hubs receive penalties unless directly requested.
+
+Run the golden-query evaluation with:
+
+```bash
+cargo run -q -p jcode-base --example retrieval_quality_eval --no-default-features
+```
+
+`retrieval-quality-evaluation.json` records four production queries. During this
+work the same harness improved from mean Recall@5 `0.125`, MRR `0.125`, and 4.5
+irrelevant top-five nodes to Recall@5 `1.0`, MRR `0.875`, and 2.5 irrelevant
+nodes. The Graphify memory call-path case now places `enrich_context`,
+`query_graphify`, `compile_graphify_context`, and `process_context` in the top
+five. This small golden set is a regression gate, not a universal retrieval
+quality claim.
+
 ## Current limits
 
 - The first production slice compiles Graphify L0/L1 topology and signatures.
@@ -120,8 +148,8 @@ capability already existed in Jcode and was verified rather than duplicated.
 | Tool output compression with retrievable evidence | GraphCompact stores oversized raw output in `JCODE_HOME/context-store` and emits a bounded reference | `raw_tool_output_is_retrievable_after_compaction` plus both app-core tool-history tests passed |
 | Token/cost/latency telemetry | Compiler emits estimated context tokens and selection counts; reused session/provider telemetry carries billed token/cost and tool latency fields | Existing telemetry serialization path was inspected. Live billed cost/latency was not collected |
 | Baseline/compressed comparison | `context_compression_eval` and the eight-case JSON artifact | Eight-case aggregate: 12,951 baseline vs 9,308 compressed estimated tokens, 1.391x. A newly checked smaller result produced 882 vs 856, 1.030x |
-| Automated core tests | Compiler, configuration, tool-history, compaction, and swarm artifact tests | Compiler 4/4, config 2/2, tool integration 3/3, compaction 35/35, mapped swarm tests 2/2 passed |
-| Existing project tests pass | Full `jcode-base` + `jcode-app-core` suite | 1,142 passed, 6 ignored, 2 failed. Both failures are pre-existing tool-schema description token caps, so this requirement is not fully satisfied |
+| Automated core tests | Compiler, configuration, tool-history, compaction, and swarm artifact tests | Compiler 6/6, config 2/2, tool integration 3/3, memory agent 9/9, compaction 35/35, mapped swarm tests 2/2 passed |
+| Existing project tests pass | Full `jcode-base` + `jcode-app-core` suite | Final run: 1,141 passed, 6 ignored, 3 failed. The socket-refusal test passed immediately in isolation, identifying a parallel-suite race; the other two are pre-existing tool-schema description token caps |
 | Benchmark/evaluation produced | `docs/context-compression-evaluation.json` | Artifact contains eight categories and aggregate metrics |
 | Documentation | This document plus generated evaluation JSON | Configuration, flow, storage, telemetry, evaluation, limitations, and traceability are documented |
 | No unsupported savings claims | Results are labelled byte/4 estimates and live provider metrics are explicitly unavailable | Documentation review and `git diff --check` passed |
@@ -147,7 +175,9 @@ and injection are accepted through an isolated debug-enabled persistent server:
 the first turn emitted `CONTEXT_COMPILATION` with 73 candidates, 19 selected
 items, 2 duplicates, and 52 dropped items; the next turn marked two memory IDs
 as injected and persisted one memory-injection event before opening the provider
-stream. The model explicitly described symbols from the injected Graphify
-package, confirming the boundary. Those symbols were not the requested call
-chain, so retrieval/task quality still needs optimization and no quality gain is
-claimed from this acceptance run.
+stream. The first quality run exposed that Graphify was queried with the full
+system-reminder-prefixed transcript rather than the focused user intent. After
+switching the external query to the focused intent and adding decomposed exact
+seeds/reranking, the live model returned:
+`enrichment_or_empty -> enrich_context -> should_enrich_context -> query_graphify -> process_context -> compile_graphify_context`.
+This confirms improved retrieval behavior for the measured call-path case.

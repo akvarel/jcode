@@ -507,11 +507,16 @@ impl MemoryAgent {
         if context.is_empty() {
             return Ok(());
         }
+        // Graphify retrieval must use the focused latest user intent. The full
+        // relevance transcript begins with session/system reminders, so its
+        // first 240 characters otherwise seed hardware, time, and session nodes
+        // instead of the user's code question.
+        let focused_query = memory::format_focused_query_for_relevance(&messages);
         // External code-graph context is independent of the semantic memory
         // store and its embedding/sidecar availability. Query it up front so
         // GraphCompact can still feed the next provider turn when no personal
         // memory candidates exist.
-        let external_entries = crate::memory_external::enrich_context(&context).await;
+        let external_entries = crate::memory_external::enrich_context(&focused_query).await;
         // Memory is only productive with the LLM precision judge. If sidecar mode
         // is requested but no LLM backend is reachable (e.g. logged out / lost
         // provider access), go dormant for this turn instead of silently
@@ -543,8 +548,6 @@ impl MemoryAgent {
         // Focused query (latest user intent, boilerplate/tool-noise stripped) used
         // for listwise LLM reranking. Benchmarking showed the cross-encoder/LLM
         // reranker only works with this focused query, not the full noisy window.
-        let focused_query = memory::format_focused_query_for_relevance(&messages);
-
         let context_signature = relevance_context_signature(&context);
         {
             let ss = self.session_state(session_id);

@@ -256,36 +256,33 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
         .nth(240)
         .map_or(query_text, |(index, _)| &query_text[..index]);
 
-    let mut command = tokio::process::Command::new("graphify");
-    command
-        .arg("query")
-        .arg(truncated)
-        .arg("--format")
-        .arg("compact");
-    if cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact {
-        // Retrieve more candidates than we emit so ranking and deduplication
-        // can choose the best bounded package. OFF intentionally preserves
-        // Graphify's existing default retrieval for baseline comparison.
-        command.arg("--budget").arg(
-            cfg.context_compression
-                .graph_token_budget
-                .saturating_mul(2)
-                .to_string(),
-        );
+    let graph_compact =
+        cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact;
+    let queries = if graph_compact {
+        crate::context_compiler::graphify_query_variants(truncated)
+    } else {
+        vec![truncated.to_string()]
+    };
+    let retrieval_budget =
+        graph_compact.then_some(cfg.context_compression.graph_token_budget.saturating_mul(2));
+    let call_intent = graph_compact && crate::context_compiler::graphify_call_intent(truncated);
+    let requests = queries
+        .iter()
+        .map(|query| run_graphify_query(query, retrieval_budget, call_intent));
+    let mut outputs = Vec::new();
+    for (index, result) in futures::future::join_all(requests).await.into_iter().enumerate() {
+        match result {
+            Ok(output) => outputs.push(output),
+            Err(error) if index > 0 => crate::logging::warn(&format!(
+                "focused Graphify query failed; using primary candidates: {error}"
+            )),
+            Err(error) => {
+                crate::logging::warn(&format!("graphify query failed: {error}"));
+                return Ok(Vec::new());
+            }
+        }
     }
-
-    let output = tokio::time::timeout(GRAPHIFY_LIMITS.timeout, command.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("graphify query timed out after 15s"))?
-        .map_err(|e| anyhow::anyhow!("failed to run graphify: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        crate::logging::warn(&format!("graphify query failed: {stderr}"));
-        return Ok(Vec::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = outputs.join("\n");
 
     if cfg.context_compression.mode == crate::config::ContextCompressionMode::GraphCompact {
         // A compression mode must not increase provider input merely because
@@ -344,6 +341,34 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
         source: "graphify",
         source_id: None,
     }])
+}
+
+async fn run_graphify_query(
+    query: &str,
+    budget_tokens: Option<usize>,
+    call_intent: bool,
+) -> Result<String> {
+    let mut command = tokio::process::Command::new("graphify");
+    command
+        .arg("query")
+        .arg(query)
+        .arg("--format")
+        .arg("compact");
+    if let Some(budget) = budget_tokens {
+        command.arg("--budget").arg(budget.to_string());
+    }
+    if call_intent {
+        command.arg("--context-filter").arg("call");
+    }
+    let output = tokio::time::timeout(GRAPHIFY_LIMITS.timeout, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("graphify query timed out after 15s"))?
+        .map_err(|e| anyhow::anyhow!("failed to run graphify: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{}", stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // ---------------------------------------------------------------------------
