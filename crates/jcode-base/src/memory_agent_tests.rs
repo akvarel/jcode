@@ -2,6 +2,20 @@ use super::*;
 use crate::memory::MemoryCategory;
 
 #[test]
+fn external_entries_are_stored_for_the_next_provider_turn() {
+    let session_id = "memory-agent-external-context-test";
+    let entry = MemoryEntry::new(
+        MemoryCategory::Fact,
+        r#"{"mode":"graph_compact","items":[{"name":"query_graphify"}]}"#,
+    );
+
+    assert!(set_pending_external_entries(session_id, &[entry]));
+    let pending = crate::memory::take_pending_memory(session_id).expect("pending external memory");
+    assert!(pending.prompt.contains("graph_compact"));
+    assert!(pending.prompt.contains("query_graphify"));
+}
+
+#[test]
 fn infer_candidate_tag_uses_repeated_non_stopword() {
     let tag =
         infer_candidate_tag("scheduler retries failed jobs and scheduler metrics update dashboard");

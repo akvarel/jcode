@@ -44,6 +44,28 @@ const TOPIC_CHANGE_THRESHOLD: f32 = 0.3;
 /// Maximum memories to surface per turn
 const MAX_MEMORIES_PER_TURN: usize = 5;
 
+fn set_pending_external_entries(session_id: &str, entries: &[MemoryEntry]) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    let Some(prompt) = memory::format_relevant_prompt(entries, MAX_MEMORIES_PER_TURN) else {
+        return false;
+    };
+    let display_prompt = memory::format_relevant_display_prompt(entries, MAX_MEMORIES_PER_TURN);
+    let ids = entries.iter().map(|entry| entry.id.clone()).collect();
+    memory::set_pending_memory_with_ids_and_display(
+        session_id,
+        prompt,
+        entries.len().min(MAX_MEMORIES_PER_TURN),
+        ids,
+        display_prompt,
+    );
+    memory::set_state(MemoryState::FoundRelevant {
+        count: entries.len().min(MAX_MEMORIES_PER_TURN),
+    });
+    true
+}
+
 /// Dynamic no-sidecar gate tunables (variable-k surfacing without an LLM).
 ///
 /// When the memory sidecar is disabled (no LLM to judge relevance), we used to
@@ -485,12 +507,18 @@ impl MemoryAgent {
         if context.is_empty() {
             return Ok(());
         }
+        // External code-graph context is independent of the semantic memory
+        // store and its embedding/sidecar availability. Query it up front so
+        // GraphCompact can still feed the next provider turn when no personal
+        // memory candidates exist.
+        let external_entries = crate::memory_external::enrich_context(&context).await;
         // Memory is only productive with the LLM precision judge. If sidecar mode
         // is requested but no LLM backend is reachable (e.g. logged out / lost
         // provider access), go dormant for this turn instead of silently
         // degrading to the low-precision no-LLM hybrid path. Re-checked live, so
         // memory resumes automatically once a login returns.
         if !memory::memory_runtime_active() {
+            set_pending_external_entries(session_id, &external_entries);
             crate::logging::event_rate_limited(
                 crate::logging::LogLevel::Info,
                 "memory_runtime_dormant",
@@ -564,11 +592,13 @@ impl MemoryAgent {
                     ],
                 );
                 memory::set_state(MemoryState::Idle);
+                set_pending_external_entries(session_id, &external_entries);
                 return Ok(());
             }
             Err(e) => {
                 crate::logging::info(&format!("Embedding task failed: {}", e));
                 memory::set_state(MemoryState::Idle);
+                set_pending_external_entries(session_id, &external_entries);
                 return Ok(());
             }
         };
@@ -667,7 +697,9 @@ impl MemoryAgent {
         });
 
         if candidates.is_empty() {
-            memory::set_state(MemoryState::Idle);
+            if !set_pending_external_entries(session_id, &external_entries) {
+                memory::set_state(MemoryState::Idle);
+            }
             return Ok(());
         }
 
@@ -692,7 +724,9 @@ impl MemoryAgent {
         );
 
         if new_candidates.is_empty() {
-            memory::set_state(MemoryState::Idle);
+            if !set_pending_external_entries(session_id, &external_entries) {
+                memory::set_state(MemoryState::Idle);
+            }
             return Ok(());
         }
 
@@ -722,7 +756,7 @@ impl MemoryAgent {
             should_run_rerank(ss.turn_count, ss.last_rerank_turn, cadence, topic_changed)
         };
 
-        let relevant = if let Some(sidecar) = self.live_sidecar() {
+        let mut relevant = if let Some(sidecar) = self.live_sidecar() {
             if should_rerank {
                 let agents = &crate::config::config().agents;
                 let votes = agents.memory_rerank_votes.max(1);
@@ -824,6 +858,13 @@ impl MemoryAgent {
             rejected_ids,
             context_snippet: jcode_core::util::truncate_str(&context, 200).to_string(),
         };
+
+        let mut seen_ids: HashSet<String> = relevant.iter().map(|entry| entry.id.clone()).collect();
+        relevant.extend(
+            external_entries
+                .into_iter()
+                .filter(|entry| seen_ids.insert(entry.id.clone())),
+        );
 
         // Step 4: Format and store for main agent
         if !relevant.is_empty() {

@@ -136,8 +136,12 @@ subscription: baseline and GraphCompact `jcode run --json` requests both
 completed and returned usage records. That check exposed a runtime gate where
 GraphCompact enabled Graphify but not the memory prompt pipeline; the gate is now
 centralized in `Config::runtime_memory_enabled()` and covered directly. A full
-two-turn injection check requires the same persistent server because memory is
-prepared asynchronously. Starting an isolated persistent server was blocked by
-Jcode's existing singleton server, and restarting the active server is a
-production-action boundary. Therefore provider transport is accepted, while
-live Graphify injection remains acceptance-blocked rather than inferred.
+two-turn check was then run against an isolated persistent server because memory
+is prepared asynchronously. It exposed a second integration gap: the persistent
+memory-agent pipeline did not consume `memory_external`, so Graphify entries
+could never become pending provider context when personal-memory retrieval was
+empty. `memory_agent.rs` now queries external context independently of embedding
+and sidecar availability, merges it with personal memories, and stores it for the
+next turn. The pending-context boundary is covered directly. Provider transport
+is accepted; the live model did not demonstrate reliable recall of the injected
+function chain, so task-quality acceptance is not claimed from those responses.
