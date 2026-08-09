@@ -143,5 +143,11 @@ could never become pending provider context when personal-memory retrieval was
 empty. `memory_agent.rs` now queries external context independently of embedding
 and sidecar availability, merges it with personal memories, and stores it for the
 next turn. The pending-context boundary is covered directly. Provider transport
-is accepted; the live model did not demonstrate reliable recall of the injected
-function chain, so task-quality acceptance is not claimed from those responses.
+and injection are accepted through an isolated debug-enabled persistent server:
+the first turn emitted `CONTEXT_COMPILATION` with 73 candidates, 19 selected
+items, 2 duplicates, and 52 dropped items; the next turn marked two memory IDs
+as injected and persisted one memory-injection event before opening the provider
+stream. The model explicitly described symbols from the injected Graphify
+package, confirming the boundary. Those symbols were not the requested call
+chain, so retrieval/task quality still needs optimization and no quality gain is
+claimed from this acceptance run.
