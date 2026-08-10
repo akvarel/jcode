@@ -43,12 +43,14 @@ environment variables are:
 
 ## Request flow
 
-1. The memory pipeline decides whether the user turn is code-related.
-2. Jcode invokes `graphify query <task> --format compact --budget <tokens>`.
+1. The provider prompt path decides whether the fresh user turn is code-related.
+2. Before opening the provider request, Jcode invokes
+   `graphify query <task> --format compact --budget <tokens>`.
 3. The context compiler parses Graphify nodes without creating another index.
 4. Task-matching roots are ranked first, exact duplicates are removed, and the
    item/token budgets are enforced.
-5. A versioned JSON package is injected through the existing memory prompt.
+5. A versioned JSON package is injected through the existing memory prompt in
+   the same provider turn. Personal-memory retrieval remains asynchronous.
 
 Each item contains a stable graph reference and a revision hash derived from
 the exact Graphify node representation. L0 contains topology-only nodes. L1

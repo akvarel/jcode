@@ -516,7 +516,17 @@ impl MemoryAgent {
         // store and its embedding/sidecar availability. Query it up front so
         // GraphCompact can still feed the next provider turn when no personal
         // memory candidates exist.
-        let external_entries = crate::memory_external::enrich_context(&focused_query).await;
+        // GraphCompact is retrieved synchronously by the provider prompt path so
+        // it can affect this user turn. Do not repeat the same Graphify queries
+        // here; the asynchronous agent still handles the other external-memory
+        // modes and personal-memory retrieval for the next turn.
+        let external_entries = if crate::config::config().context_compression.mode
+            == crate::config::ContextCompressionMode::GraphCompact
+        {
+            Vec::new()
+        } else {
+            crate::memory_external::enrich_context(&focused_query).await
+        };
         // Memory is only productive with the LLM precision judge. If sidecar mode
         // is requested but no LLM backend is reachable (e.g. logged out / lost
         // provider access), go dormant for this turn instead of silently

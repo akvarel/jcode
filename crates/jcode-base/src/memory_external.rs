@@ -238,6 +238,25 @@ pub async fn enrich_context(context: &str) -> Vec<MemoryEntry> {
     all
 }
 
+/// Compile Graphify context for immediate injection into the current provider
+/// request when graph-aware context compression is enabled.
+///
+/// The persistent memory agent remains asynchronous for personal-memory
+/// retrieval. GraphCompact is different: its code-graph package describes the
+/// current task, so delaying it until the next user turn makes it ineffective
+/// during a long tool-driven turn.
+pub async fn graphify_context_for_current_turn(context: &str) -> Vec<MemoryEntry> {
+    if crate::config::config().context_compression.mode
+        != crate::config::ContextCompressionMode::GraphCompact
+        || !should_enrich_context(context)
+    {
+        return Vec::new();
+    }
+
+    let mut enrichments = enrichment_or_empty("graphify", query_graphify(context).await);
+    entries_from_enrichments(&mut enrichments, "graphify", "graphify-codebase")
+}
+
 // ---------------------------------------------------------------------------
 // Graphify
 // ---------------------------------------------------------------------------
@@ -270,7 +289,11 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
         .iter()
         .map(|query| run_graphify_query(query, retrieval_budget, call_intent));
     let mut outputs = Vec::new();
-    for (index, result) in futures::future::join_all(requests).await.into_iter().enumerate() {
+    for (index, result) in futures::future::join_all(requests)
+        .await
+        .into_iter()
+        .enumerate()
+    {
         match result {
             Ok(output) => outputs.push(output),
             Err(error) if index > 0 => crate::logging::warn(&format!(

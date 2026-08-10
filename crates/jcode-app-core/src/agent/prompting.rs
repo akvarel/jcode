@@ -3,6 +3,80 @@ use crate::logging;
 use crate::message::{Message, ToolDefinition};
 
 impl Agent {
+    fn merge_pending_memory(
+        pending: Option<crate::memory::PendingMemory>,
+        current: Option<crate::memory::PendingMemory>,
+    ) -> Option<crate::memory::PendingMemory> {
+        match (pending, current) {
+            (None, None) => None,
+            (Some(memory), None) | (None, Some(memory)) => Some(memory),
+            (Some(mut pending), Some(current)) => {
+                pending.prompt.push_str("\n\n");
+                pending.prompt.push_str(&current.prompt);
+                pending.display_prompt = match (pending.display_prompt, current.display_prompt) {
+                    (Some(mut left), Some(right)) => {
+                        left.push_str("\n\n");
+                        left.push_str(&right);
+                        Some(left)
+                    }
+                    (left @ Some(_), None) => left,
+                    (None, right) => right,
+                };
+                pending.count = pending.count.saturating_add(current.count);
+                for id in current.memory_ids {
+                    if !pending.memory_ids.contains(&id) {
+                        pending.memory_ids.push(id);
+                    }
+                }
+                Some(pending)
+            }
+        }
+    }
+
+    async fn graphify_memory_for_current_turn(
+        &self,
+        messages: &[Message],
+    ) -> Option<crate::memory::PendingMemory> {
+        let focused_query = crate::memory::format_focused_query_for_relevance(messages);
+        let entries =
+            crate::memory_external::graphify_context_for_current_turn(&focused_query).await;
+        if entries.is_empty() {
+            return None;
+        }
+
+        let prompt = crate::memory::format_relevant_prompt(&entries, entries.len())?;
+        let display_prompt = crate::memory::format_relevant_display_prompt(&entries, entries.len());
+        Some(crate::memory::PendingMemory {
+            prompt,
+            display_prompt,
+            computed_at: std::time::Instant::now(),
+            count: entries.len(),
+            memory_ids: entries.into_iter().map(|entry| entry.id).collect(),
+        })
+    }
+
+    pub(super) async fn build_memory_prompt_for_current_turn(
+        &self,
+        messages: std::sync::Arc<[Message]>,
+        memory_event_tx: Option<crate::memory::MemoryEventSink>,
+    ) -> Option<crate::memory::PendingMemory> {
+        if !self.memory_enabled {
+            return None;
+        }
+
+        let fresh_user_turn = crate::message::ends_with_fresh_user_turn(&messages);
+        let pending = self.build_memory_prompt_nonblocking_shared(
+            std::sync::Arc::clone(&messages),
+            memory_event_tx,
+        );
+        if !fresh_user_turn {
+            return pending;
+        }
+
+        let current = self.graphify_memory_for_current_turn(&messages).await;
+        Self::merge_pending_memory(pending, current)
+    }
+
     pub(super) fn log_prompt_prefix_accounting(
         &self,
         split: &crate::prompt::SplitSystemPrompt,
@@ -132,5 +206,51 @@ impl Agent {
         _memory_event_tx: Option<crate::memory::MemoryEventSink>,
     ) -> Option<crate::memory::PendingMemory> {
         self.build_memory_prompt_nonblocking_shared(messages.to_vec().into(), _memory_event_tx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agent;
+    use crate::memory::PendingMemory;
+    use std::time::Instant;
+
+    fn pending(prompt: &str, ids: &[&str]) -> PendingMemory {
+        PendingMemory {
+            prompt: prompt.to_string(),
+            display_prompt: Some(format!("display:{prompt}")),
+            computed_at: Instant::now(),
+            count: ids.len(),
+            memory_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn merge_pending_memory_combines_async_and_current_turn_context() {
+        let merged = Agent::merge_pending_memory(
+            Some(pending("personal", &["memory-1"])),
+            Some(pending("graph", &["graph-1"])),
+        )
+        .expect("merged memory");
+
+        assert_eq!(merged.prompt, "personal\n\ngraph");
+        assert_eq!(
+            merged.display_prompt.as_deref(),
+            Some("display:personal\n\ndisplay:graph")
+        );
+        assert_eq!(merged.count, 2);
+        assert_eq!(merged.memory_ids, ["memory-1", "graph-1"]);
+    }
+
+    #[test]
+    fn merge_pending_memory_deduplicates_memory_ids() {
+        let merged = Agent::merge_pending_memory(
+            Some(pending("older", &["shared"])),
+            Some(pending("current", &["shared"])),
+        )
+        .expect("merged memory");
+
+        assert_eq!(merged.memory_ids, ["shared"]);
+        assert_eq!(merged.count, 2);
     }
 }
