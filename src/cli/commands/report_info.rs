@@ -188,7 +188,9 @@ fn build_auth_status_report() -> AuthStatusReport {
         .collect::<Vec<_>>();
 
     AuthStatusReport {
-        any_available: status.has_any_available(),
+        any_available: reports
+            .iter()
+            .any(|provider| provider.status == "available"),
         providers: reports,
     }
 }

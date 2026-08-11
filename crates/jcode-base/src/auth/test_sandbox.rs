@@ -30,6 +30,7 @@ impl AuthTestSandbox {
         std::fs::create_dir_all(temp.path().join("config").join("jcode"))?;
         std::fs::create_dir_all(temp.path().join("external"))?;
         crate::env::set_var("JCODE_HOME", temp.path());
+        crate::config::Config::invalidate_cache();
         crate::provider_catalog::force_apply_openai_compatible_profile_env(None);
         reset_global_auth_state();
 
@@ -89,6 +90,7 @@ impl Drop for AuthTestSandbox {
                 crate::env::remove_var(&key);
             }
         }
+        crate::config::Config::invalidate_cache();
         reset_global_auth_state();
     }
 }
@@ -130,6 +132,7 @@ fn tracked_env_vars() -> Vec<String> {
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
         "JCODE_INITIAL_PROVIDER_EXPLICIT",
+        "JCODE_RELOAD_AUTH_STATUS",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
