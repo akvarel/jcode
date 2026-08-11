@@ -527,17 +527,11 @@ mod tests {
 
         // A handle with no backing client is treated as dead (crashed
         // process): begin_connect must clean it up and return Leader.
-        pool.handles
-            .write()
-            .await
-            .insert(
-                "stale".to_string(),
-                crate::mcp::McpHandle::new_dummy_for_tests("stale".to_string()),
-            );
-        pool.ref_counts
-            .lock()
-            .await
-            .insert("stale".to_string(), 1);
+        pool.handles.write().await.insert(
+            "stale".to_string(),
+            crate::mcp::McpHandle::new_dummy_for_tests("stale".to_string()),
+        );
+        pool.ref_counts.lock().await.insert("stale".to_string(), 1);
 
         let attempt = pool.begin_connect("stale").await;
         match attempt {
