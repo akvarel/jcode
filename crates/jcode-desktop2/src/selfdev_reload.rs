@@ -115,6 +115,7 @@ mod tests {
 
     #[test]
     fn reload_flag_is_consumed_once() {
+        install();
         request();
         assert!(requested());
         assert!(!requested());
