@@ -195,14 +195,14 @@ async fn capture_connected_restart_snapshot()
         match client.read_event().await? {
             crate::protocol::ServerEvent::DebugResponse { id, ok, output } if id == request_id => {
                 if !ok {
-                    anyhow::bail!(output);
+                    return Ok(None);
                 }
                 break output;
             }
             crate::protocol::ServerEvent::Ack { id } if id == request_id => {}
             crate::protocol::ServerEvent::Done { id } if id == request_id => {}
-            crate::protocol::ServerEvent::Error { id, message, .. } if id == request_id => {
-                anyhow::bail!(message);
+            crate::protocol::ServerEvent::Error { id, .. } if id == request_id => {
+                return Ok(None);
             }
             _ => {}
         }
