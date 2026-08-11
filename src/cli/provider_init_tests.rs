@@ -205,6 +205,7 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
     let dir = TempDir::new().expect("temp dir");
     let saved_home = std::env::var("JCODE_HOME").ok();
     crate::env::set_var("JCODE_HOME", dir.path());
+    crate::config::Config::invalidate_cache();
     crate::subscription_catalog::clear_runtime_env();
     crate::env::remove_var("JCODE_OPENROUTER_MODEL");
     crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
@@ -216,7 +217,7 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         .block_on(init_provider(&ProviderChoice::Jcode, None))
         .expect("init jcode provider");
 
-    assert_eq!(provider.name(), "Jcode Hosted Models");
+    assert_eq!(provider.name(), "Jcode Subscription");
     assert!(crate::subscription_catalog::is_runtime_mode_enabled());
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_MODEL").ok().as_deref(),
@@ -246,6 +247,7 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         Some(home) => crate::env::set_var("JCODE_HOME", home),
         None => crate::env::remove_var("JCODE_HOME"),
     }
+    crate::config::Config::invalidate_cache();
 }
 
 #[test]
@@ -797,6 +799,7 @@ async fn auto_provider_uses_config_default_named_no_auth_provider() {
     .collect();
 
     crate::env::set_var("JCODE_HOME", dir.path());
+    crate::config::Config::invalidate_cache();
     crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
     for key in [
         "ANTHROPIC_API_KEY",
@@ -867,45 +870,25 @@ id = "llama3.1:8b"
 )]
 async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_blocking() {
     let _guard = lock_env();
-    let _env_guard = crate::storage::lock_test_env();
-    let dir = TempDir::new().expect("temp dir");
+    let sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().expect("auth sandbox");
     let saved: Vec<(String, Option<String>)> = [
-        "JCODE_HOME",
         "JCODE_NON_INTERACTIVE",
         "JCODE_DEFERRED_AUTH_BOOTSTRAP",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "GITHUB_TOKEN",
-        "GEMINI_API_KEY",
-        "CURSOR_API_KEY",
-        "JCODE_RUNTIME_PROVIDER",
-        "JCODE_ACTIVE_PROVIDER",
-        "JCODE_INITIAL_PROVIDER_EXPLICIT",
+        "JCODE_RELOAD_AUTH_STATUS",
     ]
     .iter()
     .map(|k| (k.to_string(), std::env::var(k).ok()))
     .collect();
 
-    crate::env::set_var("JCODE_HOME", dir.path());
     crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
-    for key in [
-        "JCODE_DEFERRED_AUTH_BOOTSTRAP",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "GITHUB_TOKEN",
-        "GEMINI_API_KEY",
-        "CURSOR_API_KEY",
-        "JCODE_ACTIVE_PROVIDER",
-        "JCODE_INITIAL_PROVIDER_EXPLICIT",
-    ] {
+    for key in ["JCODE_DEFERRED_AUTH_BOOTSTRAP", "JCODE_RELOAD_AUTH_STATUS"] {
         crate::env::remove_var(key);
     }
 
     let opencode_path = crate::auth::claude::ExternalClaudeAuthSource::OpenCode
         .path()
         .expect("opencode path");
+    assert!(opencode_path.starts_with(sandbox.root()));
     std::fs::create_dir_all(opencode_path.parent().expect("opencode parent"))
         .expect("create opencode dir");
     std::fs::write(

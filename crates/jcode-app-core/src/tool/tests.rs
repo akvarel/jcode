@@ -449,9 +449,10 @@ async fn print_tool_definition_token_report() {
 async fn tool_descriptions_stay_under_token_cap() {
     const DESCRIPTION_TOKEN_CAP: usize = 20;
     // integration_tools keeps a deliberate second sentence explaining that catalog
-    // entries integrate directly with the agent.
+    // entries integrate directly with the agent. batch includes its canonical
+    // parallel-call example, jcode_docs carries retrieval-first routing guidance,
     // swarm appends the user-tunable swarm-prompt.md by design.
-    const EXEMPT: &[&str] = &["integration_tools", "swarm"];
+    const EXEMPT: &[&str] = &["batch", "integration_tools", "jcode_docs", "swarm"];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -508,6 +509,25 @@ fn collect_param_descriptions(schema: &Value, path: &str, out: &mut Vec<(String,
 #[tokio::test]
 async fn tool_parameter_descriptions_stay_under_token_cap() {
     const PARAM_DESCRIPTION_TOKEN_CAP: usize = 25;
+    // These schema fields intentionally carry enum/rubric semantics that clients
+    // need in-band to submit valid structured values.
+    const EXEMPT: &[(&str, &str)] = &[
+        ("integration_tools", "$.properties.action"),
+        ("integration_tools", "$.properties.query"),
+        ("integration_tools", "$.properties.tool"),
+        (
+            "todo",
+            "$.properties.goals.items.properties.feedback_loop_coverage",
+        ),
+        (
+            "todo",
+            "$.properties.goals.items.properties.feedback_loop_relevance",
+        ),
+        (
+            "todo",
+            "$.properties.goals.items.properties.feedback_loop_traceability",
+        ),
+    ];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -516,6 +536,9 @@ async fn tool_parameter_descriptions_stay_under_token_cap() {
         let mut descriptions = Vec::new();
         collect_param_descriptions(&def.input_schema, "$", &mut descriptions);
         for (path, description) in descriptions {
+            if EXEMPT.contains(&(def.name.as_str(), path.as_str())) {
+                continue;
+            }
             let tokens = crate::util::estimate_tokens(&description);
             if tokens > PARAM_DESCRIPTION_TOKEN_CAP {
                 over_cap.push(format!(
