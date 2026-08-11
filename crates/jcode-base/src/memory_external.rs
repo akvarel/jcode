@@ -248,19 +248,15 @@ const GRAPHIFY_LIMITS: EnrichmentLimits = EnrichmentLimits {
 
 /// Query the graphify codebase knowledge graph via `graphify query`.
 async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
-    let truncated = if query_text.len() > 240 {
-        &query_text[..240]
-    } else {
-        query_text
-    };
+    let truncated = truncate_graphify_query(query_text, 240);
 
     let output = tokio::time::timeout(
         GRAPHIFY_LIMITS.timeout,
         tokio::process::Command::new("graphify")
             .arg("query")
             .arg(truncated)
-            .arg("--format")
-            .arg("compact")
+            .arg("--budget")
+            .arg("1200")
             .output(),
     )
     .await
@@ -274,21 +270,87 @@ async fn query_graphify(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut results: Vec<ExternalEnrichment> = Vec::new();
+    Ok(parse_graphify_output(&stdout, GRAPHIFY_LIMITS.max_results))
+}
 
-    for line in stdout.lines().take(GRAPHIFY_LIMITS.max_results) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("NODE") {
-            continue;
+fn truncate_graphify_query(query: &str, max_bytes: usize) -> &str {
+    if query.len() <= max_bytes {
+        return query;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !query.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &query[..boundary]
+}
+
+fn parse_graphify_output(output: &str, max_results: usize) -> Vec<ExternalEnrichment> {
+    output
+        .lines()
+        .filter_map(parse_graphify_line)
+        .take(max_results)
+        .collect()
+}
+
+fn parse_graphify_line(line: &str) -> Option<ExternalEnrichment> {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix("NODE ") {
+        let metadata_start = rest.find(" [src=")?;
+        let label = rest[..metadata_start].trim();
+        let metadata_and_summary = &rest[metadata_start + 2..];
+        let metadata_end = metadata_and_summary.find(']')?;
+        let metadata = &metadata_and_summary[..metadata_end];
+        let summary = metadata_and_summary[metadata_end + 1..]
+            .trim()
+            .strip_prefix("summary=")
+            .unwrap_or("")
+            .trim();
+        let source_file = metadata
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("src="))
+            .unwrap_or("");
+        let source_location = metadata
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("loc="))
+            .unwrap_or("");
+        let is_knowledge = source_file == "lat.md" || source_file.starts_with("lat.md/");
+        let kind = if is_knowledge {
+            "knowledge_section"
+        } else {
+            "code_node"
+        };
+        let mut content = format!("kind: {kind}\nlabel: {label}");
+        if !summary.is_empty() {
+            content.push_str("\nsummary: ");
+            content.push_str(summary);
         }
-        results.push(ExternalEnrichment {
-            content: line.to_string(),
+        if !source_file.is_empty() {
+            content.push_str("\nsource: ");
+            content.push_str(source_file);
+            if !source_location.is_empty() {
+                content.push(':');
+                content.push_str(source_location);
+            }
+        }
+        let source_id = (!source_file.is_empty()).then(|| {
+            if source_location.is_empty() {
+                source_file.to_string()
+            } else {
+                format!("{source_file}:{source_location}")
+            }
+        });
+        return Some(ExternalEnrichment {
+            content,
             source: "graphify",
-            source_id: None,
+            source_id,
+            tags: vec![if is_knowledge {
+                "graphify_knowledge".to_string()
+            } else {
+                "graphify_code".to_string()
+            }],
         });
     }
-
-    Ok(results)
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +438,7 @@ async fn search_vault(query_text: &str, vault_root: &str) -> Result<Vec<External
             content: format!("[{title}]({rel_path})"),
             source: "vault",
             source_id: Some(rel_path),
+            tags: Vec::new(),
         });
     }
 
@@ -454,6 +517,7 @@ async fn search_pgvector(query_text: &str) -> Result<Vec<ExternalEnrichment>> {
             content: line.to_string(),
             source: "pgvector",
             source_id: None,
+            tags: Vec::new(),
         });
     }
 
@@ -470,6 +534,7 @@ struct ExternalEnrichment {
     content: String,
     source: &'static str,
     source_id: Option<String>,
+    tags: Vec<String>,
 }
 
 /// Configurable timeouts and limits for each enrichment source.
@@ -503,16 +568,78 @@ fn entries_from_enrichments(
 ) -> Vec<MemoryEntry> {
     enrichments
         .drain(..)
-        .map(|e| {
+        .map(|mut e| {
             let cat = MemoryCategory::Custom(format!("external:{category_label}"));
             let prefixed = format!("[{}] {}", source_label, e.content);
             let mut entry = MemoryEntry::new(cat, prefixed).with_source(e.source);
             if let Some(id) = e.source_id {
                 entry.tags.push(id);
             }
+            entry.tags.append(&mut e.tags);
             entry.tags.push(source_label.to_string());
             entry.tags.push("external_enrichment".to_string());
+            entry.refresh_search_text();
             entry
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphify_output_becomes_structured_knowledge_and_code_records() {
+        let output = "Traversal: BFS depth=2 | Start: ['Tenant isolation'] | 3 nodes found\n\n\
+NODE Tenant isolation [src=lat.md/security.md loc=L3 community=] summary=All reads require tenant_id.\n\
+NODE repository.py [src=src/repository.py loc=L1 community=]\n\
+EDGE Tenant isolation --implemented_by [EXTRACTED]--> repository.py at=src/repository.py:L1\n";
+
+        let records = parse_graphify_output(output, 10);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].source_id.as_deref(),
+            Some("lat.md/security.md:L3")
+        );
+        assert!(records[0].content.contains("kind: knowledge_section"));
+        assert!(
+            records[0]
+                .content
+                .contains("summary: All reads require tenant_id.")
+        );
+        assert!(records[0].tags.contains(&"graphify_knowledge".to_string()));
+        assert!(records[1].content.contains("kind: code_node"));
+        assert!(records[1].tags.contains(&"graphify_code".to_string()));
+    }
+
+    #[test]
+    fn graphify_query_truncation_is_unicode_safe_and_bounded() {
+        let query = "архитектура ".repeat(40);
+        let truncated = truncate_graphify_query(&query, 240);
+
+        assert!(truncated.len() <= 240);
+        assert!(query.starts_with(truncated));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn structured_graphify_tags_reach_memory_entries() {
+        let mut records = parse_graphify_output(
+            "NODE Tenant isolation [src=lat.md/security.md loc=L3 community=] summary=Scoped reads.\n",
+            10,
+        );
+
+        let entries = entries_from_enrichments(&mut records, "graphify", "graphify-codebase");
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].tags.contains(&"graphify_knowledge".to_string()));
+        assert!(
+            entries[0]
+                .tags
+                .contains(&"lat.md/security.md:L3".to_string())
+        );
+        assert!(entries[0].search_text.contains("graphify knowledge"));
+        assert!(entries[0].search_text.contains("lat md security md l3"));
+    }
 }
