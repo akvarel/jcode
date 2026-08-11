@@ -2283,21 +2283,21 @@ fn anthropic_model_quality_rank(model: &str) -> usize {
         .unwrap_or(jcode_provider_core::ALL_CLAUDE_MODELS.len())
 }
 
-/// Parse a server-recommended replacement model from a 404 body, e.g.
-/// "Claude Fable 5 is not available. Please use Opus 4.8." -> the catalog id
-/// `claude-opus-4-8`. Returns the best matching known catalog id, if any.
-/// `error_str` is expected to already be lowercased.
+/// Parse a server-recommended replacement model from a lowercased 404 body,
+/// mapping prose such as "Please use Opus 4.8" to a known catalog id.
 fn anthropic_recommended_model_from_error(error_str: &str) -> Option<String> {
-    // Look for the phrase after "please use" / "use " and try to match it against
-    // the known catalog by collapsing it to a comparable token form. The server
-    // phrases the recommendation in prose ("Opus 4.8"), so compare on the digits
-    // and family word rather than exact ids.
+    // Match prose after "please use" / "use " by family and version tokens.
     let hint = error_str
         .split("please use")
         .nth(1)
         .or_else(|| error_str.split("use ").nth(1))?;
-    // Take up to the next sentence boundary.
-    let hint = hint.split(['.', '!', '\n']).next().unwrap_or(hint).trim();
+    // Do not treat a version decimal such as `4.8` as a sentence boundary.
+    let sentence_end = hint.char_indices().find_map(|(index, ch)| match ch {
+        '!' | '\n' => Some(index),
+        '.' if !hint[index + 1..].starts_with(|next: char| next.is_ascii_digit()) => Some(index),
+        _ => None,
+    });
+    let hint = sentence_end.map_or(hint, |index| &hint[..index]).trim();
     if hint.is_empty() {
         return None;
     }
@@ -2316,8 +2316,7 @@ fn anthropic_recommended_model_from_error(error_str: &str) -> Option<String> {
         .filter(|candidate| !anthropic_model_is_retired(candidate))
         .map(|candidate| {
             let key = AnthropicProvider::normalized_model_key(&candidate);
-            // The catalog id uses hyphenated digits ("claude-opus-4-8"), so the
-            // hint tokens ["opus","4","8"] should all appear.
+            // Hyphenated catalog ids contain the prose hint tokens.
             let score = hint_tokens
                 .iter()
                 .filter(|token| key.contains(token.as_str()))
