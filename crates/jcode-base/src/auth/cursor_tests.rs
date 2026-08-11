@@ -299,8 +299,18 @@ fn create_mock_vscdb(dir: &std::path::Path, entries: &[(&str, &str)]) -> PathBuf
     db_path
 }
 
+fn sqlite3_available() -> bool {
+    std::process::Command::new("sqlite3")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 #[test]
 fn vscdb_read_access_token() {
+    if !sqlite3_available() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let db = create_mock_vscdb(dir.path(), &[("cursorAuth/accessToken", "tok_abc123xyz")]);
     let result = read_vscdb_key(&db, "cursorAuth/accessToken").unwrap();
@@ -309,6 +319,9 @@ fn vscdb_read_access_token() {
 
 #[test]
 fn vscdb_read_machine_id() {
+    if !sqlite3_available() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let db = create_mock_vscdb(
         dir.path(),
@@ -323,6 +336,9 @@ fn vscdb_read_machine_id() {
 
 #[test]
 fn vscdb_missing_key_returns_error() {
+    if !sqlite3_available() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let db = create_mock_vscdb(dir.path(), &[("other/key", "value")]);
     let result = read_vscdb_key(&db, "cursorAuth/accessToken");
@@ -337,6 +353,9 @@ fn vscdb_missing_key_returns_error() {
 
 #[test]
 fn vscdb_empty_value_returns_error() {
+    if !sqlite3_available() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let db = create_mock_vscdb(dir.path(), &[("cursorAuth/accessToken", "")]);
     let result = read_vscdb_key(&db, "cursorAuth/accessToken");
@@ -352,6 +371,9 @@ fn vscdb_missing_file_returns_error() {
 
 #[test]
 fn vscdb_multiple_keys() {
+    if !sqlite3_available() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let db = create_mock_vscdb(
         dir.path(),
@@ -382,6 +404,9 @@ fn vscdb_multiple_keys() {
 
 #[test]
 fn vscdb_wrong_table_name() {
+    if !sqlite3_available() {
+        return;
+    }
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.vscdb");
     let status = std::process::Command::new("sqlite3")

@@ -21,7 +21,7 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 /// never read what the session that spawned it remembered. Naming the two cases
 /// makes the wrong one hard to pick by accident and obvious in review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HeadlessMemoryScope {
+pub enum HeadlessMemoryScope {
     /// Real project/global memory, scoped to the session's working directory.
     /// Correct for swarm-spawned workers, which are real user sessions.
     RealProject,
