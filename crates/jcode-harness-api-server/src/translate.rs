@@ -95,6 +95,8 @@ pub struct BridgeState {
     pending_no_reply_message_id: Option<(u64, u64)>,
     /// Legacy id of an in-flight `create/attach` subscribe.
     pending_attach_id: Option<(u64, u64)>,
+    /// Effective working directory requested for the in-flight attach.
+    pending_attach_working_dir: Option<String>,
     /// Legacy id of the unsolicited model-catalog probe sent after attach. Its
     /// reply becomes a `model_info` event rather than a request reply, so it is
     /// tracked apart from `pending_simple`.
@@ -288,6 +290,7 @@ impl BridgeState {
                                 .ok()
                                 .map(|d| d.display().to_string())
                         });
+                self.pending_attach_working_dir = working_dir.clone();
                 let mut subscribe = json!({
                     "type": "subscribe",
                     "id": id,
@@ -743,13 +746,17 @@ impl BridgeState {
                     && state_id == id
                 {
                     self.pending_attach_id = None;
+                    let working_dir = self.pending_attach_working_dir.take();
+                    if let Some(dir) = &working_dir {
+                        self.session_dirs.insert(session_id.clone(), dir.clone());
+                    }
                     return vec![ServerFrame::reply(
                         api_id,
                         ApiEvent::Attached {
                             session: SessionInfo {
                                 transcript_bytes: Self::transcript_bytes(&session_id),
                                 session_id,
-                                working_dir: None,
+                                working_dir,
                                 title: None,
                                 status: if event["is_processing"].as_bool().unwrap_or(false) {
                                     "processing".into()
