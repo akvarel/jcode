@@ -145,6 +145,57 @@ fn state_event_answers_pending_attach() {
 }
 
 #[test]
+fn attached_session_reports_requested_working_dir() {
+    let mut state = BridgeState::default();
+    let requested_dir = "/tmp/jcode-sdk-requested-working-dir";
+    let out = state.api_request_to_legacy(&json!({
+        "req": "create_session",
+        "id": 5,
+        "working_dir": requested_dir,
+    }));
+    let Outbound::Legacy(state_req) = &out[1] else {
+        panic!("expected legacy state request");
+    };
+    let state_id = state_req["id"].as_u64().unwrap();
+
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "state", "id": state_id, "session_id": "abc",
+        "message_count": 0, "is_processing": false,
+    }));
+
+    match &frames[0].event {
+        ApiEvent::Attached { session } => {
+            assert_eq!(session.session_id, "abc");
+            assert_eq!(session.working_dir.as_deref(), Some(requested_dir));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn permission_response_is_rejected_when_bridge_has_no_permission_capability() {
+    let mut state = state_with_session();
+    let frames = state.api_request_to_legacy(&json!({
+        "req": "permission_response",
+        "id": 77,
+        "request_id": "perm-1",
+        "decision": "allow",
+    }));
+
+    assert_eq!(frames.len(), 1);
+    let Outbound::Reply(reply) = &frames[0] else {
+        panic!("expected local reply");
+    };
+    assert_eq!(reply.reply_to, Some(77));
+    assert!(matches!(
+        &reply.event,
+        ApiEvent::Error { code: ErrorCode::InvalidRequest, message }
+            if message.contains("does not issue permission prompts")
+                && message.contains("no `permissions` capability")
+    ));
+}
+
+#[test]
 fn send_message_then_done_becomes_turn_done() {
     let mut state = state_with_session();
     let out = state.api_request_to_legacy(
