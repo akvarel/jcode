@@ -793,6 +793,19 @@ fn ping_request_is_lightweight_control_request() {
     assert!((Request::Ping { id: 1 }).is_lightweight_control_request());
 }
 
+#[test]
+fn notify_session_request_is_lightweight_control_request() {
+    assert!(
+        (Request::NotifySession {
+            id: 2,
+            session_id: "session_scheduler_target".to_string(),
+            message: "[Scheduled task]\nTask: wake the session".to_string(),
+        })
+        .is_lightweight_control_request(),
+        "the scheduler's internal control client must notify a live session before Subscribe"
+    );
+}
+
 fn subscribe_request(working_dir: Option<&str>) -> Request {
     Request::Subscribe {
         id: 1,
