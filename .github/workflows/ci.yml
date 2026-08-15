@@ -19,6 +19,8 @@ jobs:
     name: Quality Guardrails
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,10 +28,10 @@ jobs:
           submodules: recursive
 
       - name: Configure SSH for cargo git dependencies
-        if: ${{ secrets.DEPLOY_KEY != '' }}
+        if: ${{ env.DEPLOY_KEY != '' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+          ssh-private-key: ${{ env.DEPLOY_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -162,6 +164,7 @@ jobs:
     # pinning it here makes every step use this job's installed stable toolchain.
     env:
       RUSTUP_TOOLCHAIN: stable
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
     strategy:
       fail-fast: false
       matrix:
@@ -179,10 +182,10 @@ jobs:
           submodules: recursive
 
       - name: Configure SSH for cargo git dependencies
-        if: ${{ secrets.DEPLOY_KEY != '' }}
+        if: ${{ env.DEPLOY_KEY != '' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+          ssh-private-key: ${{ env.DEPLOY_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -411,6 +414,8 @@ jobs:
     name: Build & Test (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 150
+    env:
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -418,10 +423,10 @@ jobs:
           submodules: recursive
 
       - name: Configure SSH for cargo git dependencies
-        if: ${{ secrets.DEPLOY_KEY != '' }}
+        if: ${{ env.DEPLOY_KEY != '' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+          ssh-private-key: ${{ env.DEPLOY_KEY }}
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -665,6 +670,8 @@ jobs:
     name: Windows Cross-Target Check (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    env:
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -672,10 +679,10 @@ jobs:
           submodules: recursive
 
       - name: Configure SSH for cargo git dependencies
-        if: ${{ secrets.DEPLOY_KEY != '' }}
+        if: ${{ env.DEPLOY_KEY != '' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+          ssh-private-key: ${{ env.DEPLOY_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
