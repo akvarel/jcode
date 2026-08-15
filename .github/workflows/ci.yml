@@ -137,6 +137,9 @@ jobs:
       - name: Compile release automation scripts
         run: python3 -m py_compile scripts/post_discord_release.py scripts/test_post_discord_release.py
 
+      - name: Test fork-compatible workflow contracts
+        run: python3 -m unittest -v scripts/test_fork_ci_workflow.py
+
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
