@@ -39,6 +39,20 @@ jobs:
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+
+            try {
+              const repositoryQuery = `query($owner:String!, $repo:String!) {
+                repository(owner:$owner, name:$repo) { hasIssuesEnabled }
+              }`;
+              const repositoryResult = await github.graphql(repositoryQuery, { owner, repo });
+              if (repositoryResult?.repository?.hasIssuesEnabled === false) {
+                core.info('Repository issues are disabled; skipping linked-issue requirement.');
+                return;
+              }
+            } catch (err) {
+              core.warning(`Could not query repository issue capability: ${err}`);
+            }
+
             const text = `${pr.title || ''}\n\n${pr.body || ''}`;
 
             // Collect candidate issue numbers that belong to THIS repo.
