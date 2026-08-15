@@ -21,9 +21,11 @@ class ForkCiWorkflowTests(unittest.TestCase):
             workflow,
         )
         self.assertGreater(len(steps), 0)
+        self.assertEqual(workflow.count("DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}"), 4)
         for body in steps:
-            self.assertIn("if: ${{ secrets.DEPLOY_KEY != '' }}", body)
+            self.assertIn("if: ${{ env.DEPLOY_KEY != '' }}", body)
             self.assertIn("uses: webfactory/ssh-agent@", body)
+            self.assertIn("ssh-private-key: ${{ env.DEPLOY_KEY }}", body)
 
     def test_issue_policy_skips_when_repository_issues_are_disabled(self) -> None:
         workflow = ISSUE_WORKFLOW.read_text(encoding="utf-8")
