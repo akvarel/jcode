@@ -1637,6 +1637,7 @@ impl App {
                 // leave incomplete todos would never be poked. Stay armed and
                 // simply do nothing this turn.
                 crate::logging::info("AUTO_POKE_DECISION action=idle reason=no_todos incomplete=0");
+                self.todo_final_response_requested = false;
                 return false;
             }
             // Deferred quality checks land here, once, instead of interrupting
@@ -1684,7 +1685,7 @@ impl App {
                     crate::telemetry::record_todo_gate(
                         crate::telemetry::TodoGateKind::ConfidenceSpike,
                     );
-                    "🔍 Double-checking a confidence jump for you..."
+                    "🔍 Double-checking confidence jumps..."
                 };
                 self.push_display_message(DisplayMessage::system(notice));
                 // User-role content: reminder-only turns read as empty user
@@ -1722,20 +1723,31 @@ impl App {
             // it stays armed so the next batch of work is covered too; only an
             // explicit /poke off (or a circuit breaker above) disarms it.
             self.auto_poke_incomplete_todos = self.auto_poke_default_on;
-            self.todo_confidence_spike_challenged = false;
             // A finished cycle re-arms the review for whatever work comes next;
             // without this a session could only ever deliver one digest.
             self.todo_gate_digest_delivered = false;
             self.todo_completion_gate_attempts = 0;
-            self.push_display_message(DisplayMessage::system(format!(
-                "✅ All todos done. Completion confidence: {}.",
-                confidence_label
-            )));
+            if !self.todo_final_response_requested {
+                self.todo_final_response_requested = true;
+                self.push_display_message(DisplayMessage::system(format!(
+                    "✅ All todos done. Completion confidence: {}.",
+                    confidence_label
+                )));
+                self.queued_messages
+                    .push(crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string());
+                self.pending_queued_dispatch = true;
+                return true;
+            }
             self.pending_queued_dispatch = false;
             return false;
         }
 
         let poke_message = super::commands::build_poke_message(&incomplete);
+        self.todo_final_response_requested = false;
+        // Open work begins a new completion cycle. Keep the prior spike check
+        // latched until this point so the synthetic final-response turn cannot
+        // retrigger the same evidence gate against unchanged completed todos.
+        self.todo_confidence_spike_challenged = false;
         let fingerprint =
             serde_json::to_string(&incomplete).unwrap_or_else(|_| poke_message.clone());
         if self.last_auto_poke_fingerprint.as_ref() == Some(&fingerprint) {
@@ -1946,10 +1958,6 @@ pub(super) fn handle_control_key(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('s') => {
             app.toggle_input_stash();
-            true
-        }
-        KeyCode::Char('p') => {
-            super::commands::toggle_auto_poke_hotkey_local(app);
             true
         }
         KeyCode::Char('v') => {
@@ -2278,6 +2286,10 @@ pub(super) fn handle_pre_control_shortcuts(
 
     let macos_option_shortcut =
         crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    if app.toggle_keys.auto_poke.matches(code, modifiers) {
+        super::commands::toggle_auto_poke_hotkey_local(app);
+        return true;
+    }
     if app.toggle_keys.copy_selection.matches(code, modifiers) {
         app.toggle_copy_selection_mode();
         return true;
@@ -2479,7 +2491,7 @@ fn handle_inline_image_toggle_shortcut(app: &mut App, key: char) -> bool {
     true
 }
 
-fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
+pub(super) fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
     if !key.eq_ignore_ascii_case(&'e') {
         return false;
     }
@@ -3767,7 +3779,8 @@ impl App {
         // Leaving the preview should happen as soon as the user acts on it.
         self.onboarding_preview_mode = false;
 
-        // Add user message to display (show placeholder to user, not full paste)
+        // Add the expanded user message to the transcript. The composer remains compact
+        // while editing, but sent turns should show the actual pasted content.
         // Remember the typed prompt so we can restore it to the input box if this
         // turn fails (e.g. "token refresh needed"), instead of dropping it.
         self.last_submitted_input = Some(raw_input.clone());
@@ -3780,7 +3793,7 @@ impl App {
 
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
-            content: raw_input, // Show placeholder to user (condensed view)
+            content: input.clone(),
             tool_calls: vec![],
             duration_secs: None,
             title: None,

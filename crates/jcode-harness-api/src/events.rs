@@ -32,6 +32,9 @@ pub enum ApiEvent {
     History {
         session_id: String,
         messages: Vec<HistoryMessage>,
+        /// Images anchored to user prompts or tool calls in this transcript.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<RenderedImage>,
     },
 
     /// Reply to `Ping`.
@@ -74,6 +77,13 @@ pub enum ApiEvent {
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// Images the model just received from a tool result or image generator.
+    /// Clients should render these at their transcript anchor immediately.
+    SidePaneImages {
+        session_id: String,
+        images: Vec<RenderedImage>,
     },
 
     /// Token usage update for the attached session.
@@ -154,6 +164,9 @@ pub enum ApiEvent {
         /// Model id, e.g. `claude-sonnet-4-20250514`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Reasoning effort, e.g. `high`, for providers that expose it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
 
     /// Reply to `ListModels`: the models this session can switch to.
@@ -173,6 +186,9 @@ pub enum ApiEvent {
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Reasoning effort, e.g. `high`, for providers that expose it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
         routes: Vec<ModelRouteInfo>,
     },
 
@@ -254,6 +270,8 @@ pub struct SessionInfo {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// The effective persisted display title. A custom rename takes precedence
+    /// over the generated or imported title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub status: String,
@@ -295,4 +313,29 @@ pub struct HistoryMessage {
     /// "user" | "assistant" | "tool".
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedImageSource {
+    UserInput,
+    ToolResult { tool_name: String },
+    Other { role: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedImageAnchor {
+    ToolCall { id: String },
+    UserPrompt { ordinal: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenderedImage {
+    pub media_type: String,
+    pub data: String,
+    pub label: Option<String>,
+    pub source: RenderedImageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<RenderedImageAnchor>,
 }
