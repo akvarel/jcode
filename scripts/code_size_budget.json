@@ -15,7 +15,7 @@
     "crates/jcode-app-core/src/server/swarm.rs": 3170,
     "crates/jcode-app-core/src/tool/bash.rs": 1470,
     "crates/jcode-app-core/src/tool/communicate.rs": 3364,
-    "crates/jcode-app-core/src/tool/discover.rs": 2428,
+    "crates/jcode-app-core/src/tool/discover.rs": 2430,
     "crates/jcode-app-core/src/tool/mod.rs": 1307,
     "crates/jcode-app-core/src/tool/selfdev/build_queue.rs": 1352,
     "crates/jcode-app-core/src/tool/session_search.rs": 1892,
