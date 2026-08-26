@@ -239,7 +239,7 @@ pub(super) fn handle_bus_event(
                 )
             });
             app.session.model = Some(model.clone());
-            let _ = app.session.save();
+            drop(app.session.save());
             if !app.auth_catalog_refresh_pending {
                 app.push_display_message(crate::tui::DisplayMessage::system(message));
             }

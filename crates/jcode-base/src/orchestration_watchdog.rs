@@ -243,7 +243,12 @@ impl OrchestrationWatchdog {
 
     pub fn with_root(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref().to_path_buf();
-        let _ = fs::create_dir_all(&root);
+        if let Err(error) = fs::create_dir_all(&root) {
+            crate::logging::warn(&format!(
+                "Cannot create orchestration watchdog directory {}: {error}",
+                root.display()
+            ));
+        }
         Self { root }
     }
 
@@ -714,13 +719,16 @@ impl OrchestrationWatchdog {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            match fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<WatchRecord>(&bytes).ok())
-            {
-                Some(record) => records.push(record),
-                None => crate::logging::warn(&format!(
-                    "Ignoring unreadable orchestration watch {}",
+            match fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<WatchRecord>(&bytes) {
+                    Ok(record) => records.push(record),
+                    Err(error) => crate::logging::warn(&format!(
+                        "Ignoring invalid orchestration watch {}: {error}",
+                        path.display()
+                    )),
+                },
+                Err(error) => crate::logging::warn(&format!(
+                    "Ignoring unreadable orchestration watch {}: {error}",
                     path.display()
                 )),
             }
@@ -786,17 +794,35 @@ fn validate_relative_artifact(path: &Path) -> Result<()> {
 }
 
 fn inspect_repository(working_dir: &Path) -> Option<RepositorySnapshot> {
-    let head = Command::new("git")
+    let head = match Command::new("git")
         .args(["-C", working_dir.to_str()?, "rev-parse", "HEAD"])
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Cannot inspect repository HEAD in {}: {error}",
+                working_dir.display()
+            ));
+            return None;
+        }
+    };
     if !head.status.success() {
         return None;
     }
-    let status = Command::new("git")
+    let status = match Command::new("git")
         .args(["-C", working_dir.to_str()?, "status", "--short"])
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Cannot inspect repository status in {}: {error}",
+                working_dir.display()
+            ));
+            return None;
+        }
+    };
     let status_summary = String::from_utf8_lossy(&status.stdout).trim().to_string();
     Some(RepositorySnapshot {
         head_sha: Some(String::from_utf8_lossy(&head.stdout).trim().to_string()),
@@ -881,11 +907,10 @@ fn schedule_retry_or_fail(record: &mut WatchRecord, now: DateTime<Utc>) {
                 "retry attempt {} scheduled after {}s{}",
                 record.attempt + 1,
                 delay,
-                record
-                    .next_model
-                    .as_deref()
-                    .map(|model| format!(" using model {model}"))
-                    .unwrap_or_default()
+                match record.next_model.as_deref() {
+                    Some(model) => format!(" using model {model}"),
+                    None => String::new(),
+                }
             ),
         );
     } else {

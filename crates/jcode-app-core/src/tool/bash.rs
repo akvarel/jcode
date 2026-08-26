@@ -498,8 +498,7 @@ async fn apply_progress_update(task_id: &str, update: ProgressLineUpdate) {
     };
 }
 
-/// Progress state for a foreground command that may be promoted to a
-/// background task if it exceeds the foreground timeout.
+/// Progress state for a foreground command that may be promoted to a background task.
 ///
 /// Before promotion there is no task to attach progress to, so only the most
 /// recent update is kept. When the command is promoted, `attach_task` flushes
@@ -514,7 +513,10 @@ struct PromotedCommandProgress {
 impl PromotedCommandProgress {
     async fn record(&self, update: ProgressLineUpdate) {
         let direct = {
-            let mut pending = self.pending.lock().expect("progress mutex poisoned");
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if self.task_id.get().is_none() {
                 *pending = Some(update);
                 None
@@ -531,7 +533,11 @@ impl PromotedCommandProgress {
 
     async fn attach_task(&self, task_id: &str) {
         let _ = self.task_id.set(task_id.to_string());
-        let pending = self.pending.lock().expect("progress mutex poisoned").take();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         if let Some(update) = pending {
             apply_progress_update(task_id, update).await;
         }

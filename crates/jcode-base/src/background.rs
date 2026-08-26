@@ -53,7 +53,12 @@ impl BackgroundTaskManager {
     ///
     /// Primarily for tests; production code should use [`global`].
     pub fn with_output_dir(output_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&output_dir).ok();
+        if let Err(error) = std::fs::create_dir_all(&output_dir) {
+            crate::logging::warn(&format!(
+                "Cannot create background output directory {}: {error}",
+                output_dir.display()
+            ));
+        }
         let watchdog_root = output_dir.join("watchdog");
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -69,7 +74,12 @@ impl BackgroundTaskManager {
     /// Create a new background task manager
     pub fn new() -> Self {
         let output_dir = task_dir();
-        std::fs::create_dir_all(&output_dir).ok();
+        if let Err(error) = std::fs::create_dir_all(&output_dir) {
+            crate::logging::warn(&format!(
+                "Cannot create background output directory {}: {error}",
+                output_dir.display()
+            ));
+        }
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress_updates: Arc::new(Mutex::new(())),
@@ -84,10 +94,10 @@ impl BackgroundTaskManager {
         use std::time::{SystemTime, UNIX_EPOCH};
         const TASK_ID_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis(),
+            Err(_) => 0,
+        };
         // Use last 6 digits of timestamp + 4 random chars
         let rand_part: String = (0..4)
             .map(|_| {
@@ -133,10 +143,19 @@ impl BackgroundTaskManager {
     }
 
     fn status_duration_secs(started_at: &str, completed_at: DateTime<Utc>) -> Option<f64> {
-        DateTime::parse_from_rfc3339(started_at)
-            .ok()
-            .and_then(|started| (completed_at - started.with_timezone(&Utc)).to_std().ok())
-            .map(|duration| duration.as_secs_f64())
+        let started = match DateTime::parse_from_rfc3339(started_at) {
+            Ok(started) => started,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot parse background task start timestamp {started_at:?}: {error}"
+                ));
+                return None;
+            }
+        };
+        match (completed_at - started.with_timezone(&Utc)).to_std() {
+            Ok(duration) => Some(duration.as_secs_f64()),
+            Err(_) => None,
+        }
     }
 
     fn parse_exit_code_from_output(output: &str) -> Option<i32> {
@@ -1106,18 +1125,22 @@ impl BackgroundTaskManager {
                 }
                 fired_this_episode = true;
 
-                let running_secs = DateTime::parse_from_rfc3339(&started_at)
-                    .ok()
-                    .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
-                    .map(|duration| duration.as_secs_f64())
-                    .unwrap_or_default();
-                let output_tail = fs::read_to_string(&output_path)
-                    .await
-                    .map(|output| {
+                let running_secs = Self::status_duration_secs(&started_at, Utc::now())
+                    .map_or(0.0, |duration| duration);
+                let output_tail = match fs::read_to_string(&output_path).await {
+                    Ok(output) => {
                         let tail: Vec<&str> = output.lines().rev().take(20).collect();
                         tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-                    })
-                    .unwrap_or_default();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => {
+                        crate::logging::warn(&format!(
+                            "Cannot read stalled background output {}: {error}",
+                            output_path.display()
+                        ));
+                        String::new()
+                    }
+                };
                 let output_tail = if output_tail.len() > 2000 {
                     crate::util::truncate_str(&output_tail, 2000).to_string()
                 } else {
