@@ -154,7 +154,7 @@ impl Provider for GrokBuildProvider {
                     tx.clone(),
                     cancel_rx,
                 ) {
-                    let _ = tx.blocking_send(Err(error));
+                    drop(tx.blocking_send(Err(error)));
                 }
             })
             .context("Failed to start Grok Build ACP runtime thread")?;
@@ -290,8 +290,10 @@ impl Stream for GrokEventStream {
 
 impl Drop for GrokEventStream {
     fn drop(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(());
+        if let Some(cancel) = self.cancel.take()
+            && cancel.send(()).is_err()
+        {
+            eprintln!("Grok Build stream cancellation receiver already closed");
         }
         // Joining can block while the child handles cancellation. Detach here;
         // dropping the child in the ACP thread has kill_on_drop enabled.
@@ -529,7 +531,7 @@ async fn run_on_acp_thread_with_process<T: Send + 'static>(
                     with_connection(process, mpsc::channel(1).0, operation).await
                 })
             })();
-            let _ = result_tx.send(result);
+            drop(result_tx.send(result));
         })
         .context("Failed to start Grok Build ACP probe thread")?;
     result_rx
@@ -587,9 +589,9 @@ where
         });
     let io_task = tokio::task::spawn_local(io);
     let result = operation(connection).await;
-    let _ = child.kill().await;
+    drop(child.kill().await);
     io_task.abort();
-    let _ = tokio::time::timeout(Duration::from_millis(100), &mut stderr_task).await;
+    drop(tokio::time::timeout(Duration::from_millis(100), &mut stderr_task).await);
     stderr_task.abort();
     let stderr = stderr_capture
         .lock()
@@ -696,7 +698,7 @@ impl acp::Client for GrokAcpClient {
             _ => None,
         };
         if let Some(event) = event {
-            let _ = self.tx.send(Ok(event)).await;
+            drop(self.tx.send(Ok(event)).await);
         }
         Ok(())
     }

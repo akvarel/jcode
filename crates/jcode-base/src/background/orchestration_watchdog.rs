@@ -1,4 +1,30 @@
 use super::*;
+use std::path::Path;
+
+async fn read_watch_output(path: &Path) -> String {
+    match fs::read_to_string(path).await {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Cannot read watchdog output {}: {error}",
+                path.display()
+            ));
+            String::new()
+        }
+    }
+}
+
+fn optional_duration_secs(duration: Option<f64>) -> f64 {
+    duration.unwrap_or(0.0)
+}
+
+fn elapsed_secs(started_at: chrono::DateTime<Utc>) -> f64 {
+    match (Utc::now() - started_at).to_std() {
+        Ok(duration) => duration.as_secs_f64(),
+        Err(_) => 0.0,
+    }
+}
 
 impl BackgroundTaskManager {
     pub(super) fn register_watch(&self, task_id: &str, session_id: &str, process_id: Option<u32>) {
@@ -136,39 +162,44 @@ impl BackgroundTaskManager {
         // this observation before the orphan sweep. Preserve the status file so
         // the plan can later reconcile to its real terminal state instead of
         // reporting a false server-reload failure.
-        if status.tool_name == "swarm"
-            && self
-                .watchdog
-                .get(&status.task_id)
-                .ok()
-                .flatten()
-                .is_some_and(|record| {
-                    record.runtime_state == crate::orchestration_watchdog::RuntimeState::Running
-                        && record.last_swarm_status.is_some()
-                })
-        {
+        let active_swarm_watch = match self.watchdog.get(&status.task_id) {
+            Ok(record) => record.is_some_and(|record| {
+                record.runtime_state == crate::orchestration_watchdog::RuntimeState::Running
+                    && record.last_swarm_status.is_some()
+            }),
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot inspect swarm watch {} during orphan recovery: {error}",
+                    status.task_id
+                ));
+                false
+            }
+        };
+        if status.tool_name == "swarm" && active_swarm_watch {
             return status;
         }
 
         let completed_at = Utc::now();
         let duration_secs = Self::status_duration_secs(&status.started_at, completed_at);
-        let recovered_from_evidence = self
-            .watchdog
-            .reconcile(
-                &status.task_id,
-                crate::orchestration_watchdog::ReconcileObservation {
-                    runtime_state: crate::orchestration_watchdog::RuntimeState::OwnershipLost,
-                    process_running: Some(false),
-                    swarm_status: (status.tool_name == "swarm")
-                        .then(|| "ownership_lost".to_string()),
-                    retries_exhausted: false,
-                    observed_at: completed_at,
-                },
-            )
-            .ok()
-            .is_some_and(|record| {
-                record.status == crate::orchestration_watchdog::WatchStatus::Completed
-            });
+        let recovered_from_evidence = match self.watchdog.reconcile(
+            &status.task_id,
+            crate::orchestration_watchdog::ReconcileObservation {
+                runtime_state: crate::orchestration_watchdog::RuntimeState::OwnershipLost,
+                process_running: Some(false),
+                swarm_status: (status.tool_name == "swarm").then(|| "ownership_lost".to_string()),
+                retries_exhausted: false,
+                observed_at: completed_at,
+            },
+        ) {
+            Ok(record) => record.status == crate::orchestration_watchdog::WatchStatus::Completed,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot reconcile orphaned background task {}: {error}",
+                    status.task_id
+                ));
+                false
+            }
+        };
         let (final_status, error) = if recovered_from_evidence {
             (BackgroundTaskStatus::Completed, None)
         } else {
@@ -193,7 +224,7 @@ impl BackgroundTaskManager {
         self.write_status_file(status_path, &status).await;
 
         let output_path = self.output_path_for(&status.task_id);
-        let output = fs::read_to_string(&output_path).await.unwrap_or_default();
+        let output = read_watch_output(&output_path).await;
         let output_preview = if output.len() > 500 {
             format!("{}...", crate::util::truncate_str(&output, 500))
         } else {
@@ -208,7 +239,7 @@ impl BackgroundTaskManager {
             exit_code,
             output_preview,
             output_file: output_path,
-            duration_secs: duration_secs.unwrap_or_default(),
+            duration_secs: optional_duration_secs(duration_secs),
             notify: status.notify,
             wake: status.wake,
         });
@@ -297,7 +328,12 @@ impl BackgroundTaskManager {
                 observed_at: Utc::now(),
             };
             let result = self.watchdog.reconcile(&record.job_id, observation);
-            let _ = self.watchdog.finish_check(&record.job_id, &lease.lease_id);
+            if let Err(error) = self.watchdog.finish_check(&record.job_id, &lease.lease_id) {
+                crate::logging::warn(&format!(
+                    "Cannot finish swarm watchdog check {}: {error}",
+                    record.job_id
+                ));
+            }
             let Ok(record) = result else {
                 continue;
             };
@@ -327,7 +363,7 @@ impl BackgroundTaskManager {
             self.write_status_file(&status_path, &status).await;
 
             let output_path = self.output_path_for(&status.task_id);
-            let mut output_preview = fs::read_to_string(&output_path).await.unwrap_or_default();
+            let mut output_preview = read_watch_output(&output_path).await;
             if output_preview.len() > 500 {
                 output_preview = format!("{}...", crate::util::truncate_str(&output_preview, 500));
             }
@@ -344,7 +380,7 @@ impl BackgroundTaskManager {
                 exit_code: status.exit_code,
                 output_preview,
                 output_file: output_path,
-                duration_secs: status.duration_secs.unwrap_or_default(),
+                duration_secs: optional_duration_secs(status.duration_secs),
                 notify: status.notify,
                 wake: status.wake,
             });
@@ -376,7 +412,13 @@ impl BackgroundTaskManager {
                         &record.job_id,
                         ReconcileObservation::runtime(RuntimeState::Unknown),
                     );
-                    let _ = self.watchdog.finish_check(&record.job_id, &lease.lease_id);
+                    if let Err(error) = self.watchdog.finish_check(&record.job_id, &lease.lease_id)
+                    {
+                        crate::logging::warn(&format!(
+                            "Cannot finish background watchdog check {}: {error}",
+                            record.job_id
+                        ));
+                    }
                     if let Ok(reconciled_record) = reconciled_record
                         && reconciled_record.status.is_terminal()
                     {
@@ -403,10 +445,7 @@ impl BackgroundTaskManager {
                             exit_code: None,
                             output_preview,
                             output_file: self.output_path_for(&reconciled_record.job_id),
-                            duration_secs: (Utc::now() - reconciled_record.created_at)
-                                .to_std()
-                                .map(|duration| duration.as_secs_f64())
-                                .unwrap_or_default(),
+                            duration_secs: elapsed_secs(reconciled_record.created_at),
                             notify: true,
                             wake: true,
                         });
@@ -433,10 +472,7 @@ impl BackgroundTaskManager {
                             )
                         },
                         output_file: self.output_path_for(&record.job_id),
-                        duration_secs: (Utc::now() - record.created_at)
-                            .to_std()
-                            .map(|duration| duration.as_secs_f64())
-                            .unwrap_or_default(),
+                        duration_secs: elapsed_secs(record.created_at),
                         notify: true,
                         wake: true,
                     });
@@ -476,14 +512,24 @@ impl BackgroundTaskManager {
                     retries_exhausted: false,
                     observed_at: Utc::now(),
                 };
-                let _ = self.watchdog.reconcile(&record.job_id, observation);
-                let _ = self.watchdog.finish_check(&record.job_id, &lease.lease_id);
+                if let Err(error) = self.watchdog.reconcile(&record.job_id, observation) {
+                    crate::logging::warn(&format!(
+                        "Cannot reconcile background watchdog task {}: {error}",
+                        record.job_id
+                    ));
+                }
+                if let Err(error) = self.watchdog.finish_check(&record.job_id, &lease.lease_id) {
+                    crate::logging::warn(&format!(
+                        "Cannot finish background watchdog check {}: {error}",
+                        record.job_id
+                    ));
+                }
                 reconciled += 1;
                 continue;
             }
 
             let output_path = self.output_path_for(&status.task_id);
-            let output = fs::read_to_string(&output_path).await.unwrap_or_default();
+            let output = read_watch_output(&output_path).await;
             let output_preview = if output.len() > 500 {
                 format!("{}...", crate::util::truncate_str(&output, 500))
             } else {
@@ -498,7 +544,7 @@ impl BackgroundTaskManager {
                 exit_code: status.exit_code,
                 output_preview,
                 output_file: output_path,
-                duration_secs: status.duration_secs.unwrap_or_default(),
+                duration_secs: optional_duration_secs(status.duration_secs),
                 notify: status.notify,
                 wake: status.wake,
             });

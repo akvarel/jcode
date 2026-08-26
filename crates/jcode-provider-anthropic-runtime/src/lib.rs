@@ -54,6 +54,9 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+mod runtime_env;
+use runtime_env::{nonempty_env, optional_u32};
+
 /// Anthropic Messages API endpoint
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -61,9 +64,8 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_URL_OAUTH: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
 fn direct_api_url() -> String {
-    let base = std::env::var("JCODE_ANTHROPIC_API_BASE")
-        .ok()
-        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
+    let base = nonempty_env("JCODE_ANTHROPIC_API_BASE")
+        .or_else(|| nonempty_env("ANTHROPIC_BASE_URL"))
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty());
     match base {
@@ -74,10 +76,7 @@ fn direct_api_url() -> String {
 }
 
 fn configured_direct_headers() -> Result<HeaderMap> {
-    let Some(raw) = std::env::var("JCODE_ANTHROPIC_HEADERS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(raw) = nonempty_env("JCODE_ANTHROPIC_HEADERS") else {
         return Ok(HeaderMap::new());
     };
     let headers: std::collections::BTreeMap<String, String> = serde_json::from_str(&raw)
@@ -94,14 +93,9 @@ fn configured_direct_headers() -> Result<HeaderMap> {
 }
 
 fn direct_auth_mode() -> String {
-    std::env::var("JCODE_ANTHROPIC_AUTH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    nonempty_env("JCODE_ANTHROPIC_AUTH")
         .unwrap_or_else(|| {
-            if std::env::var("ANTHROPIC_AUTH_TOKEN")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
+            if nonempty_env("ANTHROPIC_AUTH_TOKEN").is_some() {
                 "bearer".to_string()
             } else {
                 "header".to_string()
@@ -609,9 +603,7 @@ impl AnthropicProvider {
             })
         });
 
-        let max_tokens_override = std::env::var("JCODE_ANTHROPIC_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok());
+        let max_tokens_override = optional_u32("JCODE_ANTHROPIC_MAX_TOKENS");
         let reasoning_effort = jcode_base::config::config()
             .provider
             .anthropic_reasoning_effort
