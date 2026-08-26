@@ -2508,10 +2508,9 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         assert!(super::commands::is_poke_message(summary));
         assert!(super::commands::is_todo_confidence_summary_message(summary));
         assert!(summary.starts_with(crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE));
-        // The continuation self-identifies as an automated follow-up so the model
-        // does not mistake it for a user message, but never discloses private
-        // calibration details.
-        assert!(summary.contains("automated follow-up"));
+        // Compact continuations remain visibly synthetic without exposing
+        // private calibration details.
+        assert!(summary.starts_with("[auto]"));
         assert!(!summary.to_ascii_lowercase().contains("threshold"));
         // The model is told exactly which completed todos to recheck.
         assert!(summary.contains("Finish risky provider path"));

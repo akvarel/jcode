@@ -1362,13 +1362,13 @@ fn visually_appealing_prompt_batched_retry_renders_complete_todo_card() {
 
     assert!(rendered.contains("✓ todo"), "{rendered}");
     assert!(rendered.contains("pelican-bike"), "{rendered}");
-    assert!(
-        compact.contains(&without_whitespace(OBJECTIVE)),
-        "batched todo plan intention was truncated:\n{rendered}"
-    );
-    // Compact transcript cards show the goal's quality assessments rather than
-    // repeating its potentially long feedback-loop prose. The full prose remains
-    // available in the serialized todo payload and the todos side panel.
+    let intent_line = rendered
+        .lines()
+        .find(|line| line.contains("Intent clear:"))
+        .expect("batched todo card should include the plan intention");
+    assert!(intent_line.contains("Deliver a single-page vanilla HTML/CSS/JS animation"));
+    assert!(intent_line.trim_end().ends_with('…'), "{rendered}");
+    assert!(!compact.contains(&without_whitespace(OBJECTIVE)));
     assert!(rendered.contains("Relevance missing · Coverage missing"));
     assert!(!compact.contains(&without_whitespace(FEEDBACK)));
     let goal_details = rendered
