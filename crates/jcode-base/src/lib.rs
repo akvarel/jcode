@@ -58,6 +58,7 @@ pub mod memory_rerank;
 pub mod memory_types;
 pub mod message;
 pub mod model_pricing;
+pub mod orchestration_watchdog;
 pub mod output_style;
 pub mod plan;
 pub mod platform;
