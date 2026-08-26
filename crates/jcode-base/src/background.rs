@@ -1125,8 +1125,8 @@ impl BackgroundTaskManager {
                 }
                 fired_this_episode = true;
 
-                let running_secs = Self::status_duration_secs(&started_at, Utc::now())
-                    .map_or(0.0, |duration| duration);
+                let running_secs =
+                    Self::status_duration_secs(&started_at, Utc::now()).unwrap_or(0.0);
                 let output_tail = match fs::read_to_string(&output_path).await {
                     Ok(output) => {
                         let tail: Vec<&str> = output.lines().rev().take(20).collect();

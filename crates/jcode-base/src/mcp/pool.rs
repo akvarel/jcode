@@ -451,9 +451,13 @@ mod tests {
     use crate::mcp::protocol::McpConfig;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn issue_790_reload_reuses_default_config_directory() {
+    #[test]
+    fn issue_790_reload_reuses_default_config_directory() {
         let _guard = crate::storage::lock_test_env();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
         let original_cwd = std::env::current_dir().expect("current cwd");
         let previous_home = std::env::var_os("JCODE_HOME");
         let home = tempfile::tempdir().expect("home tempdir");
@@ -473,7 +477,6 @@ mod tests {
 
         std::env::set_current_dir(first_project.path()).expect("set first project cwd");
         let pool = SharedMcpPool::from_default_config();
-        let initially_loaded_first = pool.config().await.servers.contains_key("first");
 
         std::fs::write(
             first_project.path().join(".mcp.json"),
@@ -482,8 +485,18 @@ mod tests {
         .expect("update first project config");
 
         std::env::set_current_dir(second_project.path()).expect("set second project cwd");
-        let _ = pool.reload().await;
-        let reloaded = pool.config().await;
+        let (initially_loaded_first, reloaded_first, reloaded_first_reloaded, reloaded_second) =
+            runtime.block_on(async {
+                let initially_loaded_first = pool.config().await.servers.contains_key("first");
+                let _ = pool.reload().await;
+                let reloaded = pool.config().await;
+                (
+                    initially_loaded_first,
+                    reloaded.servers.contains_key("first"),
+                    reloaded.servers.contains_key("first-reloaded"),
+                    reloaded.servers.contains_key("second"),
+                )
+            });
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
         if let Some(previous_home) = previous_home {
@@ -493,9 +506,9 @@ mod tests {
         }
 
         assert!(initially_loaded_first);
-        assert!(!reloaded.servers.contains_key("first"));
-        assert!(reloaded.servers.contains_key("first-reloaded"));
-        assert!(!reloaded.servers.contains_key("second"));
+        assert!(!reloaded_first);
+        assert!(reloaded_first_reloaded);
+        assert!(!reloaded_second);
     }
 
     #[tokio::test]
