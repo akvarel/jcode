@@ -1600,5 +1600,9 @@ impl BashTool {
 }
 
 #[cfg(all(test, not(windows)))]
+#[path = "bash_progress_tests.rs"]
+mod progress_tests;
+
+#[cfg(all(test, not(windows)))]
 #[path = "bash_tests.rs"]
 mod tests;
