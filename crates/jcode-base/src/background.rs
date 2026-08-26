@@ -33,6 +33,7 @@ use model::{
 };
 
 /// Manages background task execution
+#[derive(Clone)]
 pub struct BackgroundTaskManager {
     tasks: Arc<RwLock<HashMap<String, RunningTask>>>,
     /// Serializes progress status read-modify-write cycles so concurrent output
@@ -43,6 +44,7 @@ pub struct BackgroundTaskManager {
     /// output bytes and no progress events for the configured window.
     stall_watchdogs: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     output_dir: PathBuf,
+    watchdog: crate::orchestration_watchdog::OrchestrationWatchdog,
 }
 
 impl BackgroundTaskManager {
@@ -51,18 +53,124 @@ impl BackgroundTaskManager {
     /// Primarily for tests; production code should use [`global`].
     pub fn with_output_dir(output_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&output_dir).ok();
+        let watchdog_root = output_dir.join("watchdog");
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress_updates: Arc::new(Mutex::new(())),
             stall_watchdogs: Arc::new(RwLock::new(HashMap::new())),
             output_dir,
+            watchdog: crate::orchestration_watchdog::OrchestrationWatchdog::with_root(
+                watchdog_root,
+            ),
         }
     }
 
     /// Create a new background task manager
     pub fn new() -> Self {
         let output_dir = task_dir();
-        Self::with_output_dir(output_dir)
+        std::fs::create_dir_all(&output_dir).ok();
+        Self {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            progress_updates: Arc::new(Mutex::new(())),
+            stall_watchdogs: Arc::new(RwLock::new(HashMap::new())),
+            output_dir,
+            watchdog: crate::orchestration_watchdog::OrchestrationWatchdog::new(),
+        }
+    }
+
+    fn register_watch(&self, task_id: &str, session_id: &str, process_id: Option<u32>) {
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let spec = crate::orchestration_watchdog::WatchSpec {
+            job_id: task_id.to_string(),
+            dedupe_key: format!("background:{session_id}:{task_id}"),
+            owner_session_id: session_id.to_string(),
+            worker_session_id: None,
+            process_id,
+            working_dir,
+            baseline_sha: None,
+            expected_sha: None,
+            expected_artifacts: Vec::new(),
+            deadline: None,
+            stale_after: chrono::Duration::days(7),
+            retry: crate::orchestration_watchdog::RetryPolicy::default(),
+        };
+        if let Err(error) = self.watchdog.register(spec) {
+            crate::logging::warn(&format!(
+                "Failed to register orchestration watch for background task {task_id}: {error}"
+            ));
+        }
+    }
+
+    pub fn configure_watch(
+        &self,
+        task_id: &str,
+        update: crate::orchestration_watchdog::WatchUpdate,
+    ) -> Result<crate::orchestration_watchdog::WatchRecord> {
+        self.watchdog.update(task_id, update)
+    }
+
+    fn publish_completion_once(&self, mut event: BackgroundTaskCompleted) {
+        use crate::orchestration_watchdog::{ReconcileObservation, RuntimeState, WatchStatus};
+
+        let task_id = event.task_id.clone();
+        let runtime = match event.status {
+            BackgroundTaskStatus::Completed | BackgroundTaskStatus::Superseded => {
+                RuntimeState::Completed
+            }
+            BackgroundTaskStatus::Failed => RuntimeState::Failed,
+            BackgroundTaskStatus::Running => RuntimeState::Running,
+        };
+        let reconciliation = self.watchdog.reconcile(
+            &task_id,
+            ReconcileObservation {
+                runtime_state: runtime,
+                process_running: None,
+                swarm_status: (event.tool_name == "swarm").then(|| "terminal".to_string()),
+                retries_exhausted: true,
+                observed_at: Utc::now(),
+            },
+        );
+        let delivery_event_id = match reconciliation {
+            Ok(record) => {
+                if record.status == WatchStatus::Completed {
+                    event.status = BackgroundTaskStatus::Completed;
+                    if !record.completion_evidence.is_empty() {
+                        if !event.output_preview.is_empty() {
+                            event.output_preview.push_str("\n\n");
+                        }
+                        event.output_preview.push_str("Watchdog evidence:\n");
+                        event
+                            .output_preview
+                            .push_str(&record.completion_evidence.join("\n"));
+                    }
+                }
+                match self
+                    .watchdog
+                    .claim_terminal_delivery(&task_id, "background-task-manager")
+                {
+                    Ok(Some(claim)) => Some(claim.event_id),
+                    Ok(None) => None,
+                    Err(error) => {
+                        crate::logging::warn(&format!(
+                            "Failed to claim terminal delivery for background task {task_id}: {error}"
+                        ));
+                        Some(String::new())
+                    }
+                }
+            }
+            Err(error) => {
+                // Legacy status files have no watch. Preserve their historical
+                // delivery behavior instead of dropping completion.
+                crate::logging::warn(&format!(
+                    "Background task {task_id} has no usable orchestration watch: {error}"
+                ));
+                Some(String::new())
+            }
+        };
+
+        if delivery_event_id.is_some() {
+            Bus::global().publish(BusEvent::BackgroundTaskCompleted(event));
+        }
     }
 
     /// Generate a short, unique task ID
@@ -201,7 +309,7 @@ impl BackgroundTaskManager {
         } else {
             output
         };
-        Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+        self.publish_completion_once(BackgroundTaskCompleted {
             task_id: status.task_id.clone(),
             tool_name: status.tool_name.clone(),
             display_name: status.display_name.clone(),
@@ -213,7 +321,7 @@ impl BackgroundTaskManager {
             duration_secs: duration_secs.unwrap_or_default(),
             notify: status.notify,
             wake: status.wake,
-        }));
+        });
 
         status
     }
@@ -272,20 +380,64 @@ impl BackgroundTaskManager {
         if self.is_live_task(&status.task_id) {
             return status;
         }
+        // A reloaded run_plan driver can lose its task future while the durable
+        // swarm plan and workers remain active. The app-core watchdog refreshes
+        // this observation before the orphan sweep. Preserve the status file so
+        // the plan can later reconcile to its real terminal state instead of
+        // reporting a false server-reload failure.
+        if status.tool_name == "swarm"
+            && self
+                .watchdog
+                .get(&status.task_id)
+                .ok()
+                .flatten()
+                .is_some_and(|record| {
+                    record.runtime_state == crate::orchestration_watchdog::RuntimeState::Running
+                        && record.last_swarm_status.is_some()
+                })
+        {
+            return status;
+        }
 
         let completed_at = Utc::now();
         let duration_secs = Self::status_duration_secs(&status.started_at, completed_at);
-        let error =
-            "Task orphaned: the owning server process exited (reloaded or crashed) before the task finished"
-                .to_string();
-        status.status = BackgroundTaskStatus::Failed;
-        status.exit_code = None;
-        status.error = Some(error.clone());
+        let recovered_from_evidence = self
+            .watchdog
+            .reconcile(
+                &status.task_id,
+                crate::orchestration_watchdog::ReconcileObservation {
+                    runtime_state: crate::orchestration_watchdog::RuntimeState::OwnershipLost,
+                    process_running: Some(false),
+                    swarm_status: (status.tool_name == "swarm")
+                        .then(|| "ownership_lost".to_string()),
+                    retries_exhausted: false,
+                    observed_at: completed_at,
+                },
+            )
+            .ok()
+            .is_some_and(|record| {
+                record.status == crate::orchestration_watchdog::WatchStatus::Completed
+            });
+        let (final_status, error) = if recovered_from_evidence {
+            (BackgroundTaskStatus::Completed, None)
+        } else {
+            (
+                BackgroundTaskStatus::Failed,
+                Some(
+                    "Task orphaned: the owning server process exited (reloaded or crashed) before the task finished"
+                        .to_string(),
+                ),
+            )
+        };
+        status.status = final_status.clone();
+        let exit_code = recovered_from_evidence.then_some(0);
+        status.exit_code = exit_code;
+        status.error = error.clone();
         status.completed_at = Some(completed_at.to_rfc3339());
         status.duration_secs = duration_secs;
         push_task_event(
             &mut status,
-            terminal_event_record(BackgroundTaskStatus::Failed, None, Some(&error)),
+            terminal_event_record(final_status.clone(), exit_code, error.as_deref()),
         );
         self.write_status_file(status_path, &status).await;
 
@@ -296,19 +448,19 @@ impl BackgroundTaskManager {
         } else {
             output
         };
-        Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+        self.publish_completion_once(BackgroundTaskCompleted {
             task_id: status.task_id.clone(),
             tool_name: status.tool_name.clone(),
             display_name: status.display_name.clone(),
             session_id: status.session_id.clone(),
-            status: BackgroundTaskStatus::Failed,
-            exit_code: None,
+            status: final_status,
+            exit_code,
             output_preview,
             output_file: output_path,
             duration_secs: duration_secs.unwrap_or_default(),
             notify: status.notify,
             wake: status.wake,
-        }));
+        });
 
         status
     }
@@ -344,6 +496,274 @@ impl BackgroundTaskManager {
             }
             self.finalize_orphaned_status_if_needed(status, &path).await;
             reconciled += 1;
+        }
+        reconciled
+    }
+
+    /// Reconcile running swarm background tasks from the server's durable plan
+    /// snapshot. This closes the ownership-loss gap where a run_plan driver
+    /// future disappears on reload even though its worker plan later reaches a
+    /// terminal state.
+    pub async fn reconcile_swarm_plan_status(
+        &self,
+        owner_session_id: &str,
+        runtime_state: crate::orchestration_watchdog::RuntimeState,
+        swarm_status: String,
+    ) -> usize {
+        use crate::orchestration_watchdog::{ReconcileObservation, WatchStatus};
+
+        let Ok(records) = self.watchdog.list() else {
+            return 0;
+        };
+        let mut reconciled = 0;
+        for record in records.into_iter().filter(|record| {
+            record.owner_session_id == owner_session_id && !record.status.is_terminal()
+        }) {
+            // A live driver owns retries and terminal cleanup itself. Direct
+            // plan reconciliation is only the reload/ownership-loss fallback.
+            if self.is_live_task(&record.job_id) {
+                continue;
+            }
+            let status_path = self.status_path_for(&record.job_id);
+            let Some(mut status) = self.read_status_file(&status_path).await else {
+                continue;
+            };
+            if status.tool_name != "swarm" || status.status != BackgroundTaskStatus::Running {
+                continue;
+            }
+            let Ok(Some(lease)) = self
+                .watchdog
+                .claim_due_check(&record.job_id, "swarm-plan-watchdog")
+            else {
+                continue;
+            };
+            let observation = ReconcileObservation {
+                runtime_state: runtime_state.clone(),
+                process_running: status.pid.map(crate::platform::is_process_running),
+                swarm_status: Some(swarm_status.clone()),
+                retries_exhausted: runtime_state
+                    == crate::orchestration_watchdog::RuntimeState::Failed,
+                observed_at: Utc::now(),
+            };
+            let result = self.watchdog.reconcile(&record.job_id, observation);
+            let _ = self.watchdog.finish_check(&record.job_id, &lease.lease_id);
+            let Ok(record) = result else {
+                continue;
+            };
+            reconciled += 1;
+            if !record.status.is_terminal() {
+                continue;
+            }
+
+            let completed_at = Utc::now();
+            let background_status = if record.status == WatchStatus::Completed {
+                BackgroundTaskStatus::Completed
+            } else {
+                BackgroundTaskStatus::Failed
+            };
+            let error = (background_status == BackgroundTaskStatus::Failed)
+                .then(|| format!("Swarm plan reconciled as {}", swarm_status));
+            status.status = background_status.clone();
+            let exit_code = (background_status == BackgroundTaskStatus::Completed).then_some(0);
+            status.exit_code = exit_code;
+            status.error = error.clone();
+            status.completed_at = Some(completed_at.to_rfc3339());
+            status.duration_secs = Self::status_duration_secs(&status.started_at, completed_at);
+            push_task_event(
+                &mut status,
+                terminal_event_record(background_status.clone(), exit_code, error.as_deref()),
+            );
+            self.write_status_file(&status_path, &status).await;
+
+            let output_path = self.output_path_for(&status.task_id);
+            let mut output_preview = fs::read_to_string(&output_path).await.unwrap_or_default();
+            if output_preview.len() > 500 {
+                output_preview = format!("{}...", crate::util::truncate_str(&output_preview, 500));
+            }
+            if !output_preview.is_empty() {
+                output_preview.push_str("\n\n");
+            }
+            output_preview.push_str(&format!("Swarm watchdog: {swarm_status}"));
+            self.publish_completion_once(BackgroundTaskCompleted {
+                task_id: status.task_id.clone(),
+                tool_name: status.tool_name.clone(),
+                display_name: status.display_name.clone(),
+                session_id: status.session_id.clone(),
+                status: background_status,
+                exit_code: status.exit_code,
+                output_preview,
+                output_file: output_path,
+                duration_secs: status.duration_secs.unwrap_or_default(),
+                notify: status.notify,
+                wake: status.wake,
+            });
+        }
+        reconciled
+    }
+
+    /// Reconcile every durable background watch against its persisted status,
+    /// process liveness, repository, and expected artifacts. This is safe to run
+    /// repeatedly and concurrently: check leases coalesce duplicate schedulers,
+    /// while terminal delivery uses a durable exactly-once claim.
+    pub async fn reconcile_watchdog_tasks(&self) -> usize {
+        use crate::orchestration_watchdog::{ReconcileObservation, RuntimeState, WatchStatus};
+
+        let Ok(records) = self.watchdog.list() else {
+            return 0;
+        };
+        let mut reconciled = 0;
+
+        for record in records {
+            let status_path = self.status_path_for(&record.job_id);
+            let Some(mut status) = self.read_status_file(&status_path).await else {
+                if !record.status.is_terminal()
+                    && let Ok(Some(lease)) = self
+                        .watchdog
+                        .claim_due_check(&record.job_id, "background-watchdog")
+                {
+                    let reconciled_record = self.watchdog.reconcile(
+                        &record.job_id,
+                        ReconcileObservation::runtime(RuntimeState::Unknown),
+                    );
+                    let _ = self.watchdog.finish_check(&record.job_id, &lease.lease_id);
+                    if let Ok(reconciled_record) = reconciled_record
+                        && reconciled_record.status.is_terminal()
+                    {
+                        let status = if reconciled_record.status == WatchStatus::Completed {
+                            BackgroundTaskStatus::Completed
+                        } else {
+                            BackgroundTaskStatus::Failed
+                        };
+                        let output_preview = if reconciled_record.completion_evidence.is_empty() {
+                            "Watchdog reached a terminal state after the original status file was lost."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Watchdog evidence:\n{}",
+                                reconciled_record.completion_evidence.join("\n")
+                            )
+                        };
+                        self.publish_completion_once(BackgroundTaskCompleted {
+                            task_id: reconciled_record.job_id.clone(),
+                            tool_name: "orchestration_watchdog".to_string(),
+                            display_name: Some("recovered orchestration watch".to_string()),
+                            session_id: reconciled_record.owner_session_id.clone(),
+                            status,
+                            exit_code: None,
+                            output_preview,
+                            output_file: self.output_path_for(&reconciled_record.job_id),
+                            duration_secs: (Utc::now() - reconciled_record.created_at)
+                                .to_std()
+                                .map(|duration| duration.as_secs_f64())
+                                .unwrap_or_default(),
+                            notify: true,
+                            wake: true,
+                        });
+                    }
+                } else if record.status.is_terminal() {
+                    let status = if record.status == WatchStatus::Completed {
+                        BackgroundTaskStatus::Completed
+                    } else {
+                        BackgroundTaskStatus::Failed
+                    };
+                    self.publish_completion_once(BackgroundTaskCompleted {
+                        task_id: record.job_id.clone(),
+                        tool_name: "orchestration_watchdog".to_string(),
+                        display_name: Some("recovered orchestration watch".to_string()),
+                        session_id: record.owner_session_id.clone(),
+                        status,
+                        exit_code: None,
+                        output_preview: if record.completion_evidence.is_empty() {
+                            "Recovered terminal orchestration watch pending delivery.".to_string()
+                        } else {
+                            format!(
+                                "Watchdog evidence:\n{}",
+                                record.completion_evidence.join("\n")
+                            )
+                        },
+                        output_file: self.output_path_for(&record.job_id),
+                        duration_secs: (Utc::now() - record.created_at)
+                            .to_std()
+                            .map(|duration| duration.as_secs_f64())
+                            .unwrap_or_default(),
+                        notify: true,
+                        wake: true,
+                    });
+                }
+                continue;
+            };
+
+            if status.status == BackgroundTaskStatus::Running {
+                status = self
+                    .finalize_detached_status_if_needed(status, &status_path)
+                    .await;
+                status = self
+                    .finalize_orphaned_status_if_needed(status, &status_path)
+                    .await;
+            }
+
+            if status.status == BackgroundTaskStatus::Running {
+                let Ok(Some(lease)) = self
+                    .watchdog
+                    .claim_due_check(&record.job_id, "background-watchdog")
+                else {
+                    continue;
+                };
+                let runtime = if status.detached
+                    && status.pid.is_some_and(crate::platform::is_process_running)
+                {
+                    RuntimeState::Running
+                } else if Self::status_is_reconcilable_orphan(&status) {
+                    RuntimeState::OwnershipLost
+                } else {
+                    RuntimeState::Running
+                };
+                let observation = ReconcileObservation {
+                    runtime_state: runtime,
+                    process_running: status.pid.map(crate::platform::is_process_running),
+                    swarm_status: (status.tool_name == "swarm").then(|| "running".to_string()),
+                    retries_exhausted: false,
+                    observed_at: Utc::now(),
+                };
+                let _ = self.watchdog.reconcile(&record.job_id, observation);
+                let _ = self.watchdog.finish_check(&record.job_id, &lease.lease_id);
+                reconciled += 1;
+                continue;
+            }
+
+            let output_path = self.output_path_for(&status.task_id);
+            let output = fs::read_to_string(&output_path).await.unwrap_or_default();
+            let output_preview = if output.len() > 500 {
+                format!("{}...", crate::util::truncate_str(&output, 500))
+            } else {
+                output
+            };
+            self.publish_completion_once(BackgroundTaskCompleted {
+                task_id: status.task_id.clone(),
+                tool_name: status.tool_name.clone(),
+                display_name: status.display_name.clone(),
+                session_id: status.session_id.clone(),
+                status: status.status.clone(),
+                exit_code: status.exit_code,
+                output_preview,
+                output_file: output_path,
+                duration_secs: status.duration_secs.unwrap_or_default(),
+                notify: status.notify,
+                wake: status.wake,
+            });
+            if matches!(
+                record.status,
+                WatchStatus::Watching | WatchStatus::RetryScheduled
+            ) {
+                reconciled += 1;
+            }
+        }
+
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+        if let Err(error) = self.watchdog.cleanup_terminal_before(cutoff) {
+            crate::logging::warn(&format!(
+                "Failed to clean stale orchestration watches: {error}"
+            ));
         }
         reconciled
     }
@@ -399,6 +819,7 @@ impl BackgroundTaskManager {
             stall_wake_seconds: None,
         };
         self.write_status_file(&info.status_file, &status).await;
+        self.register_watch(&info.task_id, session_id, Some(pid));
         Self::publish_task_started_activity(
             &info.task_id,
             tool_name,
@@ -471,6 +892,7 @@ impl BackgroundTaskManager {
         if let Ok(json) = serde_json::to_string_pretty(&initial_status) {
             let _ = std::fs::write(&status_path, json);
         }
+        self.register_watch(&task_id, session_id, Some(std::process::id()));
         Self::publish_task_started_activity(
             &task_id,
             tool_name,
@@ -489,6 +911,7 @@ impl BackgroundTaskManager {
         let started_at_rfc3339_for_task = started_at_rfc3339.clone();
         let (delivery_flags_tx, delivery_flags_rx) = watch::channel((notify, wake));
         let tasks_for_prune = Arc::clone(&self.tasks);
+        let manager = self.clone();
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Spawn the background task
@@ -576,7 +999,7 @@ impl BackgroundTaskManager {
                 .unwrap_or_default();
 
             // Publish completion event to the bus
-            Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+            manager.publish_completion_once(BackgroundTaskCompleted {
                 task_id: task_id_clone,
                 tool_name: tool_name_owned,
                 display_name: display_name_owned,
@@ -588,7 +1011,7 @@ impl BackgroundTaskManager {
                 duration_secs,
                 notify: notify_flag,
                 wake: wake_flag,
-            }));
+            });
 
             result
         });
@@ -675,6 +1098,7 @@ impl BackgroundTaskManager {
         if let Ok(json) = serde_json::to_string_pretty(&initial_status) {
             let _ = std::fs::write(&status_path, json);
         }
+        self.register_watch(&task_id, session_id, Some(std::process::id()));
         Self::publish_task_started_activity(
             &task_id,
             tool_name,
@@ -693,6 +1117,7 @@ impl BackgroundTaskManager {
         let display_name_owned = initial_status.display_name.clone();
         let (delivery_flags_tx, delivery_flags_rx) = watch::channel((notify, wake));
         let tasks_for_prune = Arc::clone(&self.tasks);
+        let manager = self.clone();
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         let wrapper_handle = tokio::spawn(async move {
@@ -777,7 +1202,7 @@ impl BackgroundTaskManager {
                 output_text
             };
 
-            Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+            manager.publish_completion_once(BackgroundTaskCompleted {
                 task_id: task_id_clone,
                 tool_name: tool_name_owned,
                 display_name: display_name_owned,
@@ -789,7 +1214,7 @@ impl BackgroundTaskManager {
                 duration_secs,
                 notify: notify_flag,
                 wake: wake_flag,
-            }));
+            });
 
             Ok(TaskResult {
                 exit_code,

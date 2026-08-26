@@ -29,9 +29,10 @@ pub(super) async fn dispatch_background_task_completion(
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
     let notification = format_background_task_notification_markdown(task);
+    let mut delivered = !task.notify && !task.wake;
 
-    if task.notify
-        && fanout_session_event(
+    if task.notify {
+        let notified = fanout_session_event(
             swarm_members,
             &task.session_id,
             ServerEvent::Notification {
@@ -45,17 +46,19 @@ pub(super) async fn dispatch_background_task_completion(
                 message: notification.clone(),
             },
         )
-        .await
-            == 0
-    {
-        crate::logging::warn(&format!(
-            "Failed to notify attached clients for background task completion on session {}",
-            task.session_id
-        ));
+        .await;
+        if notified == 0 {
+            crate::logging::warn(&format!(
+                "Failed to notify attached clients for background task completion on session {}",
+                task.session_id
+            ));
+        } else {
+            delivered = true;
+        }
     }
 
-    if task.wake
-        && !run_live_turn_if_idle(
+    if task.wake {
+        let woke = run_live_turn_if_idle(
             &task.session_id,
             &notification,
             Some(
@@ -71,20 +74,37 @@ pub(super) async fn dispatch_background_task_completion(
                 swarm_event_tx,
             ),
         )
-        .await
-        && !queue_soft_interrupt_for_session(
-            &task.session_id,
-            notification.clone(),
-            false,
-            SoftInterruptSource::BackgroundTask,
-            soft_interrupt_queues,
-            sessions,
-        )
-        .await
+        .await;
+        let queued = if woke {
+            false
+        } else {
+            queue_soft_interrupt_for_session(
+                &task.session_id,
+                notification.clone(),
+                false,
+                SoftInterruptSource::BackgroundTask,
+                soft_interrupt_queues,
+                sessions,
+            )
+            .await
+        };
+        if woke || queued {
+            delivered = true;
+        } else {
+            crate::logging::warn(&format!(
+                "Failed to deliver background task completion to session {}",
+                task.session_id
+            ));
+        }
+    }
+
+    if delivered
+        && let Err(error) = crate::orchestration_watchdog::OrchestrationWatchdog::new()
+            .acknowledge_claimed_delivery(&task.task_id)
     {
         crate::logging::warn(&format!(
-            "Failed to deliver background task completion to session {}",
-            task.session_id
+            "Failed to acknowledge watchdog delivery for background task {}: {}",
+            task.task_id, error
         ));
     }
 }
