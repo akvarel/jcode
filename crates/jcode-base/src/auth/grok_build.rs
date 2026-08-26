@@ -8,7 +8,7 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const CLI_PATH_ENV: &str = "JCODE_GROK_CLI_PATH";
 const PRIMARY_BASE_URL: &str = "https://x.ai/cli";
@@ -139,23 +139,13 @@ pub async fn complete_device_login(
 }
 
 fn save_tokens(tokens: TokenResponse) -> Result<()> {
-    let claims = tokens
-        .access_token
-        .split('.')
-        .nth(1)
-        .and_then(|part| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(part)
-                .ok()
-        })
-        .and_then(|bytes| serde_json::from_slice::<JwtClaims>(&bytes).ok())
-        .unwrap_or_default();
+    let claims = decode_claims(&tokens.access_token);
     let now = chrono::Utc::now();
     let credential = StoredCredential {
         key: tokens.access_token,
         auth_mode: "oidc",
         create_time: now.to_rfc3339(),
-        user_id: claims.sub.unwrap_or_default(),
+        user_id: claims.sub.unwrap_or(String::from("")),
         email: claims.email,
         coding_data_retention_opt_out: false,
         first_name: claims.given_name,
@@ -174,12 +164,7 @@ fn save_tokens(tokens: TokenResponse) -> Result<()> {
     .context("No home directory available for Grok Build credentials")?;
     std::fs::create_dir_all(&home)?;
     let path = home.join("auth.json");
-    let mut credentials = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| {
-            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).ok()
-        })
-        .unwrap_or_default();
+    let mut credentials = load_credentials(&path);
     credentials.insert(
         format!("{OAUTH_ISSUER}::{OAUTH_CLIENT_ID}"),
         serde_json::to_value(credential)?,
@@ -200,6 +185,53 @@ fn grok_home(
         home.or(user_profile)
             .map(|home| PathBuf::from(home).join(".grok"))
     })
+}
+
+fn decode_claims(access_token: &str) -> JwtClaims {
+    let Some(part) = access_token.split('.').nth(1) else {
+        crate::logging::warn("Grok access token has no JWT claims segment");
+        return JwtClaims::default();
+    };
+    let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            crate::logging::warn(&format!("Cannot decode Grok JWT claims: {error}"));
+            return JwtClaims::default();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(claims) => claims,
+        Err(error) => {
+            crate::logging::warn(&format!("Cannot parse Grok JWT claims: {error}"));
+            JwtClaims::default()
+        }
+    }
+}
+
+fn load_credentials(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return serde_json::Map::new();
+        }
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Cannot read existing Grok credentials {}: {error}",
+                path.display()
+            ));
+            return serde_json::Map::new();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Cannot parse existing Grok credentials {}: {error}",
+                path.display()
+            ));
+            serde_json::Map::new()
+        }
+    }
 }
 
 fn managed_cli_path() -> Result<PathBuf> {
@@ -233,10 +265,7 @@ pub fn cli_available() -> bool {
 /// Backend presence alone is not authentication and must not make `/login` or
 /// `jcode auth status` claim that Grok Build is ready.
 pub fn has_cached_login() -> bool {
-    if std::env::var("GROK_DEPLOYMENT_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if matches!(std::env::var("GROK_DEPLOYMENT_KEY"), Ok(value) if !value.trim().is_empty()) {
         return true;
     }
     let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
@@ -274,7 +303,9 @@ fn platform_name() -> Result<&'static str> {
 
 fn valid_version(version: &str) -> bool {
     let mut core_and_suffix = version.splitn(2, '-');
-    let core = core_and_suffix.next().unwrap_or_default();
+    let Some(core) = core_and_suffix.next() else {
+        return false;
+    };
     let suffix_ok = core_and_suffix.next().is_none_or(|suffix| {
         !suffix.is_empty()
             && suffix
