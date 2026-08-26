@@ -429,11 +429,18 @@ pub fn reap_detached(child: std::process::Child) {
     #[cfg(unix)]
     {
         let mut child = child;
-        let _ = std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("jcode-detached-child".to_string())
             .spawn(move || {
-                let _ = child.wait();
-            });
+                if let Err(error) = child.wait() {
+                    crate::logging::warn(&format!("Cannot reap detached child process: {error}"));
+                }
+            })
+        {
+            crate::logging::warn(&format!(
+                "Cannot start detached child reaper thread: {error}"
+            ));
+        }
     }
 
     #[cfg(windows)]

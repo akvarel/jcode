@@ -2896,12 +2896,12 @@ async fn start_processing_message(
         .await
         .set_remote_active_skill(active_skill.clone())
     {
-        let skill_name = active_skill.as_deref().unwrap_or_default();
-        let _ = client_event_tx.send(ServerEvent::Error {
+        let skill_name = active_skill.as_deref().map_or("", |name| name);
+        drop(client_event_tx.send(ServerEvent::Error {
             id,
             message: format!("Skill '{skill_name}' is not installed on the server"),
             retry_after_secs: None,
-        });
+        }));
         return;
     }
 
