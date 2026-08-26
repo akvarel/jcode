@@ -43,17 +43,31 @@ pub(super) async fn run_swarm_plan_in_background(
 
     let notify = params.notify.unwrap_or(true);
     let wake = params.wake.unwrap_or(true);
-    let model_fallbacks = params.model_fallbacks.clone().unwrap_or_default();
+    let model_fallbacks = params
+        .model_fallbacks
+        .clone()
+        .unwrap_or(Vec::with_capacity(0));
     let max_retries = params.max_retries.unwrap_or(model_fallbacks.len() as u32);
     let retry_backoff_secs = params.retry_backoff_secs.unwrap_or(30).max(1);
     let retry_models_for_run = model_fallbacks.clone();
     let initial_model = params.model.clone();
     let expected_sha = params.expected_sha.clone();
-    let expected_artifacts = params.expected_artifacts.clone().unwrap_or_default();
-    let working_dir = ctx
-        .working_dir
+    let expected_artifacts = params
+        .expected_artifacts
         .clone()
-        .or_else(|| std::env::current_dir().ok());
+        .unwrap_or(Vec::with_capacity(0));
+    let working_dir = match ctx.working_dir.clone() {
+        Some(path) => Some(path),
+        None => match std::env::current_dir() {
+            Ok(path) => Some(path),
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot resolve run_plan working directory for watchdog registration: {error}"
+                ));
+                None
+            }
+        },
+    };
     let watch_deadline = chrono::Utc::now()
         + chrono::Duration::minutes(params.timeout_minutes.unwrap_or(60).max(1) as i64);
     // Keep the display name free of the "·" separator used by the background
@@ -98,10 +112,10 @@ pub(super) async fn run_swarm_plan_in_background(
                                     retry_index,
                                     max_retries,
                                     delay,
-                                    next_model
-                                        .as_deref()
-                                        .map(|model| format!(" with model {model}"))
-                                        .unwrap_or_default()
+                                    match next_model.as_deref() {
+                                        Some(model) => format!(" with model {model}"),
+                                        None => String::new(),
+                                    }
                                 ))
                                 .await;
                             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
