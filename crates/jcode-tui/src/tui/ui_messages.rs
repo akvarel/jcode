@@ -1651,14 +1651,14 @@ fn render_todo_plan_update(
             .as_ref()
             .and_then(|plan| plan.understands_user_intent),
     );
-    if !update
+    let understanding_changed = update
         .fields
-        .contains(&crate::todo::TodoPlanField::UnderstandsUserIntent)
-        && !(intent_is_unclear
-            && update
-                .fields
-                .contains(&crate::todo::TodoPlanField::UserIntention))
-    {
+        .contains(&crate::todo::TodoPlanField::UnderstandsUserIntent);
+    let unclear_intention_changed = intent_is_unclear
+        && update
+            .fields
+            .contains(&crate::todo::TodoPlanField::UserIntention);
+    if !(understanding_changed || unclear_intention_changed) {
         return Vec::new();
     }
     let centered = markdown::center_code_blocks();
