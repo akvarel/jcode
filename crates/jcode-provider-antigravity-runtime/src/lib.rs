@@ -523,7 +523,7 @@ impl Provider for AntigravityProvider {
                         match retried {
                             Ok(response) => response,
                             Err(retry_err) => {
-                                let _ = tx.send(Err(retry_err)).await;
+                                drop(tx.send(Err(retry_err)).await);
                                 return;
                             }
                         }
@@ -616,11 +616,12 @@ impl Provider for AntigravityProvider {
                     }
                 };
                 if jcode_provider_antigravity::is_pseudo_tool_call_turn(&response) {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
+                    drop(
+                        tx.send(Err(anyhow::anyhow!(
                             "Antigravity returned a textual pseudo-tool call after a forced native-call retry; start a new turn or choose another model"
                         )))
-                        .await;
+                        .await,
+                    );
                     return;
                 }
             }

@@ -1813,7 +1813,7 @@ impl App {
             };
             let url = authorization.verification_uri_complete.as_deref()
                 .unwrap_or(&authorization.verification_uri);
-            let _ = Self::open_auth_browser(url);
+            Self::open_auth_browser(url);
             publish_progress(format!(
                 "Grok Build Login\n\nOpen: {}\n\nConfirm code: {}\n\nWaiting for authorization...",
                 authorization.verification_uri, authorization.user_code

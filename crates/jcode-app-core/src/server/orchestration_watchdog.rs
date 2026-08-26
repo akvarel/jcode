@@ -50,11 +50,24 @@ pub(super) fn spawn(server: &Server) {
     let watchdog_swarm_coordinators = Arc::clone(&server.swarm_state.coordinators);
     let watchdog_swarm_members = Arc::clone(&server.swarm_state.members);
     tokio::spawn(async move {
-        let interval_secs = std::env::var("JCODE_ORCHESTRATION_WATCHDOG_INTERVAL_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(30);
+        let interval_secs = match std::env::var("JCODE_ORCHESTRATION_WATCHDOG_INTERVAL_SECS") {
+            Ok(value) => match value.parse::<u64>() {
+                Ok(value) if value > 0 => value,
+                Ok(_) | Err(_) => {
+                    crate::logging::warn(
+                        "Ignoring invalid JCODE_ORCHESTRATION_WATCHDOG_INTERVAL_SECS; using 30s",
+                    );
+                    30
+                }
+            },
+            Err(std::env::VarError::NotPresent) => 30,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot read JCODE_ORCHESTRATION_WATCHDOG_INTERVAL_SECS: {error}; using 30s"
+                ));
+                30
+            }
+        };
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

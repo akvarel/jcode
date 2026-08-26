@@ -85,7 +85,10 @@ impl FileTree {
                 if name == ".git" || name == "target" || name == "node_modules" {
                     return None;
                 }
-                let directory = item.file_type().ok()?.is_dir();
+                let directory = match item.file_type() {
+                    Ok(file_type) => file_type.is_dir(),
+                    Err(_) => return None,
+                };
                 Some(Entry {
                     path: item.path(),
                     name,
