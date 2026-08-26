@@ -3,6 +3,7 @@
 use super::{
     FileAccess, Server, SessionInterruptQueues, SwarmMember, dispatch_background_task_completion,
     file_activity_scope_label, persist_swarm_state_snapshot, remove_session_entry,
+    swarm_watch_runtime, swarm_watch_status,
 };
 use crate::agent::Agent;
 use crate::bus::{
@@ -75,6 +76,25 @@ fn file_activity_scope_label_classifies_overlap() {
 
     let current = file_touch_with_summary(None);
     assert_eq!(file_activity_scope_label(&previous, &current), "same file");
+}
+
+#[test]
+fn swarm_watch_runtime_reconciles_running_success_and_failure() {
+    use crate::orchestration_watchdog::RuntimeState;
+
+    let mut summary = crate::protocol::PlanGraphStatus::empty_for_swarm("swarm-watch");
+    summary.item_count = 2;
+    summary.active_ids = vec!["node-a".to_string()];
+    assert_eq!(swarm_watch_runtime(&summary, 1), RuntimeState::Running);
+
+    summary.active_ids.clear();
+    summary.completed_ids = vec!["node-a".to_string(), "node-b".to_string()];
+    assert_eq!(swarm_watch_runtime(&summary, 0), RuntimeState::Completed);
+
+    summary.completed_ids = vec!["node-a".to_string()];
+    summary.failed_ids = vec!["node-b".to_string()];
+    assert_eq!(swarm_watch_runtime(&summary, 0), RuntimeState::Failed);
+    assert!(swarm_watch_status("swarm-watch", &summary, 0).contains("failed=1"));
 }
 
 #[tokio::test]
