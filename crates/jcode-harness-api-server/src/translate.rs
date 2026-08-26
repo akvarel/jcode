@@ -15,6 +15,8 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod best_effort;
+mod content;
 /// Default number of messages a `peek_session` returns. A preview is a glance,
 /// so this is a tail rather than a transcript: enough to recognise which
 /// conversation it is, few enough that peeking a dozen sessions stays cheap.
@@ -54,24 +56,6 @@ const MAX_WALK_FILES: usize = 20_000;
 const MAX_WALK_ENTRIES: usize = 50_000;
 const MAX_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Flatten a stored message's `content` to plain text.
-///
-/// The daemon writes content either as a bare string or as an array of typed
-/// blocks, so both shapes are accepted; anything without text (a tool call, an
-/// image) contributes nothing rather than a placeholder.
-fn flatten_content(content: &Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.to_string();
-    }
-    let Some(blocks) = content.as_array() else {
-        return String::new();
-    };
-    blocks
-        .iter()
-        .filter_map(|block| block["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("")
-}
 use serde_json::{Value, json};
 
 /// Where a translated client request should go.
@@ -999,7 +983,10 @@ impl BridgeState {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| session(self)),
-                images: serde_json::from_value(event["images"].clone()).unwrap_or_default(),
+                images: best_effort::result_or(
+                    serde_json::from_value(event["images"].clone()),
+                    Vec::new(),
+                ),
             })],
             "tokens" => vec![ServerFrame::event(ApiEvent::TokenUsage {
                 session_id: session(self),
@@ -1117,9 +1104,8 @@ impl BridgeState {
                 let Some(api_id) = self.take_simple(id, SimpleKind::History) else {
                     return vec![];
                 };
-                let messages = event["messages"]
-                    .as_array()
-                    .map(|messages| {
+                let messages = best_effort::option_or(
+                    event["messages"].as_array().map(|messages| {
                         messages
                             .iter()
                             .map(|m| HistoryMessage {
@@ -1127,9 +1113,13 @@ impl BridgeState {
                                 content: m["content"].as_str().unwrap_or("").to_string(),
                             })
                             .collect()
-                    })
-                    .unwrap_or_default();
-                let images = serde_json::from_value(event["images"].clone()).unwrap_or_default();
+                    }),
+                    Vec::new(),
+                );
+                let images = best_effort::result_or(
+                    serde_json::from_value(event["images"].clone()),
+                    Vec::new(),
+                );
                 vec![ServerFrame::reply(
                     api_id,
                     ApiEvent::History {
@@ -1474,15 +1464,15 @@ impl BridgeState {
         // fields, or be mid-write), and the only cost is missing metadata, so
         // this degrades rather than failing the whole session list or attach.
         const WINDOW: usize = 64 * 1024;
-        let mut file = std::fs::File::open(path).ok()?;
-        let len = file.metadata().ok()?.len();
-        let head_len = usize::try_from(len.min(WINDOW as u64)).ok()?;
+        let mut file = best_effort::option(std::fs::File::open(path))?;
+        let len = best_effort::option(file.metadata())?.len();
+        let head_len = best_effort::option(usize::try_from(len.min(WINDOW as u64)))?;
         let mut head = vec![0; head_len];
-        file.read_exact(&mut head).ok()?;
+        best_effort::option(file.read_exact(&mut head))?;
         let tail = if len > WINDOW as u64 {
-            file.seek(SeekFrom::End(-(WINDOW as i64))).ok()?;
+            best_effort::option(file.seek(SeekFrom::End(-(WINDOW as i64))))?;
             let mut tail = vec![0; WINDOW];
-            file.read_exact(&mut tail).ok()?;
+            best_effort::option(file.read_exact(&mut tail))?;
             tail
         } else {
             Vec::new()
@@ -1615,21 +1605,23 @@ impl BridgeState {
         ) else {
             return Vec::new();
         };
-        statement
-            .query_map([], |row| {
-                Ok(RecentSessionIndexEntry {
-                    session_id: row.get(0)?,
-                    working_dir: row.get(1)?,
-                    generated_title: row.get(2)?,
-                    custom_title: row.get(3)?,
-                    todo_title: row.get(4)?,
-                    saved: row.get(5)?,
-                    updated_at_ms: row.get(6)?,
-                    last_active_at_ms: row.get(7)?,
+        best_effort::result_or(
+            statement
+                .query_map([], |row| {
+                    Ok(RecentSessionIndexEntry {
+                        session_id: row.get(0)?,
+                        working_dir: row.get(1)?,
+                        generated_title: row.get(2)?,
+                        custom_title: row.get(3)?,
+                        todo_title: row.get(4)?,
+                        saved: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                        last_active_at_ms: row.get(7)?,
+                    })
                 })
-            })
-            .and_then(|rows| rows.collect())
-            .unwrap_or_default()
+                .and_then(|rows| rows.collect()),
+            Vec::new(),
+        )
     }
 
     fn write_bootstrap_recent_session_index(ids: &[(SystemTime, String)]) {
@@ -1643,12 +1635,17 @@ impl BridgeState {
             return;
         };
         for (modified, session_id) in ids.iter().take(500) {
-            let metadata = Self::resolve_session_metadata(session_id).unwrap_or_default();
-            let updated_at_ms = modified
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-                .unwrap_or_default();
-            let _ = transaction.execute(
+            let metadata = best_effort::option_or(
+                Self::resolve_session_metadata(session_id),
+                PersistedSessionMetadata::default(),
+            );
+            let updated_at_ms = best_effort::result_or(
+                modified.duration_since(UNIX_EPOCH),
+                std::time::Duration::ZERO,
+            )
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+            drop(transaction.execute(
                 "INSERT INTO recent_sessions (
                      session_id, working_dir, generated_title, custom_title,
                      todo_title, updated_at_ms, last_active_at_ms
@@ -1661,9 +1658,9 @@ impl BridgeState {
                     metadata.custom_title,
                     updated_at_ms,
                 ],
-            );
+            ));
         }
-        let _ = transaction.commit();
+        drop(transaction.commit());
     }
 
     fn stored_session_ids(limit: Option<usize>) -> Vec<String> {
@@ -1719,7 +1716,7 @@ impl BridgeState {
                 })
             });
             handles
-                .flat_map(|handle| handle.join().unwrap_or_default())
+                .flat_map(|handle| best_effort::result_or(handle.join(), Vec::new()))
                 .collect::<Vec<_>>()
         });
         ids.sort_unstable_by(|left, right| right.0.cmp(&left.0));
@@ -2287,7 +2284,7 @@ impl BridgeState {
                 if role != "user" && role != "assistant" {
                     return None;
                 }
-                let content = flatten_content(&message["content"]);
+                let content = content::flatten(&message["content"]);
                 (!content.trim().is_empty()).then(|| HistoryMessage {
                     role: role.to_string(),
                     content,

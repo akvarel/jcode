@@ -499,7 +499,7 @@ pub(super) async fn handle_set_feature(
             }
 
             if enabled {
-                let _ = working_dir;
+                drop(working_dir);
                 let new_swarm_id = swarm_id_for_session(client_session_id);
                 if let Some(ref id) = new_swarm_id {
                     {

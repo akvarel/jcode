@@ -3,17 +3,21 @@ use std::sync::OnceLock;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn url_regex() -> Option<&'static Regex> {
-    static URL_REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    static URL_REGEX: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
     URL_REGEX
-        .get_or_init(|| Regex::new(r#"(?i)(?:https?://|mailto:|file://)[^\s<>'\"]+"#).ok())
+        .get_or_init(|| Regex::new(r#"(?i)(?:https?://|mailto:|file://)[^\s<>'\"]+"#))
         .as_ref()
+        .into_iter()
+        .next()
 }
 
 fn markdown_link_regex() -> Option<&'static Regex> {
-    static MARKDOWN_LINK_REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    static MARKDOWN_LINK_REGEX: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
     MARKDOWN_LINK_REGEX
-        .get_or_init(|| Regex::new(r#"\[([^]\n]+)\]\(([^\s)]+)(?:\s+[^)]*)?\)"#).ok())
+        .get_or_init(|| Regex::new(r#"\[([^]\n]+)\]\(([^\s)]+)(?:\s+[^)]*)?\)"#))
         .as_ref()
+        .into_iter()
+        .next()
 }
 
 pub(crate) fn trim_url_candidate(candidate: &str) -> &str {
