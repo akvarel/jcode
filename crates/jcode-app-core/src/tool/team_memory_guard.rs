@@ -137,10 +137,11 @@ fn split_entries(text: &str) -> Vec<&str> {
     let mut entries = Vec::new();
     let mut start = None;
     for (offset, line) in text.match_indices("## ") {
-        if (offset == 0 || text.as_bytes().get(offset - 1) == Some(&b'\n')) && line == "## " {
-            if let Some(previous) = start.replace(offset) {
-                entries.push(&text[previous..offset]);
-            }
+        if (offset == 0 || text.as_bytes().get(offset - 1) == Some(&b'\n'))
+            && line == "## "
+            && let Some(previous) = start.replace(offset)
+        {
+            entries.push(&text[previous..offset]);
         }
     }
     if let Some(start) = start {
