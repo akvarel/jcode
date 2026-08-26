@@ -3,6 +3,7 @@ use jcode_storage as storage;
 mod lifecycle;
 pub mod onboarding_trace;
 mod state_support;
+mod transport;
 use chrono::{DateTime, NaiveDate, Utc};
 use jcode_usage_types::{
     AuthEvent, DiscoveryEvent, ErrorCounts, FeedbackEvent, InstallEvent, OnboardingStepEvent,
@@ -18,26 +19,14 @@ use lifecycle::emit_lifecycle_event;
 use serde_json::Value;
 use state_support::*;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use transport::{DeliveryMode, send_payload, send_transcript_payload};
 
-const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
-const TRANSCRIPT_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/transcript";
-const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const BACKGROUND_QUEUE_CAPACITY: usize = 2048;
 const BLOCKING_INSTALL_TIMEOUT: Duration = Duration::from_millis(1200);
 const BLOCKING_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(800);
 const TELEMETRY_SCHEMA_VERSION: u32 = 6;
 const DEFAULT_DISCOVERY_ENDPOINT: &str = "https://api.jcode.sh/v1/discovery";
-static TELEMETRY_PERMANENTLY_REJECTED: AtomicBool = AtomicBool::new(false);
-static TELEMETRY_QUEUE_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
-static TELEMETRY_BACKGROUND_SENDER: OnceLock<SyncSender<Value>> = OnceLock::new();
-static TRANSCRIPT_BACKGROUND_SENDER: OnceLock<SyncSender<Value>> = OnceLock::new();
-static TELEMETRY_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-#[cfg(test)]
-static TEST_EMITTED_PAYLOADS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryTelemetry<'a> {
@@ -401,12 +390,6 @@ impl TurnTelemetry {
             todo_gate_spike_count: 0,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DeliveryMode {
-    Background,
-    Blocking(Duration),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,179 +1232,6 @@ pub fn record_command_family(command: &str) {
         }
     }
     maybe_emit_session_start();
-}
-
-fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
-    if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
-        return false;
-    }
-    let client = TELEMETRY_HTTP_CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .user_agent(jcode_provider_core::JCODE_USER_AGENT)
-            .build()
-            .expect("telemetry HTTP client should build")
-    });
-    match client
-        .post(TELEMETRY_ENDPOINT)
-        .timeout(timeout)
-        .json(&payload)
-        .send()
-    {
-        Ok(response) if response.status().is_success() => true,
-        Ok(response) => {
-            let status = response.status();
-            if telemetry_status_is_permanent(status.as_u16()) {
-                TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
-                logging::warn(&format!(
-                    "telemetry endpoint permanently rejected payload with HTTP {status}; suppressing telemetry delivery for this process"
-                ));
-            } else {
-                logging::warn(&format!(
-                    "telemetry endpoint temporarily rejected payload with HTTP {status}"
-                ));
-            }
-            false
-        }
-        Err(err) => {
-            logging::warn(&format!("telemetry payload send failed: {err}"));
-            false
-        }
-    }
-}
-
-fn post_transcript_payload(payload: serde_json::Value, timeout: Duration) -> bool {
-    let client = TELEMETRY_HTTP_CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .user_agent(jcode_provider_core::JCODE_USER_AGENT)
-            .build()
-            .expect("telemetry HTTP client should build")
-    });
-    match client
-        .post(TRANSCRIPT_ENDPOINT)
-        .timeout(timeout)
-        .json(&payload)
-        .send()
-    {
-        Ok(response) if response.status().is_success() => true,
-        Ok(response) => {
-            logging::warn(&format!(
-                "transcript endpoint rejected upload with HTTP {}",
-                response.status()
-            ));
-            false
-        }
-        Err(err) => {
-            logging::warn(&format!("transcript upload failed: {err}"));
-            false
-        }
-    }
-}
-
-fn telemetry_status_is_permanent(status: u16) -> bool {
-    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
-}
-
-fn spawn_background_worker<F>(capacity: usize, mut deliver: F) -> std::io::Result<SyncSender<Value>>
-where
-    F: FnMut(Value) + Send + 'static,
-{
-    let (sender, receiver) = sync_channel(capacity);
-    std::thread::Builder::new()
-        .name("jcode-telemetry".to_string())
-        .spawn(move || {
-            while let Ok(payload) = receiver.recv() {
-                deliver(payload);
-            }
-        })?;
-    Ok(sender)
-}
-
-fn background_sender() -> &'static SyncSender<Value> {
-    TELEMETRY_BACKGROUND_SENDER.get_or_init(|| {
-        spawn_background_worker(BACKGROUND_QUEUE_CAPACITY, |payload| {
-            let _ = post_payload(payload, ASYNC_SEND_TIMEOUT);
-        })
-        .expect("telemetry background worker should start")
-    })
-}
-
-fn transcript_background_sender() -> &'static SyncSender<Value> {
-    TRANSCRIPT_BACKGROUND_SENDER.get_or_init(|| {
-        spawn_background_worker(64, |payload| {
-            let _ = post_transcript_payload(payload, ASYNC_SEND_TIMEOUT);
-        })
-        .expect("transcript telemetry background worker should start")
-    })
-}
-
-fn send_transcript_payload(payload: Value) -> bool {
-    #[cfg(test)]
-    {
-        if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
-            emitted.push(payload);
-        }
-        return true;
-    }
-    #[cfg(not(test))]
-    match transcript_background_sender().try_send(payload) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            logging::warn("transcript upload queue is full; dropping transcript");
-            false
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            logging::warn("transcript upload worker stopped; dropping transcript");
-            false
-        }
-    }
-}
-
-fn send_payload(payload: serde_json::Value, mode: DeliveryMode) -> bool {
-    #[cfg(test)]
-    if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
-        emitted.push(payload.clone());
-    }
-    match mode {
-        DeliveryMode::Background => {
-            if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
-                return false;
-            }
-            logging::debug("queueing telemetry payload for background delivery");
-            match background_sender().try_send(payload) {
-                Ok(()) => {
-                    TELEMETRY_QUEUE_OVERFLOW_WARNED.store(false, Ordering::Relaxed);
-                    true
-                }
-                Err(TrySendError::Full(_)) => {
-                    if !TELEMETRY_QUEUE_OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
-                        logging::warn(&format!(
-                            "telemetry background queue is full (capacity={BACKGROUND_QUEUE_CAPACITY}); dropping events until delivery catches up"
-                        ));
-                    }
-                    false
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    logging::warn("telemetry background worker stopped; dropping payload");
-                    false
-                }
-            }
-        }
-        DeliveryMode::Blocking(timeout) => {
-            logging::debug(&format!(
-                "sending telemetry payload with blocking timeout={}ms",
-                timeout.as_millis()
-            ));
-            if tokio::runtime::Handle::try_current().is_ok() {
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                std::thread::spawn(move || {
-                    let _ = tx.send(post_payload(payload, timeout));
-                });
-                rx.recv_timeout(timeout).unwrap_or(false)
-            } else {
-                post_payload(payload, timeout)
-            }
-        }
-    }
 }
 
 fn current_error_counts(state: &SessionTelemetry) -> ErrorCounts {
