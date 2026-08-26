@@ -861,6 +861,19 @@ async fn run_swarm_plan_in_background(
 
     let notify = params.notify.unwrap_or(true);
     let wake = params.wake.unwrap_or(true);
+    let model_fallbacks = params.model_fallbacks.clone().unwrap_or_default();
+    let max_retries = params.max_retries.unwrap_or(model_fallbacks.len() as u32);
+    let retry_backoff_secs = params.retry_backoff_secs.unwrap_or(30).max(1);
+    let retry_models_for_run = model_fallbacks.clone();
+    let initial_model = params.model.clone();
+    let expected_sha = params.expected_sha.clone();
+    let expected_artifacts = params.expected_artifacts.clone().unwrap_or_default();
+    let working_dir = ctx
+        .working_dir
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+    let watch_deadline = chrono::Utc::now()
+        + chrono::Duration::minutes(params.timeout_minutes.unwrap_or(60).max(1) as i64);
     // Keep the display name free of the "·" separator used by the background
     // notification markdown header, or downstream parsing mis-splits the label.
     let display_name = format!(
@@ -878,20 +891,77 @@ async fn run_swarm_plan_in_background(
             wake,
             move |output_path| async move {
                 let reporter = RunPlanReporter::background(&output_path);
-                match run_swarm_plan_to_terminal(&bg_ctx, &params, &reporter).await {
-                    Ok(output) => {
-                        reporter.finalize(&output.output).await;
-                        Ok(TaskResult::completed(Some(0)))
-                    }
-                    Err(error) => {
-                        let message = format!("run_plan failed: {}", error);
-                        reporter.finalize(&message).await;
-                        Ok(TaskResult::failed(None, message))
+                let mut run_params = params;
+                let mut retry_index = 0_u32;
+                loop {
+                    match run_swarm_plan_to_terminal(&bg_ctx, &run_params, &reporter).await {
+                        Ok(output) => {
+                            reporter.finalize(&output.output).await;
+                            break Ok(TaskResult::completed(Some(0)));
+                        }
+                        Err(error) if retry_index < max_retries => {
+                            let delay = retry_backoff_secs
+                                .saturating_mul(1_u64 << retry_index.min(31))
+                                .min(30 * 60);
+                            let next_model = retry_models_for_run
+                                .get(retry_index as usize)
+                                .cloned();
+                            if let Some(model) = next_model.as_ref() {
+                                run_params.model = Some(model.clone());
+                            }
+                            retry_index += 1;
+                            reporter
+                                .checkpoint(&format!(
+                                    "run_plan driver failed: {error}. Retrying attempt {}/{} in {}s{}.",
+                                    retry_index,
+                                    max_retries,
+                                    delay,
+                                    next_model
+                                        .as_deref()
+                                        .map(|model| format!(" with model {model}"))
+                                        .unwrap_or_default()
+                                ))
+                                .await;
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        }
+                        Err(error) => {
+                            let message = format!("run_plan failed: {}", error);
+                            reporter.finalize(&message).await;
+                            break Ok(TaskResult::failed(None, message));
+                        }
                     }
                 }
             },
         )
         .await;
+    let mut watch_models = Vec::new();
+    watch_models.push(initial_model.unwrap_or_else(|| "<inherited>".to_string()));
+    watch_models.extend(model_fallbacks);
+    let watch_update = crate::orchestration_watchdog::WatchUpdate {
+        working_dir,
+        expected_sha,
+        expected_artifacts: Some(
+            expected_artifacts
+                .into_iter()
+                .map(crate::orchestration_watchdog::ArtifactExpectation::required)
+                .collect(),
+        ),
+        deadline: Some(watch_deadline),
+        stale_after: Some(chrono::Duration::hours(24)),
+        retry: Some(crate::orchestration_watchdog::RetryPolicy {
+            max_attempts: max_retries.saturating_add(1),
+            initial_backoff_secs: retry_backoff_secs,
+            max_backoff_secs: 30 * 60,
+            model_fallbacks: watch_models,
+        }),
+        ..crate::orchestration_watchdog::WatchUpdate::default()
+    };
+    if let Err(error) = crate::background::global().configure_watch(&info.task_id, watch_update) {
+        crate::logging::warn(&format!(
+            "Failed to configure run_plan orchestration watch {}: {}",
+            info.task_id, error
+        ));
+    }
     claim.record_task(&info.task_id);
 
     let delivery_note = if wake {
@@ -1885,6 +1955,25 @@ struct CommunicateInput {
     /// threshold.
     #[serde(default)]
     tldr: Option<String>,
+    /// Per-spawn model override for spawn/assign_task/assign_next/run_plan
+    /// spawns. Takes precedence over agents.swarm_model config.
+    #[serde(default)]
+    model: Option<String>,
+    /// Ordered fallback models used by run_plan retries.
+    #[serde(default)]
+    model_fallbacks: Option<Vec<String>>,
+    /// Maximum number of run_plan retries after the initial driver failure.
+    #[serde(default)]
+    max_retries: Option<u32>,
+    /// Initial exponential retry backoff for run_plan.
+    #[serde(default)]
+    retry_backoff_secs: Option<u64>,
+    /// Expected repository HEAD for ownership-loss reconciliation.
+    #[serde(default)]
+    expected_sha: Option<String>,
+    /// Required artifact paths, relative to the run_plan working directory.
+    #[serde(default)]
+    expected_artifacts: Option<Vec<String>>,
     /// Reasoning effort for spawned agents (none|minimal|low|medium|high|xhigh|max).
     #[serde(default)]
     effort: Option<String>,
@@ -2051,6 +2140,34 @@ impl Tool for CommunicateTool {
                     "type": "string",
                     "enum": ["visible", "headless", "inline", "auto"],
                     "description": "Spawn UI mode: visible terminal, headless, inline gallery, or auto. Defaults to inline."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model for spawned agents, e.g. 'gpt-5.5' or 'claude-api:opus'. Omit to inherit; see list_models."
+                },
+                "model_fallbacks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered fallback models for run_plan retries."
+                },
+                "max_retries": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Maximum run_plan retries after the initial driver failure."
+                },
+                "retry_backoff_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Initial exponential backoff for run_plan retries."
+                },
+                "expected_sha": {
+                    "type": "string",
+                    "description": "Expected repository HEAD used when worker/session ownership is lost."
+                },
+                "expected_artifacts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required artifact paths relative to the run_plan working directory."
                 },
                 "effort": {
                     "type": "string",
