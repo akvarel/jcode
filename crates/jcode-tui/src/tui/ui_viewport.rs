@@ -1363,8 +1363,8 @@ fn windowed_min(widths: &[u16], window: usize) -> Vec<u16> {
 }
 
 /// Lines for the pinned status band: optional todos followed by exactly one
-/// compact row per retained background task. Todo content is capped so the
-/// transcript stays usable; tasks are never folded into a summary row.
+/// compact row per relevant background task. Completed tasks are shown briefly
+/// as confirmation, while running and failed tasks remain actionable.
 fn pinned_todo_band_lines(
     app: &dyn TuiState,
     width: u16,
@@ -1380,17 +1380,15 @@ fn pinned_todo_band_lines(
         .map(|task| active_background_task_line(task, width))
         .collect();
     let card_lines = if crate::config::config().display.pin_todos {
-        app.pinned_todos_payload()
-            .map(|payload| {
-                let msg = crate::tui::DisplayMessage::todos(payload.to_string());
-                super::messages::get_cached_message_lines(
-                    &msg,
-                    width,
-                    app.diff_mode(),
-                    super::messages::render_todos_message,
-                )
-            })
-            .unwrap_or_default()
+        app.pinned_todos_payload().map_or_else(Vec::new, |payload| {
+            let msg = crate::tui::DisplayMessage::todos(payload.to_string());
+            super::messages::get_cached_message_lines(
+                &msg,
+                width,
+                app.diff_mode(),
+                super::messages::render_todos_message,
+            )
+        })
     } else {
         Vec::new()
     };
@@ -1398,7 +1396,7 @@ fn pinned_todo_band_lines(
         return (Vec::new(), None);
     }
 
-    // Band budget: about a third of the viewport.
+    // Limit the pinned band to about a third of the viewport.
     let budget = ((viewport_height as usize) / 3).clamp(2, 12);
     let content_budget = budget.saturating_sub(task_lines.len()).max(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1442,8 +1440,7 @@ fn active_background_task_line(task: &crate::tui::BackgroundTaskRow, width: u16)
         format!("{}%", rounded_percent)
     };
     let filled = ((percent / 100.0) * BAR_WIDTH as f32).round() as usize;
-    let (active_bar, remaining_bar) = if task.status
-        == crate::tui::BackgroundTaskRowStatus::Failed
+    let (active_bar, remaining_bar) = if task.status == crate::tui::BackgroundTaskRowStatus::Failed
     {
         (
             "━".repeat(filled.min(BAR_WIDTH)),
@@ -1505,14 +1502,15 @@ fn set_pinned_todo_more_area(area: Option<Rect>) {
         *current = area;
     }
 }
-
 #[cfg(test)]
 pub(crate) fn set_pinned_todo_more_area_for_test(area: Option<Rect>) {
     set_pinned_todo_more_area(area);
 }
 
 pub(crate) fn pinned_todo_more_area() -> Option<Rect> {
-    PINNED_TODO_MORE_AREA.lock().ok().and_then(|area| *area)
+    *PINNED_TODO_MORE_AREA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn compute_prompt_preview_line_count(

@@ -967,7 +967,13 @@ fn load_agents_md_files_from_dirs(
 /// Load AGENTS.md files from a specific working directory.
 pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, ContextInfo) {
     let project_dir = working_dir.unwrap_or(Path::new("."));
-    let global_agents_md = crate::storage::user_home_path("AGENTS.md").ok();
+    let global_agents_md = match crate::storage::user_home_path("AGENTS.md") {
+        Ok(path) => Some(path),
+        Err(error) => {
+            crate::logging::warn(&format!("Cannot resolve global AGENTS.md path: {error}"));
+            None
+        }
+    };
     load_agents_md_files_from_dirs(project_dir, global_agents_md.as_deref())
 }
 

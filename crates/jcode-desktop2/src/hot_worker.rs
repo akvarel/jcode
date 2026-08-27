@@ -114,7 +114,9 @@ unsafe fn window_event(
     event: *mut Option<WindowEvent>,
 ) {
     // Taking the event transfers its owned strings/IME payload exactly once.
-    let event = unsafe { (&mut *event).take() }.expect("host supplied window event");
+    let Some(event) = (unsafe { (&mut *event).take() }) else {
+        return;
+    };
     unsafe { (&mut *app).worker_window_event(&*event_loop, window_id, event) };
 }
 
@@ -123,7 +125,9 @@ unsafe fn new_events(
     event_loop: *const ActiveEventLoop,
     cause: *mut Option<StartCause>,
 ) {
-    let cause = unsafe { (&mut *cause).take() }.expect("host supplied start cause");
+    let Some(cause) = (unsafe { (&mut *cause).take() }) else {
+        return;
+    };
     unsafe { (&mut *app).worker_new_events(&*event_loop, cause) };
 }
 
@@ -274,7 +278,7 @@ const fn parse_hex(value: &str) -> u64 {
                 b'0'..=b'9' => (bytes[index] - b'0') as u64,
                 b'a'..=b'f' => (bytes[index] - b'a' + 10) as u64,
                 b'A'..=b'F' => (bytes[index] - b'A' + 10) as u64,
-                _ => panic!("invalid hexadecimal build fingerprint"),
+                _ => return 0,
             };
         index += 1;
     }

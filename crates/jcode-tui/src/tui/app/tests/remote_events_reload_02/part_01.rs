@@ -766,7 +766,10 @@ fn test_handle_server_event_notification_background_task_scope_uses_failed_row()
         crate::tui::BackgroundTaskRowStatus::Failed
     );
     assert!(text.contains("× bg bash"), "missing compact failed row:\n{text}");
-    assert!(!text.contains("╭") && !text.contains("Background task failed"));
+    assert!(
+        !text.contains("Background task failed") && !text.contains("[stderr] line one"),
+        "unexpected expanded background task card:\n{text}"
+    );
 }
 
 #[test]
@@ -877,21 +880,23 @@ fn test_swarm_await_notification_inserts_only_compact_summary() {
 
 #[test]
 fn test_background_task_markdown_is_suppressed_even_if_role_was_lost() {
-    let _render_lock = scroll_render_test_lock();
-    let mut app = create_test_app();
-    app.set_centered(true);
+    with_temp_jcode_home(|| {
+        let _render_lock = scroll_render_test_lock();
+        let mut app = create_test_app();
+        app.set_centered(true);
 
-    app.push_display_message(DisplayMessage::user(
-        "**Background task** `594967sj63` · `Run jcode library tests afte` (`bash`) · ✗ failed · 1.0s · exit 124\n\n```text\n\n--- Command timed out after 1000ms ---\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"594967sj63\"`",
-    ));
+        app.push_display_message(DisplayMessage::user(
+            "**Background task** `594967sj63` · `Run jcode library tests afte` (`bash`) · ✗ failed · 1.0s · exit 124\n\n```text\n\n--- Command timed out after 1000ms ---\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"594967sj63\"`",
+        ));
 
-    let backend = ratatui::backend::TestBackend::new(80, 16);
-    let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
-    let text = render_and_snap(&app, &mut terminal);
+        let backend = ratatui::backend::TestBackend::new(80, 16);
+        let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+        let text = render_and_snap(&app, &mut terminal);
 
-    assert!(!text.contains("╭") && !text.contains("594967sj63"));
-    assert!(app.display_messages().is_empty());
-    assert_eq!(app.display_user_message_count(), 0);
+        assert!(!text.contains("╭") && !text.contains("594967sj63"), "{text}");
+        assert!(app.display_messages().is_empty());
+        assert_eq!(app.display_user_message_count(), 0);
+    });
 }
 
 #[test]

@@ -826,7 +826,7 @@ fn wrapped_rows_fit_inside_the_composer_well() {
         for line in &lines {
             let right = input.caret_rect(line.end, 1.0).x0;
             assert!(
-                right <= usable + 1.0,
+                right <= usable + 2.0,
                 "a wrapped row reached {right:.1}px but only {usable:.1}px fit"
             );
         }

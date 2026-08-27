@@ -21,7 +21,7 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 /// never read what the session that spawned it remembered. Naming the two cases
 /// makes the wrong one hard to pick by accident and obvious in review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HeadlessMemoryScope {
+pub enum HeadlessMemoryScope {
     /// Real project/global memory, scoped to the session's working directory.
     /// Correct for swarm-spawned workers, which are real user sessions.
     RealProject,
@@ -34,7 +34,7 @@ pub(super) enum HeadlessMemoryScope {
     clippy::too_many_arguments,
     reason = "headless session creation wires provider, global session, swarm state, interrupts, and MCP pool together"
 )]
-pub(super) async fn create_headless_session(
+pub async fn create_headless_session(
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn Provider>,

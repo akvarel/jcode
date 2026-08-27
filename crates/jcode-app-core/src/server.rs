@@ -8,7 +8,7 @@ mod client_comm_channels;
 mod client_comm_context;
 mod client_comm_message;
 mod client_disconnect_cleanup;
-mod client_lifecycle;
+pub mod client_lifecycle;
 mod client_lifecycle_logging;
 mod client_lightweight_control;
 mod client_session;
@@ -32,10 +32,13 @@ mod debug_swarm_read;
 mod debug_swarm_write;
 mod debug_testers;
 mod durable_state;
-mod headless;
+pub mod headless;
 mod jade_relay;
 mod lifecycle;
 mod live_turn;
+mod orchestration_watchdog;
+#[cfg(test)]
+use orchestration_watchdog::{swarm_watch_runtime, swarm_watch_status};
 mod provider_control;
 mod reload;
 mod reload_recovery;
@@ -106,7 +109,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OnceCell, RwLock, broadcast, mpsc};
 
-pub(super) type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+pub type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 pub(super) type ChannelSubscriptions =
     Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
@@ -569,7 +572,7 @@ async fn capture_runtime_memory_attribution_sample(
     sample
 }
 
-mod state;
+pub mod state;
 
 use self::state::latest_peer_touches;
 pub use self::state::{
@@ -1255,21 +1258,7 @@ impl Server {
         // indexing cost while leaving exhaustive searches available on demand.
         crate::tool::spawn_recent_index_warmup();
 
-        // Reconcile background-task status files orphaned by a previous
-        // process image (crash or exec-based reload). Non-detached tasks die
-        // with their owning process but their status files still say Running,
-        // which leaves phantom entries in `bg list` and blocks `bg wait`
-        // until timeout. Detached tasks are untouched (they survive reloads
-        // and reconcile via their real pid).
-        tokio::spawn(async move {
-            let reconciled = crate::background::global().reconcile_orphaned_tasks().await;
-            if reconciled > 0 {
-                crate::logging::info(&format!(
-                    "Marked {} orphaned background task(s) from a previous server process as failed",
-                    reconciled
-                ));
-            }
-        });
+        orchestration_watchdog::spawn(self);
 
         // Spawn reload monitor (event-driven via in-process channel).
         // In the unified server design, self-dev sessions share the main server,

@@ -614,10 +614,10 @@ export -f cargo
         }
         let workers = dir.join("desktop2-workers");
         std::fs::create_dir_all(&workers)?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        let nonce = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos(),
+            Err(_) => 0,
+        };
         let fingerprint = source
             .fingerprint
             .chars()

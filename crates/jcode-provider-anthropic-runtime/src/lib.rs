@@ -54,6 +54,9 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+mod runtime_env;
+use runtime_env::{nonempty_env, optional_u32};
+
 /// Anthropic Messages API endpoint
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -61,9 +64,8 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_URL_OAUTH: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
 fn direct_api_url() -> String {
-    let base = std::env::var("JCODE_ANTHROPIC_API_BASE")
-        .ok()
-        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
+    let base = nonempty_env("JCODE_ANTHROPIC_API_BASE")
+        .or_else(|| nonempty_env("ANTHROPIC_BASE_URL"))
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty());
     match base {
@@ -74,10 +76,7 @@ fn direct_api_url() -> String {
 }
 
 fn configured_direct_headers() -> Result<HeaderMap> {
-    let Some(raw) = std::env::var("JCODE_ANTHROPIC_HEADERS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(raw) = nonempty_env("JCODE_ANTHROPIC_HEADERS") else {
         return Ok(HeaderMap::new());
     };
     let headers: std::collections::BTreeMap<String, String> = serde_json::from_str(&raw)
@@ -94,14 +93,9 @@ fn configured_direct_headers() -> Result<HeaderMap> {
 }
 
 fn direct_auth_mode() -> String {
-    std::env::var("JCODE_ANTHROPIC_AUTH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    nonempty_env("JCODE_ANTHROPIC_AUTH")
         .unwrap_or_else(|| {
-            if std::env::var("ANTHROPIC_AUTH_TOKEN")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
+            if nonempty_env("ANTHROPIC_AUTH_TOKEN").is_some() {
                 "bearer".to_string()
             } else {
                 "header".to_string()
@@ -135,9 +129,7 @@ fn active_anthropic_profile_models() -> Option<Vec<String>> {
     let Ok(profile_name) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE") else {
         return None;
     };
-    let Some(profile) = jcode_base::config::config().providers.get(&profile_name) else {
-        return None;
-    };
+    let profile = jcode_base::config::config().providers.get(&profile_name)?;
     if !matches!(
         profile.provider_type,
         jcode_base::config::NamedProviderType::AnthropicCompatible
@@ -611,9 +603,7 @@ impl AnthropicProvider {
             })
         });
 
-        let max_tokens_override = std::env::var("JCODE_ANTHROPIC_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok());
+        let max_tokens_override = optional_u32("JCODE_ANTHROPIC_MAX_TOKENS");
         let reasoning_effort = jcode_base::config::config()
             .provider
             .anthropic_reasoning_effort
@@ -1969,6 +1959,10 @@ async fn force_refresh_oauth_token(
 }
 
 /// Stream the response from Anthropic API
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming requires transport, authentication, request, event, and session context"
+)]
 async fn stream_response(
     client: Client,
     token: String,
@@ -2281,21 +2275,21 @@ fn anthropic_model_quality_rank(model: &str) -> usize {
         .unwrap_or(jcode_provider_core::ALL_CLAUDE_MODELS.len())
 }
 
-/// Parse a server-recommended replacement model from a 404 body, e.g.
-/// "Claude Fable 5 is not available. Please use Opus 4.8." -> the catalog id
-/// `claude-opus-4-8`. Returns the best matching known catalog id, if any.
-/// `error_str` is expected to already be lowercased.
+/// Parse a server-recommended replacement model from a lowercased 404 body,
+/// mapping prose such as "Please use Opus 4.8" to a known catalog id.
 fn anthropic_recommended_model_from_error(error_str: &str) -> Option<String> {
-    // Look for the phrase after "please use" / "use " and try to match it against
-    // the known catalog by collapsing it to a comparable token form. The server
-    // phrases the recommendation in prose ("Opus 4.8"), so compare on the digits
-    // and family word rather than exact ids.
+    // Match prose after "please use" / "use " by family and version tokens.
     let hint = error_str
         .split("please use")
         .nth(1)
         .or_else(|| error_str.split("use ").nth(1))?;
-    // Take up to the next sentence boundary.
-    let hint = hint.split(['.', '!', '\n']).next().unwrap_or(hint).trim();
+    // Do not treat a version decimal such as `4.8` as a sentence boundary.
+    let sentence_end = hint.char_indices().find_map(|(index, ch)| match ch {
+        '!' | '\n' => Some(index),
+        '.' if !hint[index + 1..].starts_with(|next: char| next.is_ascii_digit()) => Some(index),
+        _ => None,
+    });
+    let hint = sentence_end.map_or(hint, |index| &hint[..index]).trim();
     if hint.is_empty() {
         return None;
     }
@@ -2314,8 +2308,7 @@ fn anthropic_recommended_model_from_error(error_str: &str) -> Option<String> {
         .filter(|candidate| !anthropic_model_is_retired(candidate))
         .map(|candidate| {
             let key = AnthropicProvider::normalized_model_key(&candidate);
-            // The catalog id uses hyphenated digits ("claude-opus-4-8"), so the
-            // hint tokens ["opus","4","8"] should all appear.
+            // Hyphenated catalog ids contain the prose hint tokens.
             let score = hint_tokens
                 .iter()
                 .filter(|token| key.contains(token.as_str()))

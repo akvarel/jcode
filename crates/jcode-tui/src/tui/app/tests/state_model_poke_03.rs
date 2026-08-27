@@ -2508,10 +2508,9 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         assert!(super::commands::is_poke_message(summary));
         assert!(super::commands::is_todo_confidence_summary_message(summary));
         assert!(summary.starts_with(crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE));
-        // The continuation self-identifies as an automated follow-up so the model
-        // does not mistake it for a user message, but never discloses private
-        // calibration details.
-        assert!(summary.contains("automated follow-up"));
+        // Compact continuations remain visibly synthetic without exposing
+        // private calibration details.
+        assert!(summary.starts_with("[auto]"));
         assert!(!summary.to_ascii_lowercase().contains("threshold"));
         // The model is told exactly which completed todos to recheck.
         assert!(summary.contains("Finish risky provider path"));
@@ -2674,20 +2673,40 @@ fn test_finish_turn_challenges_confidence_spike_once() {
         assert!(
             app.display_messages()
                 .iter()
-                .any(|msg| { msg.content.contains("Double-checking a confidence jump") })
+                .any(|msg| { msg.content.contains("Double-checking confidence jumps") })
         );
 
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
         app.is_processing = true;
-        // Pin the default so the clean second cycle disarms; this test is
-        // about challenging the spike exactly once.
-        app.auto_poke_default_on = false;
         super::local::finish_turn(&mut app);
 
-        assert!(!app.auto_poke_incomplete_todos);
-        assert!(!app.todo_confidence_spike_challenged);
+        assert!(app.auto_poke_incomplete_todos);
+        assert!(app.todo_confidence_spike_challenged);
+        assert!(app.pending_queued_dispatch);
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
+        );
+
+        // Finishing the synthetic final-response turn must not challenge the
+        // same unchanged confidence history again.
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        app.is_processing = true;
+        super::local::finish_turn(&mut app);
+
+        assert!(app.auto_poke_incomplete_todos);
+        assert!(app.todo_confidence_spike_challenged);
         assert!(!app.pending_queued_dispatch);
+        assert!(app.queued_messages.is_empty());
+        assert_eq!(
+            app.display_messages()
+                .iter()
+                .filter(|message| message.content.contains("All todos done"))
+                .count(),
+            1
+        );
     });
 }
 

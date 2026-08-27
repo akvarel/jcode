@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant as TokioInstant, MissedTickBehavior};
 
 mod model;
+mod orchestration_watchdog;
 
 pub use model::{
     BackgroundCleanupResult, BackgroundTaskEventKind, BackgroundTaskEventRecord,
@@ -33,6 +34,7 @@ use model::{
 };
 
 /// Manages background task execution
+#[derive(Clone)]
 pub struct BackgroundTaskManager {
     tasks: Arc<RwLock<HashMap<String, RunningTask>>>,
     /// Serializes progress status read-modify-write cycles so concurrent output
@@ -43,6 +45,7 @@ pub struct BackgroundTaskManager {
     /// output bytes and no progress events for the configured window.
     stall_watchdogs: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     output_dir: PathBuf,
+    watchdog: crate::orchestration_watchdog::OrchestrationWatchdog,
 }
 
 impl BackgroundTaskManager {
@@ -50,19 +53,40 @@ impl BackgroundTaskManager {
     ///
     /// Primarily for tests; production code should use [`global`].
     pub fn with_output_dir(output_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&output_dir).ok();
+        if let Err(error) = std::fs::create_dir_all(&output_dir) {
+            crate::logging::warn(&format!(
+                "Cannot create background output directory {}: {error}",
+                output_dir.display()
+            ));
+        }
+        let watchdog_root = output_dir.join("watchdog");
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress_updates: Arc::new(Mutex::new(())),
             stall_watchdogs: Arc::new(RwLock::new(HashMap::new())),
             output_dir,
+            watchdog: crate::orchestration_watchdog::OrchestrationWatchdog::with_root(
+                watchdog_root,
+            ),
         }
     }
 
     /// Create a new background task manager
     pub fn new() -> Self {
         let output_dir = task_dir();
-        Self::with_output_dir(output_dir)
+        if let Err(error) = std::fs::create_dir_all(&output_dir) {
+            crate::logging::warn(&format!(
+                "Cannot create background output directory {}: {error}",
+                output_dir.display()
+            ));
+        }
+        Self {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            progress_updates: Arc::new(Mutex::new(())),
+            stall_watchdogs: Arc::new(RwLock::new(HashMap::new())),
+            output_dir,
+            watchdog: crate::orchestration_watchdog::OrchestrationWatchdog::new(),
+        }
     }
 
     /// Generate a short, unique task ID
@@ -70,10 +94,10 @@ impl BackgroundTaskManager {
         use std::time::{SystemTime, UNIX_EPOCH};
         const TASK_ID_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis(),
+            Err(_) => 0,
+        };
         // Use last 6 digits of timestamp + 4 random chars
         let rand_part: String = (0..4)
             .map(|_| {
@@ -119,10 +143,19 @@ impl BackgroundTaskManager {
     }
 
     fn status_duration_secs(started_at: &str, completed_at: DateTime<Utc>) -> Option<f64> {
-        DateTime::parse_from_rfc3339(started_at)
-            .ok()
-            .and_then(|started| (completed_at - started.with_timezone(&Utc)).to_std().ok())
-            .map(|duration| duration.as_secs_f64())
+        let started = match DateTime::parse_from_rfc3339(started_at) {
+            Ok(started) => started,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot parse background task start timestamp {started_at:?}: {error}"
+                ));
+                return None;
+            }
+        };
+        match (completed_at - started.with_timezone(&Utc)).to_std() {
+            Ok(duration) => Some(duration.as_secs_f64()),
+            Err(_) => None,
+        }
     }
 
     fn parse_exit_code_from_output(output: &str) -> Option<i32> {
@@ -201,7 +234,7 @@ impl BackgroundTaskManager {
         } else {
             output
         };
-        Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+        self.publish_completion_once(BackgroundTaskCompleted {
             task_id: status.task_id.clone(),
             tool_name: status.tool_name.clone(),
             display_name: status.display_name.clone(),
@@ -213,7 +246,7 @@ impl BackgroundTaskManager {
             duration_secs: duration_secs.unwrap_or_default(),
             notify: status.notify,
             wake: status.wake,
-        }));
+        });
 
         status
     }
@@ -237,117 +270,6 @@ impl BackgroundTaskManager {
     /// - Files without owner metadata (written by older builds) are left
     ///   alone; only the explicit startup sweep in
     ///   [`Self::reconcile_orphaned_tasks`] handles those.
-    fn status_is_reconcilable_orphan(status: &TaskStatusFile) -> bool {
-        if status.status != BackgroundTaskStatus::Running || status.detached || status.pid.is_some()
-        {
-            return false;
-        }
-        let Some(owner_pid) = status.owner_pid else {
-            return false;
-        };
-        if status.owner_instance.as_deref() == Some(model::process_instance_token()) {
-            return false;
-        }
-        if owner_pid == std::process::id() {
-            return true;
-        }
-        !crate::platform::is_process_running(owner_pid)
-    }
-
-    /// Finalize an orphaned non-detached `Running` status file as `Failed`.
-    ///
-    /// The owning process's task future died with the process (crash or
-    /// exec-based server reload), so without this the file reads `Running`
-    /// forever: `bg list`/`bg status` show a phantom task and `bg wait`
-    /// blocks until its timeout.
-    async fn finalize_orphaned_status_if_needed(
-        &self,
-        mut status: TaskStatusFile,
-        status_path: &std::path::Path,
-    ) -> TaskStatusFile {
-        if !Self::status_is_reconcilable_orphan(&status) {
-            return status;
-        }
-        // Belt and braces: never rewrite a task this process is executing.
-        if self.is_live_task(&status.task_id) {
-            return status;
-        }
-
-        let completed_at = Utc::now();
-        let duration_secs = Self::status_duration_secs(&status.started_at, completed_at);
-        let error =
-            "Task orphaned: the owning server process exited (reloaded or crashed) before the task finished"
-                .to_string();
-        status.status = BackgroundTaskStatus::Failed;
-        status.exit_code = None;
-        status.error = Some(error.clone());
-        status.completed_at = Some(completed_at.to_rfc3339());
-        status.duration_secs = duration_secs;
-        push_task_event(
-            &mut status,
-            terminal_event_record(BackgroundTaskStatus::Failed, None, Some(&error)),
-        );
-        self.write_status_file(status_path, &status).await;
-
-        let output_path = self.output_path_for(&status.task_id);
-        let output = fs::read_to_string(&output_path).await.unwrap_or_default();
-        let output_preview = if output.len() > 500 {
-            format!("{}...", crate::util::truncate_str(&output, 500))
-        } else {
-            output
-        };
-        Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
-            task_id: status.task_id.clone(),
-            tool_name: status.tool_name.clone(),
-            display_name: status.display_name.clone(),
-            session_id: status.session_id.clone(),
-            status: BackgroundTaskStatus::Failed,
-            exit_code: None,
-            output_preview,
-            output_file: output_path,
-            duration_secs: duration_secs.unwrap_or_default(),
-            notify: status.notify,
-            wake: status.wake,
-        }));
-
-        status
-    }
-
-    /// Startup/reload sweep: mark orphaned non-detached `Running` status
-    /// files as `Failed` with a "server reloaded" note.
-    ///
-    /// Only owner-tagged files are considered, using the liveness rules of
-    /// [`Self::status_is_reconcilable_orphan`]. Files without owner metadata
-    /// (written by older builds, or by processes that legitimately still run
-    /// them) are left untouched: the task dir is shared machine-wide, so
-    /// without owner metadata there is no safe way to distinguish a phantom
-    /// from another live process's task. Returns how many files were
-    /// reconciled.
-    pub async fn reconcile_orphaned_tasks(&self) -> usize {
-        let mut reconciled = 0;
-        let Ok(mut entries) = fs::read_dir(&self.output_dir).await else {
-            return reconciled;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(status) = self.read_status_file(&path).await else {
-                continue;
-            };
-            if !Self::status_is_reconcilable_orphan(&status) {
-                continue;
-            }
-            if self.tasks.read().await.contains_key(&status.task_id) {
-                continue;
-            }
-            self.finalize_orphaned_status_if_needed(status, &path).await;
-            reconciled += 1;
-        }
-        reconciled
-    }
-
     pub fn reserve_task_info(&self) -> BackgroundTaskInfo {
         let task_id = Self::generate_task_id();
         let output_file = self.output_path_for(&task_id);
@@ -399,6 +321,7 @@ impl BackgroundTaskManager {
             stall_wake_seconds: None,
         };
         self.write_status_file(&info.status_file, &status).await;
+        self.register_watch(&info.task_id, session_id, Some(pid));
         Self::publish_task_started_activity(
             &info.task_id,
             tool_name,
@@ -471,6 +394,7 @@ impl BackgroundTaskManager {
         if let Ok(json) = serde_json::to_string_pretty(&initial_status) {
             let _ = std::fs::write(&status_path, json);
         }
+        self.register_watch(&task_id, session_id, Some(std::process::id()));
         Self::publish_task_started_activity(
             &task_id,
             tool_name,
@@ -489,6 +413,7 @@ impl BackgroundTaskManager {
         let started_at_rfc3339_for_task = started_at_rfc3339.clone();
         let (delivery_flags_tx, delivery_flags_rx) = watch::channel((notify, wake));
         let tasks_for_prune = Arc::clone(&self.tasks);
+        let manager = self.clone();
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Spawn the background task
@@ -576,7 +501,7 @@ impl BackgroundTaskManager {
                 .unwrap_or_default();
 
             // Publish completion event to the bus
-            Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+            manager.publish_completion_once(BackgroundTaskCompleted {
                 task_id: task_id_clone,
                 tool_name: tool_name_owned,
                 display_name: display_name_owned,
@@ -588,7 +513,7 @@ impl BackgroundTaskManager {
                 duration_secs,
                 notify: notify_flag,
                 wake: wake_flag,
-            }));
+            });
 
             result
         });
@@ -675,6 +600,7 @@ impl BackgroundTaskManager {
         if let Ok(json) = serde_json::to_string_pretty(&initial_status) {
             let _ = std::fs::write(&status_path, json);
         }
+        self.register_watch(&task_id, session_id, Some(std::process::id()));
         Self::publish_task_started_activity(
             &task_id,
             tool_name,
@@ -693,6 +619,7 @@ impl BackgroundTaskManager {
         let display_name_owned = initial_status.display_name.clone();
         let (delivery_flags_tx, delivery_flags_rx) = watch::channel((notify, wake));
         let tasks_for_prune = Arc::clone(&self.tasks);
+        let manager = self.clone();
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         let wrapper_handle = tokio::spawn(async move {
@@ -777,7 +704,7 @@ impl BackgroundTaskManager {
                 output_text
             };
 
-            Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+            manager.publish_completion_once(BackgroundTaskCompleted {
                 task_id: task_id_clone,
                 tool_name: tool_name_owned,
                 display_name: display_name_owned,
@@ -789,7 +716,7 @@ impl BackgroundTaskManager {
                 duration_secs,
                 notify: notify_flag,
                 wake: wake_flag,
-            }));
+            });
 
             Ok(TaskResult {
                 exit_code,
@@ -1198,18 +1125,22 @@ impl BackgroundTaskManager {
                 }
                 fired_this_episode = true;
 
-                let running_secs = DateTime::parse_from_rfc3339(&started_at)
-                    .ok()
-                    .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
-                    .map(|duration| duration.as_secs_f64())
-                    .unwrap_or_default();
-                let output_tail = fs::read_to_string(&output_path)
-                    .await
-                    .map(|output| {
+                let running_secs =
+                    Self::status_duration_secs(&started_at, Utc::now()).unwrap_or(0.0);
+                let output_tail = match fs::read_to_string(&output_path).await {
+                    Ok(output) => {
                         let tail: Vec<&str> = output.lines().rev().take(20).collect();
                         tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-                    })
-                    .unwrap_or_default();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => {
+                        crate::logging::warn(&format!(
+                            "Cannot read stalled background output {}: {error}",
+                            output_path.display()
+                        ));
+                        String::new()
+                    }
+                };
                 let output_tail = if output_tail.len() > 2000 {
                     crate::util::truncate_str(&output_tail, 2000).to_string()
                 } else {

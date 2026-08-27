@@ -185,7 +185,9 @@ async fn update_progress_keeps_the_determinate_high_water_mark() -> Result<()> {
         source: BackgroundTaskProgressSource::Reported,
     };
 
-    manager.update_progress(&info.task_id, progress(60.0)).await?;
+    manager
+        .update_progress(&info.task_id, progress(60.0))
+        .await?;
     let status = manager
         .update_progress(&info.task_id, progress(25.0))
         .await?
@@ -224,7 +226,9 @@ async fn update_progress_preserves_high_water_mark_through_reported_checkpoint()
         updated_at: Utc::now().to_rfc3339(),
         source: BackgroundTaskProgressSource::Reported,
     };
-    manager.update_progress(&info.task_id, progress.clone()).await?;
+    manager
+        .update_progress(&info.task_id, progress.clone())
+        .await?;
 
     progress.kind = BackgroundTaskProgressKind::Indeterminate;
     progress.percent = None;
@@ -248,7 +252,9 @@ async fn update_progress_preserves_high_water_mark_through_reported_checkpoint()
 #[tokio::test]
 async fn concurrent_progress_updates_cannot_overwrite_the_high_water_mark() -> Result<()> {
     let tmp = tempdir()?;
-    let manager = Arc::new(BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf()));
+    let manager = Arc::new(BackgroundTaskManager::with_output_dir(
+        tmp.path().to_path_buf(),
+    ));
     let info = manager
         .spawn_with_notify(
             "bash",
@@ -499,6 +505,38 @@ async fn reconcile_marks_orphan_from_reloaded_process_failed() -> Result<()> {
         "error should explain the reload orphaning, got: {error}"
     );
     assert!(status.completed_at.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_swarm_plan_completion_wins_over_orphan_failure() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+    let task_id = "swarmreload1";
+    let session_id = "session-swarm-reload";
+    let mut orphan = running_status_fixture(task_id, session_id);
+    orphan.owner_pid = Some(std::process::id());
+    orphan.owner_instance = Some("previous-process-image".to_string());
+    write_status_fixture(&manager, &orphan).await;
+    manager.register_watch(task_id, session_id, None);
+
+    assert_eq!(
+        manager
+            .reconcile_swarm_plan_status(
+                session_id,
+                crate::orchestration_watchdog::RuntimeState::Completed,
+                "swarm=restored completed=1 failed=0 active=0 ready=0 in_flight=0".to_string(),
+            )
+            .await,
+        1
+    );
+    let status = manager
+        .status(task_id)
+        .await
+        .ok_or_else(|| anyhow!("status should exist"))?;
+    assert_eq!(status.status, BackgroundTaskStatus::Completed);
+    assert_eq!(status.exit_code, Some(0));
+    assert_eq!(manager.reconcile_orphaned_tasks().await, 0);
     Ok(())
 }
 

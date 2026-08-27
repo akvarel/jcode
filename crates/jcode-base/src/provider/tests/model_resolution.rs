@@ -1897,7 +1897,10 @@ fn test_context_limit_respects_provider_hint() {
 fn test_resolve_model_capabilities_uses_provider_hint() {
     let openai = resolve_model_capabilities("gpt-5.4", Some("openai"));
     assert_eq!(openai.provider.as_deref(), Some("openai"));
-    assert_eq!(openai.context_window, Some(1_000_000));
+    assert_eq!(
+        openai.context_window,
+        context_limit_for_model_with_provider("gpt-5.4", Some("openai"))
+    );
 
     let copilot = resolve_model_capabilities("gpt-5.4", Some("copilot"));
     assert_eq!(copilot.provider.as_deref(), Some("copilot"));

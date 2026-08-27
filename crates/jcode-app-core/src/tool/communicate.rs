@@ -29,6 +29,7 @@ const REQUEST_ID: u64 = 1;
 /// with the server's recursive-spawn RAM safety guard).
 const LIGHT_MODE_DEFAULT_CONCURRENCY: usize = 4;
 
+mod orchestration_watchdog;
 mod transport;
 use transport::{send_request, send_request_with_timeout};
 
@@ -816,117 +817,6 @@ fn try_claim_run_plan_driver(
         session_id: session_id.to_string(),
         defused: false,
     })
-}
-
-/// Drive `run_plan` as a managed background task and return immediately.
-///
-/// The coordinating agent stays responsive: the plan loop runs inside the
-/// shared `BackgroundTaskManager` (task id, progress card, `bg` tool
-/// integration), and completion is delivered through the standard notify/wake
-/// path like any other background task.
-async fn run_swarm_plan_in_background(
-    ctx: &ToolContext,
-    params: CommunicateInput,
-) -> Result<ToolOutput> {
-    // Validate the plan inline so an empty/broken plan errors immediately
-    // instead of as a delayed background failure.
-    let initial_summary = fetch_plan_status(&ctx.session_id).await?;
-    if initial_summary.item_count == 0 {
-        return Ok(ToolOutput::new("No swarm plan items to run."));
-    }
-
-    // Refuse to start a second driver for the same session: two concurrent
-    // run_plan loops would race on assignments and double-spawn workers. The
-    // claim is check-and-insert under one lock, so two run_plan calls in the
-    // same batch cannot both pass. Only drivers live in this process count; a
-    // stale "running" status file left by a server reload must not block
-    // restarting the driver (the claim map is per-process and dead task ids
-    // fail the is_live_task check).
-    let manager = crate::background::global();
-    let claim = match try_claim_run_plan_driver(manager, &ctx.session_id) {
-        RunPlanDriverClaimResult::Claimed(claim) => claim,
-        RunPlanDriverClaimResult::AlreadyRunning(existing) => {
-            return Ok(ToolOutput::new(match existing {
-                Some(task_id) => format!(
-                    "A swarm run_plan driver is already running for this session (task {}). \
-                     Check it with `bg action=\"status\" task_id=\"{}\"` or `swarm plan_status` instead of starting another.",
-                    task_id, task_id
-                ),
-                None => "A swarm run_plan driver is already starting for this session. \
-                         Check it with `swarm plan_status` instead of starting another."
-                    .to_string(),
-            }));
-        }
-    };
-
-    let notify = params.notify.unwrap_or(true);
-    let wake = params.wake.unwrap_or(true);
-    // Keep the display name free of the "·" separator used by the background
-    // notification markdown header, or downstream parsing mis-splits the label.
-    let display_name = format!(
-        "run_plan ({} nodes, {} mode)",
-        initial_summary.item_count, initial_summary.mode
-    );
-
-    let bg_ctx = ctx.clone();
-    let info = crate::background::global()
-        .spawn_with_notify(
-            "swarm",
-            Some(display_name.clone()),
-            &ctx.session_id,
-            notify,
-            wake,
-            move |output_path| async move {
-                let reporter = RunPlanReporter::background(&output_path);
-                match run_swarm_plan_to_terminal(&bg_ctx, &params, &reporter).await {
-                    Ok(output) => {
-                        reporter.finalize(&output.output).await;
-                        Ok(TaskResult::completed(Some(0)))
-                    }
-                    Err(error) => {
-                        let message = format!("run_plan failed: {}", error);
-                        reporter.finalize(&message).await;
-                        Ok(TaskResult::failed(None, message))
-                    }
-                }
-            },
-        )
-        .await;
-    claim.record_task(&info.task_id);
-
-    let delivery_note = if wake {
-        "You'll be woken with the result when the plan reaches a terminal state."
-    } else if notify {
-        "A notification will appear when the plan reaches a terminal state."
-    } else {
-        "Notifications disabled. Use the `bg` tool to check status."
-    };
-    let output = format!(
-        "🐝 Swarm plan running in background.\n\n\
-         Task ID: {}\n\
-         Plan: {} node(s), {} mode\n\
-         Output file: {}\n\n\
-         {}\n\
-         Check progress: use the `bg` tool with action=\"status\" and task_id=\"{}\", or `swarm plan_status`.\n\
-         Note: a server reload stops this driver (workers keep running); rerun `swarm run_plan` to resume driving the same plan.",
-        info.task_id,
-        initial_summary.item_count,
-        initial_summary.mode,
-        info.output_file.display(),
-        delivery_note,
-        info.task_id,
-    );
-
-    Ok(ToolOutput::new(output)
-        .with_title(format!("Swarm run_plan in background: {}", info.task_id))
-        .with_metadata(json!({
-            "background": true,
-            "swarm": true,
-            "task_id": info.task_id,
-            "display_name": display_name,
-            "output_file": info.output_file.to_string_lossy(),
-            "status_file": info.status_file.to_string_lossy(),
-        })))
 }
 
 /// Hint appended to every `run_plan` driver failure: the driver exits without
@@ -1891,6 +1781,21 @@ struct CommunicateInput {
     /// spawns. Takes precedence over agents.swarm_model config.
     #[serde(default)]
     model: Option<String>,
+    /// Ordered fallback models used by run_plan retries.
+    #[serde(default)]
+    model_fallbacks: Option<Vec<String>>,
+    /// Maximum number of run_plan retries after the initial driver failure.
+    #[serde(default)]
+    max_retries: Option<u32>,
+    /// Initial exponential retry backoff for run_plan.
+    #[serde(default)]
+    retry_backoff_secs: Option<u64>,
+    /// Expected repository HEAD for ownership-loss reconciliation.
+    #[serde(default)]
+    expected_sha: Option<String>,
+    /// Required artifact paths, relative to the run_plan working directory.
+    #[serde(default)]
+    expected_artifacts: Option<Vec<String>>,
     /// Reasoning effort for spawned agents (none|minimal|low|medium|high|xhigh|max).
     #[serde(default)]
     effort: Option<String>,
@@ -1902,7 +1807,16 @@ struct CommunicateInput {
 
 impl CommunicateInput {
     fn spawn_initial_message(&self) -> Option<String> {
-        self.initial_message.clone().or_else(|| self.prompt.clone())
+        self.initial_message
+            .as_ref()
+            .filter(|message| !message.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                self.prompt
+                    .as_ref()
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .cloned()
+            })
     }
 
     fn required_spawn_label(&self) -> anyhow::Result<String> {
@@ -2052,6 +1966,30 @@ impl Tool for CommunicateTool {
                 "model": {
                     "type": "string",
                     "description": "Model for spawned agents, e.g. 'gpt-5.5' or 'claude-api:opus'. Omit to inherit; see list_models."
+                },
+                "model_fallbacks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered fallback models for run_plan retries."
+                },
+                "max_retries": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Maximum run_plan retries after the initial driver failure."
+                },
+                "retry_backoff_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Initial exponential backoff for run_plan retries."
+                },
+                "expected_sha": {
+                    "type": "string",
+                    "description": "Expected repository HEAD used when worker/session ownership is lost."
+                },
+                "expected_artifacts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required artifact paths relative to the run_plan working directory."
                 },
                 "effort": {
                     "type": "string",
@@ -3140,7 +3078,7 @@ impl Tool for CommunicateTool {
                 // coordinating agent stays responsive. Pass background=false
                 // to block inline until the plan reaches a terminal state.
                 if params.background.unwrap_or(true) {
-                    run_swarm_plan_in_background(&ctx, params.clone()).await
+                    orchestration_watchdog::run_swarm_plan_in_background(&ctx, params.clone()).await
                 } else {
                     run_swarm_plan_to_terminal(&ctx, &params, &RunPlanReporter::inline()).await
                 }

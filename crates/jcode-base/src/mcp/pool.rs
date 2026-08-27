@@ -25,6 +25,7 @@ struct FailedConnectRecord {
     failed_at: Instant,
 }
 
+#[derive(Debug)]
 enum ConnectAttempt {
     Connected,
     Leader(Arc<Notify>),
@@ -287,7 +288,29 @@ impl SharedMcpPool {
         }
 
         if self.handles.read().await.contains_key(name) {
-            return ConnectAttempt::Connected;
+            // The pool may hold a handle whose child process died (e.g. the
+            // MCP server crashed or was killed externally). Detect that here
+            // so a reconnect spawns a fresh process instead of returning the
+            // stale handle, which would make every tool call fail with
+            // "Failed to send request" (writer channel closed).
+            let mut clients = self.clients.lock().await;
+            let dead = match clients.get_mut(name) {
+                Some(client) => !client.is_running(),
+                None => true, // handle without client -> treat as dead
+            };
+            if dead {
+                clients.remove(name);
+                drop(clients);
+                let mut handles = self.handles.write().await;
+                handles.remove(name);
+                let mut refs = self.ref_counts.lock().await;
+                refs.remove(name);
+                let mut errors = self.last_errors.write().await;
+                errors.remove(name);
+            } else {
+                drop(clients);
+                return ConnectAttempt::Connected;
+            }
         }
 
         let notify = Arc::new(Notify::new());
@@ -428,9 +451,13 @@ mod tests {
     use crate::mcp::protocol::McpConfig;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn issue_790_reload_reuses_default_config_directory() {
+    #[test]
+    fn issue_790_reload_reuses_default_config_directory() {
         let _guard = crate::storage::lock_test_env();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
         let original_cwd = std::env::current_dir().expect("current cwd");
         let previous_home = std::env::var_os("JCODE_HOME");
         let home = tempfile::tempdir().expect("home tempdir");
@@ -450,7 +477,6 @@ mod tests {
 
         std::env::set_current_dir(first_project.path()).expect("set first project cwd");
         let pool = SharedMcpPool::from_default_config();
-        let initially_loaded_first = pool.config().await.servers.contains_key("first");
 
         std::fs::write(
             first_project.path().join(".mcp.json"),
@@ -459,8 +485,18 @@ mod tests {
         .expect("update first project config");
 
         std::env::set_current_dir(second_project.path()).expect("set second project cwd");
-        let _ = pool.reload().await;
-        let reloaded = pool.config().await;
+        let (initially_loaded_first, reloaded_first, reloaded_first_reloaded, reloaded_second) =
+            runtime.block_on(async {
+                let initially_loaded_first = pool.config().await.servers.contains_key("first");
+                let _ = pool.reload().await;
+                let reloaded = pool.config().await;
+                (
+                    initially_loaded_first,
+                    reloaded.servers.contains_key("first"),
+                    reloaded.servers.contains_key("first-reloaded"),
+                    reloaded.servers.contains_key("second"),
+                )
+            });
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
         if let Some(previous_home) = previous_home {
@@ -470,9 +506,9 @@ mod tests {
         }
 
         assert!(initially_loaded_first);
-        assert!(!reloaded.servers.contains_key("first"));
-        assert!(reloaded.servers.contains_key("first-reloaded"));
-        assert!(!reloaded.servers.contains_key("second"));
+        assert!(!reloaded_first);
+        assert!(reloaded_first_reloaded);
+        assert!(!reloaded_second);
     }
 
     #[tokio::test]
@@ -492,6 +528,36 @@ mod tests {
         };
 
         assert!(Arc::ptr_eq(&first_notify, &second_notify));
+    }
+
+    #[tokio::test]
+    async fn begin_connect_replaces_dead_client() {
+        // A handle whose child process has exited must not be returned as
+        // "Connected": every tool call on it would fail with a closed writer
+        // channel. begin_connect should drop the stale client/handle and
+        // return Leader so a fresh process is spawned.
+        let pool = Arc::new(SharedMcpPool::new(McpConfig::default()));
+
+        // A handle with no backing client is treated as dead (crashed
+        // process): begin_connect must clean it up and return Leader.
+        pool.handles.write().await.insert(
+            "stale".to_string(),
+            crate::mcp::McpHandle::new_dummy_for_tests("stale".to_string()),
+        );
+        pool.ref_counts.lock().await.insert("stale".to_string(), 1);
+
+        let attempt = pool.begin_connect("stale").await;
+        match attempt {
+            ConnectAttempt::Leader(_) => {
+                // Stale handle was cleaned up; a fresh connect will spawn.
+            }
+            other => panic!("stale handle must yield Leader, got {other:?}"),
+        }
+
+        // The stale handle must be gone from the pool.
+        assert!(!pool.handles.read().await.contains_key("stale"));
+        assert!(!pool.clients.lock().await.contains_key("stale"));
+        assert!(!pool.ref_counts.lock().await.contains_key("stale"));
     }
 
     #[tokio::test]

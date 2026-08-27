@@ -81,6 +81,8 @@ impl Config {
 - Enabled allow-list: {}
 - Disabled tools: {}
 - Disable base tools: {}
+- MCP tools: {}
+- MCP auto threshold: {} tokens
 
 **Provider:**
 - Default model: {}
@@ -101,6 +103,7 @@ impl Config {
 - Judge: {}
 - Memory: {}
 - Memory sidecar: {}
+- Memory enrichment: graphify={}, vault={}, pgvector={}
 - Ambient: {}
 
 **Gateway:**
@@ -244,6 +247,8 @@ impl Config {
                 effective_disabled_tools.join(", ")
             },
             self.tools.disable_base_tools,
+            self.tools.mcp_tools.as_str(),
+            self.tools.mcp_tools_token_threshold,
             self.provider
                 .default_model
                 .as_deref()
@@ -297,6 +302,9 @@ impl Config {
             } else {
                 "disabled"
             },
+            self.agents.memory_graphify_enabled,
+            self.agents.memory_vault_enabled,
+            self.agents.memory_pgvector_enabled,
             self.ambient
                 .model
                 .as_deref()

@@ -33,6 +33,7 @@ mod session_search;
 pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
+mod team_memory_guard;
 mod todo;
 mod webfetch;
 mod websearch;
@@ -48,11 +49,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> bool {
-    allowed.contains(name) || (allowed.contains("mcp") && name.starts_with("mcp__"))
+    allowed.contains(name)
+        || (allowed.contains("mcp") && is_mcp_tool_name(name))
+        || (is_fixed_mcp_tool(name) && allowed.iter().any(|tool| tool.starts_with("mcp__")))
 }
 
 pub(crate) fn tool_name_is_disabled(disabled: &HashSet<String>, name: &str) -> bool {
-    disabled.contains(name) || (disabled.contains("mcp") && name.starts_with("mcp__"))
+    disabled.contains(name) || (disabled.contains("mcp") && is_mcp_tool_name(name))
+}
+
+fn is_fixed_mcp_tool(name: &str) -> bool {
+    matches!(name, "mcp_search" | "mcp_call")
+}
+
+fn is_mcp_tool_name(name: &str) -> bool {
+    name == "mcp" || name.starts_with("mcp__") || is_fixed_mcp_tool(name)
 }
 use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
@@ -66,6 +77,7 @@ pub(crate) use session_search::spawn_recent_index_warmup;
 struct SessionToolPolicy {
     allowed_tools: Option<HashSet<String>>,
     disabled_tools: HashSet<String>,
+    team_memory_writer: bool,
 }
 
 static SESSION_TOOL_POLICIES: LazyLock<StdRwLock<HashMap<String, SessionToolPolicy>>> =
@@ -84,8 +96,28 @@ pub(crate) fn set_session_tool_policy(
         SessionToolPolicy {
             allowed_tools,
             disabled_tools,
+            team_memory_writer: true,
         },
     );
+}
+
+pub(crate) fn deny_session_team_memory_writes(session_id: &str) {
+    let mut policies = SESSION_TOOL_POLICIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    policies
+        .entry(session_id.to_string())
+        .or_default()
+        .team_memory_writer = false;
+}
+
+pub(crate) fn session_may_write_team_memory(session_id: &str) -> bool {
+    if std::env::var_os("JCODE_SPAWN_COORDINATOR_SESSION_ID").is_some() {
+        return false;
+    }
+    session_tool_policy(session_id)
+        .map(|policy| policy.team_memory_writer)
+        .unwrap_or(true)
 }
 
 pub(crate) fn clear_session_tool_policy(session_id: &str) {
@@ -101,6 +133,23 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(session_id)
         .cloned()
+}
+
+/// Apply the current session policy to an MCP server tool invoked through a
+/// fixed deferred surface. Explicitly enabling the fixed surface authorizes its
+/// underlying MCP calls, while per-tool allow/deny entries remain effective.
+pub(crate) fn session_mcp_dispatch_is_allowed(
+    session_id: &str,
+    dispatched_name: &str,
+    fixed_surface: &str,
+) -> bool {
+    let Some(policy) = session_tool_policy(session_id) else {
+        return true;
+    };
+    let allowed = policy.allowed_tools.as_ref().is_none_or(|allowed| {
+        tool_name_is_allowed(allowed, dispatched_name) || allowed.contains(fixed_surface)
+    });
+    allowed && !tool_name_is_disabled(&policy.disabled_tools, dispatched_name)
 }
 
 /// Whether a tool call opted in to receiving an oversized (truncated) result.
@@ -942,6 +991,16 @@ impl Registry {
             mcp::McpManagementTool::new(Arc::clone(&mcp_manager)).with_registry(self.clone());
         self.register("mcp".to_string(), Arc::new(mcp_tool) as Arc<dyn Tool>)
             .await;
+        self.register(
+            "mcp_search".to_string(),
+            Arc::new(mcp::McpSearchTool::new(Arc::clone(&mcp_manager))) as Arc<dyn Tool>,
+        )
+        .await;
+        self.register(
+            "mcp_call".to_string(),
+            Arc::new(mcp::McpCallTool::new(Arc::clone(&mcp_manager))) as Arc<dyn Tool>,
+        )
+        .await;
 
         // Check if we have enabled servers to connect to. Disabled servers stay
         // configured (visible to the mcp management tool, connectable by name)

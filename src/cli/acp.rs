@@ -142,7 +142,7 @@ impl TurnUsage {
             "inputTokens": self.input_tokens,
             "outputTokens": self.output_tokens,
         });
-        let object = usage.as_object_mut().expect("usage is an object");
+        let object = usage.as_object_mut()?;
         if let Some(tokens) = self.cached_read_tokens {
             object.insert("cachedReadTokens".to_string(), json!(tokens));
         }
@@ -161,11 +161,10 @@ fn add_optional_tokens(total: &mut Option<u64>, tokens: Option<u64>) {
 
 fn prompt_response(stop_reason: &str, usage: &TurnUsage) -> Value {
     let mut response = json!({ "stopReason": stop_reason });
-    if let Some(usage) = usage.to_acp() {
-        response
-            .as_object_mut()
-            .expect("prompt response is an object")
-            .insert("usage".to_string(), usage);
+    if let Some(usage) = usage.to_acp()
+        && let Some(object) = response.as_object_mut()
+    {
+        object.insert("usage".to_string(), usage);
     }
     response
 }
@@ -1709,7 +1708,7 @@ fn parse_acp_slash_command(text: &str) -> Option<Result<AcpSlashCommand>> {
     let trimmed = text.trim_end();
     let body = trimmed.strip_prefix('/')?;
     let mut parts = body.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or_default();
+    let name = parts.next().map_or("", |name| name);
     let argument = parts
         .next()
         .map(str::trim)

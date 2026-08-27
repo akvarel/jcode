@@ -120,6 +120,16 @@ impl Config {
         {
             self.tools.disable_base_tools = parsed;
         }
+        if let Ok(v) = std::env::var("JCODE_MCP_TOOLS")
+            && let Some(mode) = crate::config::McpToolsMode::parse(&v)
+        {
+            self.tools.mcp_tools = mode;
+        }
+        if let Ok(v) = std::env::var("JCODE_MCP_TOOLS_TOKEN_THRESHOLD")
+            && let Ok(parsed) = v.trim().parse::<usize>()
+        {
+            self.tools.mcp_tools_token_threshold = parsed;
+        }
 
         // ACP adapter
         if let Ok(v) = std::env::var("JCODE_ACP_PROFILE") {
@@ -418,6 +428,29 @@ impl Config {
             if let Ok(parsed) = v.trim().parse::<usize>() {
                 self.agents.memory_embedding_dim = Some(parsed);
             }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_GRAPHIFY_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_graphify_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_VAULT_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_vault_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_PGVECTOR_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_pgvector_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_VAULT_ROOT") {
+            let trimmed = v.trim();
+            self.agents.memory_vault_root = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
         }
 
         // Terminal spawning

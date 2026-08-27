@@ -18,6 +18,7 @@ mod image_clamp;
 pub mod jcode;
 pub mod models;
 mod multi_provider;
+mod named_profile;
 pub mod openai;
 pub mod openai_request;
 pub mod openrouter;
@@ -1075,15 +1076,7 @@ impl MultiProvider {
 
         match provider {
             ActiveProvider::Claude => {
-                let switching_from_named_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
-                    .ok()
-                    .and_then(|name| crate::config::config().providers.get(&name))
-                    .is_some_and(|profile| {
-                        matches!(
-                            profile.provider_type,
-                            crate::config::NamedProviderType::AnthropicCompatible
-                        )
-                    });
+                let switching_from_named_anthropic = named_profile::active_is_anthropic();
                 if switching_from_named_anthropic {
                     crate::env::remove_var("JCODE_NAMED_PROVIDER_PROFILE");
                     crate::env::remove_var("JCODE_PROVIDER_PROFILE_ACTIVE");
@@ -2874,8 +2867,18 @@ impl Provider for MultiProvider {
             cursor: RwLock::new(cursor_provider),
             bedrock: RwLock::new(bedrock_provider),
             openrouter: RwLock::new(openrouter),
-            openai_compatible_profiles: RwLock::new(HashMap::new()),
-            active_openai_compatible_profile: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(
+                self.openai_compatible_profiles
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ),
+            active_openai_compatible_profile: RwLock::new(
+                self.active_openai_compatible_profile
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ),
             active: RwLock::new(active),
             use_claude_cli: self.use_claude_cli,
             startup_notices: RwLock::new(Vec::new()),

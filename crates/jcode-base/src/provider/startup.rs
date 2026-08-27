@@ -148,15 +148,15 @@ impl MultiProvider {
         let anthropic = if has_claude_creds && !use_claude_cli {
             let provider =
                 external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME);
-            let active_profile_is_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
-                .ok()
-                .and_then(|name| cfg.providers.get(&name))
-                .is_some_and(|profile| {
+            let active_profile_is_anthropic = match std::env::var("JCODE_NAMED_PROVIDER_PROFILE") {
+                Ok(name) => cfg.providers.get(&name).is_some_and(|profile| {
                     matches!(
                         profile.provider_type,
                         crate::config::NamedProviderType::AnthropicCompatible
                     )
-                });
+                }),
+                Err(_) => false,
+            };
             if active_profile_is_anthropic {
                 crate::provider_catalog::clear_anthropic_profile_env();
             }
@@ -214,10 +214,13 @@ impl MultiProvider {
             None
         };
 
-        let active_named_profile_is_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
-            .ok()
-            .or_else(|| default_named_provider_profile.clone())
-            .and_then(|name| cfg.providers.get(&name))
+        let named_provider_profile = match std::env::var("JCODE_NAMED_PROVIDER_PROFILE") {
+            Ok(name) => Some(name),
+            Err(_) => default_named_provider_profile.clone(),
+        };
+        let active_named_profile_is_anthropic = named_provider_profile
+            .as_deref()
+            .and_then(|name| cfg.providers.get(name))
             .is_some_and(|profile| {
                 matches!(
                     profile.provider_type,
@@ -225,10 +228,7 @@ impl MultiProvider {
                 )
             });
         let openrouter = if has_openrouter_creds && !active_named_profile_is_anthropic {
-            let named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
-                .ok()
-                .or_else(|| default_named_provider_profile.clone());
-            let spec = named_profile
+            let spec = named_provider_profile
                 .as_deref()
                 .and_then(|profile_name| {
                     cfg.providers.get(profile_name).map(|profile| {
