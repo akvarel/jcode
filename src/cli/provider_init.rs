@@ -40,6 +40,8 @@ pub enum ProviderChoice {
     )]
     OpenaiApi,
     Openrouter,
+    #[value(alias = "orca-router")]
+    Orcarouter,
     #[value(alias = "aws-bedrock", alias = "aws_bedrock")]
     Bedrock,
     #[value(alias = "azure-openai", alias = "aoai")]
@@ -152,6 +154,7 @@ impl ProviderChoice {
             Self::Openai => "openai",
             Self::OpenaiApi => "openai-api",
             Self::Openrouter => "openrouter",
+            Self::Orcarouter => "orcarouter",
             Self::Bedrock => "bedrock",
             Self::Azure => "azure",
             Self::Opencode => "opencode",
@@ -231,6 +234,10 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
     (
         ProviderChoice::Openrouter,
         crate::provider_catalog::OPENROUTER_LOGIN_PROVIDER,
+    ),
+    (
+        ProviderChoice::Orcarouter,
+        crate::provider_catalog::ORCAROUTER_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::Bedrock,
@@ -1227,10 +1234,8 @@ pub fn clear_initial_model_provider() {
     crate::provider::activation::clear_initial_runtime_provider();
 }
 
-/// A CLI provider choice for a dual-auth backend is also a credential choice.
-/// Pin it through the provider's credential-mode API
-/// so `--provider anthropic-api` cannot remain in Auto mode and prefer a stored
-/// Claude OAuth credential over `ANTHROPIC_API_KEY` (and likewise for OpenAI).
+/// Pin explicit dual-auth CLI choices to their matching credential mode so
+/// stored OAuth credentials cannot override API-key selections.
 fn explicit_credential_mode(choice: &ProviderChoice) -> Option<provider::CredentialMode> {
     match choice {
         ProviderChoice::AnthropicApi | ProviderChoice::OpenaiApi => {
@@ -1424,13 +1429,8 @@ async fn init_provider_with_options(
     show_init_messages: bool,
     allow_login_bootstrap: bool,
 ) -> Result<Arc<dyn provider::Provider>> {
-    // Provider construction resolves concrete runtimes through the base
-    // crate's external-runtime registry (composition-root pattern). The
-    // binary's normal path registers them in `startup::run()`, but this
-    // function is also entered directly by validation/login/test flows that
-    // never run startup. Registration is idempotent, so do it here too;
-    // otherwise Auto-init silently loses registry-backed runtimes (e.g. the
-    // OpenRouter/OpenAI-compatible factory) and their model-picker routes.
+    // Validation and login flows bypass startup, so idempotently register the
+    // external runtimes here to preserve their model-picker routes.
     super::startup::register_external_provider_runtimes();
 
     if let Ok(profile_name) = std::env::var("JCODE_PROVIDER_PROFILE_NAME")
@@ -1565,6 +1565,7 @@ async fn init_provider_with_options(
             Arc::new(multi)
         }
         ProviderChoice::Opencode
+        | ProviderChoice::Orcarouter
         | ProviderChoice::OpencodeGo
         | ProviderChoice::Zai
         | ProviderChoice::Ai302
@@ -1605,10 +1606,8 @@ async fn init_provider_with_options(
             let profile = profile_for_choice(choice)
                 .ok_or_else(|| anyhow::anyhow!("missing provider profile for choice"))?;
             if std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE").is_none() {
-                // An explicit `--provider <compatible>` selection should win over
-                // any stale active-profile marker inherited from a previous
-                // bootstrap/login flow. Named provider profiles still take
-                // precedence when explicitly configured.
+                // Explicit compatible choices override stale bootstrap markers;
+                // explicitly configured named profiles still take precedence.
                 force_apply_openai_compatible_profile_env(Some(profile));
             }
             let mut runtime_model_hint = None;
