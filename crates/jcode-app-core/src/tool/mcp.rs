@@ -75,7 +75,7 @@ impl Tool for McpSearchTool {
                 "include_schema": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Include full input schemas only after narrowing to likely tools."
+                    "description": "Include full input schemas only after narrowing to likely tools. Schema-bearing pages are capped at five matches."
                 }
             }
         })
