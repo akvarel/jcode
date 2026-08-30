@@ -52,7 +52,7 @@ pub(super) fn search_tools(
         MAX_LIMIT
     };
     let limit = requested_limit.min(max_limit);
-    let query = options.query.as_deref().map(normalize).unwrap_or_default();
+    let query = options.query.as_deref().map_or_else(String::new, normalize);
     let query_terms = terms(&query);
 
     let mut matches: Vec<SearchMatch> = catalog
