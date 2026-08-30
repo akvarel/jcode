@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
+const MAX_SCHEMA_LIMIT: usize = 5;
 
 #[derive(Debug, Default)]
 pub(super) struct SearchOptions {
@@ -40,11 +41,17 @@ pub(super) fn search_tools(
     catalog: Vec<(String, McpToolDef)>,
     options: SearchOptions,
 ) -> SearchPage {
-    let limit = if options.limit == 0 {
+    let requested_limit = if options.limit == 0 {
         DEFAULT_LIMIT
     } else {
-        options.limit.min(MAX_LIMIT)
+        options.limit
     };
+    let max_limit = if options.include_schema {
+        MAX_SCHEMA_LIMIT
+    } else {
+        MAX_LIMIT
+    };
+    let limit = requested_limit.min(max_limit);
     let query = options.query.as_deref().map(normalize).unwrap_or_default();
     let query_terms = terms(&query);
 
