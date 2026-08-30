@@ -332,6 +332,8 @@ disable_base_tools = false
 # MCP tool exposure: "eager" sends every server tool definition, "deferred"
 # sends only fixed mcp_search/mcp_call tools, and "auto" switches to deferred
 # when the filtered MCP definitions exceed the token threshold below.
+# Deferred search returns compact ranked pages (10 by default, max 50) and
+# only includes schemas when requested (max 5 schema-bearing matches).
 # Env overrides: JCODE_MCP_TOOLS, JCODE_MCP_TOOLS_TOKEN_THRESHOLD.
 mcp_tools = "auto"
 mcp_tools_token_threshold = 8000

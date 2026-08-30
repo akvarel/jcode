@@ -578,6 +578,28 @@ Example MCP config:
 }
 ```
 
+### Scalable MCP tool discovery
+
+Jcode avoids sending a large MCP catalog to the model on every turn. Under
+`[tools]`, `mcp_tools = "auto"` exposes individual MCP tools until their
+serialized definitions exceed `mcp_tools_token_threshold` (8,000 tokens by
+default), then switches to the fixed `mcp_search` and `mcp_call` surface.
+`mcp_tools = "deferred"` enables that surface unconditionally.
+
+Deferred discovery is two-stage:
+
+1. `mcp_search` ranks tools by server, name, and description and returns 10
+   compact matches by default. Results are deterministically paginated and the
+   public maximum is 50 matches.
+2. The model narrows the candidates and repeats the search with
+   `include_schema: true`. Schema-bearing pages are capped at five tools before
+   one is invoked through `mcp_call`.
+
+This keeps full JSON schemas out of the model context until they are needed. A
+10,000-tool regression test covers bounded discovery. The current ranker is a
+deterministic in-process lexical ranker; it does not require an embedding model
+or external search service. See [`docs/MCP_TOOL_DISCOVERY.md`](docs/MCP_TOOL_DISCOVERY.md).
+
 For headless or SSH sessions, OAuth-style providers support `jcode login --provider <provider> --no-browser` (alias: `--headless`) so jcode prints the auth URL/QR and falls back to manual code or callback paste instead of trying to launch a local browser.
 
 For more scriptable remote flows, `claude`, `openai`, `gemini`, and `antigravity` also support a two-step pattern:
