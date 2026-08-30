@@ -22,6 +22,11 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use transport::{DeliveryMode, send_payload, send_transcript_payload};
+#[cfg(test)]
+use transport::{
+    TELEMETRY_ENDPOINT, TEST_EMITTED_PAYLOADS, TRANSCRIPT_ENDPOINT, spawn_background_worker,
+    telemetry_status_is_permanent,
+};
 
 const BLOCKING_INSTALL_TIMEOUT: Duration = Duration::from_millis(1200);
 const BLOCKING_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(800);

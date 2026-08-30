@@ -5,17 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
-const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
-const TRANSCRIPT_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/transcript";
+pub(super) const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
+pub(super) const TRANSCRIPT_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/transcript";
 const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKGROUND_QUEUE_CAPACITY: usize = 2048;
 static TELEMETRY_PERMANENTLY_REJECTED: AtomicBool = AtomicBool::new(false);
 static TELEMETRY_QUEUE_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
 static TELEMETRY_BACKGROUND_SENDER: OnceLock<Result<SyncSender<Value>, String>> = OnceLock::new();
+#[cfg(not(test))]
 static TRANSCRIPT_BACKGROUND_SENDER: OnceLock<Result<SyncSender<Value>, String>> = OnceLock::new();
 static TELEMETRY_HTTP_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
 #[cfg(test)]
-static TEST_EMITTED_PAYLOADS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+pub(super) static TEST_EMITTED_PAYLOADS: std::sync::Mutex<Vec<Value>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DeliveryMode {
@@ -75,6 +77,7 @@ fn post_payload(payload: Value, timeout: Duration) -> bool {
     }
 }
 
+#[cfg(not(test))]
 fn post_transcript_payload(payload: Value, timeout: Duration) -> bool {
     let Some(client) = http_client() else {
         return false;
@@ -100,11 +103,14 @@ fn post_transcript_payload(payload: Value, timeout: Duration) -> bool {
     }
 }
 
-fn telemetry_status_is_permanent(status: u16) -> bool {
+pub(super) fn telemetry_status_is_permanent(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
 }
 
-fn spawn_background_worker<F>(capacity: usize, mut deliver: F) -> std::io::Result<SyncSender<Value>>
+pub(super) fn spawn_background_worker<F>(
+    capacity: usize,
+    mut deliver: F,
+) -> std::io::Result<SyncSender<Value>>
 where
     F: FnMut(Value) + Send + 'static,
 {
@@ -143,6 +149,7 @@ fn background_sender() -> Option<&'static SyncSender<Value>> {
     })
 }
 
+#[cfg(not(test))]
 fn transcript_background_sender() -> Option<&'static SyncSender<Value>> {
     initialized_sender(
         &TRANSCRIPT_BACKGROUND_SENDER,
@@ -161,21 +168,23 @@ pub(super) fn send_transcript_payload(payload: Value) -> bool {
         if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
             emitted.push(payload);
         }
-        return true;
+        true
     }
     #[cfg(not(test))]
-    let Some(sender) = transcript_background_sender() else {
-        return false;
-    };
-    match sender.try_send(payload) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            logging::warn("transcript upload queue is full; dropping transcript");
-            false
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            logging::warn("transcript upload worker stopped; dropping transcript");
-            false
+    {
+        let Some(sender) = transcript_background_sender() else {
+            return false;
+        };
+        match sender.try_send(payload) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                logging::warn("transcript upload queue is full; dropping transcript");
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                logging::warn("transcript upload worker stopped; dropping transcript");
+                false
+            }
         }
     }
 }
