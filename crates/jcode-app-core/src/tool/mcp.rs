@@ -4,7 +4,7 @@ use crate::mcp::{ContentBlock, McpManager, McpServerConfig, dispatch_name};
 use crate::tool::{Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,15 +18,12 @@ struct McpSearchInput {
     server: Option<String>,
     #[serde(default)]
     query: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct McpSearchResult {
-    name: String,
-    server: String,
-    tool: String,
-    description: String,
-    input_schema: Value,
+    #[serde(default)]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    include_schema: bool,
 }
 
 /// Fixed MCP discovery surface used when individual server definitions are deferred.
@@ -47,7 +44,7 @@ impl Tool for McpSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search available MCP tools by server, name, or description. Returns callable names and input schemas."
+        "Search and rank available MCP tools by server, name, or description. Returns a bounded compact page by default; set include_schema only for the shortlisted tools you may call."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -60,7 +57,25 @@ impl Tool for McpSearchTool {
                 },
                 "query": {
                     "type": "string",
-                    "description": "Optional case-insensitive name or description search."
+                    "description": "Optional natural-language name or description search."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 10,
+                    "description": "Maximum matches to return. Values above 50 are clamped."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Result offset for stable pagination."
+                },
+                "include_schema": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include full input schemas only after narrowing to likely tools."
                 }
             }
         })
@@ -70,51 +85,32 @@ impl Tool for McpSearchTool {
         let params: McpSearchInput = serde_json::from_value(input)?;
         let server_filter = params
             .server
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+            .map(|server| server.trim().to_string())
+            .filter(|server| !server.is_empty());
         let query = params
             .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_ascii_lowercase);
+            .map(|query| query.trim().to_string())
+            .filter(|query| !query.is_empty());
         let manager = self.manager.read().await;
-        let catalog = manager.searchable_tools().await;
+        let mut catalog = manager.searchable_tools().await;
         drop(manager);
 
-        let matches: Vec<McpSearchResult> = catalog
-            .into_iter()
-            .filter_map(|(server, tool)| {
-                if server_filter.is_some_and(|wanted| wanted != server) {
-                    return None;
-                }
-                let name = dispatch_name(&server, &tool.name);
-                if !super::session_mcp_dispatch_is_allowed(&ctx.session_id, &name, "mcp_search") {
-                    return None;
-                }
-                if let Some(query) = &query {
-                    let description = tool.description.as_deref().unwrap_or("");
-                    if !name.to_ascii_lowercase().contains(query)
-                        && !server.to_ascii_lowercase().contains(query)
-                        && !tool.name.to_ascii_lowercase().contains(query)
-                        && !description.to_ascii_lowercase().contains(query)
-                    {
-                        return None;
-                    }
-                }
-                Some(McpSearchResult {
-                    name,
-                    server,
-                    tool: tool.name,
-                    description: tool.description.unwrap_or_else(|| "MCP tool".to_string()),
-                    input_schema: tool.input_schema,
-                })
-            })
-            .collect();
-
-        Ok(ToolOutput::new(serde_json::to_string_pretty(&matches)?)
-            .with_title(format!("MCP tools ({})", matches.len())))
+        catalog.retain(|(server, tool)| {
+            let name = dispatch_name(server, &tool.name);
+            super::session_mcp_dispatch_is_allowed(&ctx.session_id, &name, "mcp_search")
+        });
+        let page = search::search_tools(
+            catalog,
+            search::SearchOptions {
+                server: server_filter,
+                query,
+                limit: params.limit,
+                offset: params.offset,
+                include_schema: params.include_schema,
+            },
+        );
+        let title = format!("MCP tools ({} of {})", page.matches.len(), page.total);
+        Ok(ToolOutput::new(serde_json::to_string_pretty(&page)?).with_title(title))
     }
 }
 
