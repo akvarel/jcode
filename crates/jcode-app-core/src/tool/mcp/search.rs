@@ -271,6 +271,26 @@ mod tests {
     }
 
     #[test]
+    fn limits_schema_expansion_to_five_shortlisted_tools() {
+        let catalog = (0..20)
+            .map(|index| tool("bulk", &format!("tool_{index:03}"), "bulk operation"))
+            .collect();
+
+        let page = search_tools(
+            catalog,
+            SearchOptions {
+                limit: 50,
+                include_schema: true,
+                ..SearchOptions::default()
+            },
+        );
+
+        assert_eq!(page.limit, 5);
+        assert_eq!(page.matches.len(), 5);
+        assert!(page.matches.iter().all(|item| item.input_schema.is_some()));
+    }
+
+    #[test]
     fn omits_schemas_until_the_model_explicitly_requests_them() {
         let catalog = vec![tool(
             "postgres",
