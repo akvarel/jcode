@@ -70,9 +70,9 @@ impl ImageExpandLevel {
     #[cfg(test)]
     pub(crate) fn next(self) -> Self {
         match self {
-            ImageExpandLevel::Fit => ImageExpandLevel::Large,
-            ImageExpandLevel::Large => ImageExpandLevel::Full,
-            ImageExpandLevel::Full => ImageExpandLevel::Fit,
+            Self::Fit => Self::Large,
+            Self::Large => Self::Full,
+            Self::Full => Self::Fit,
         }
     }
 

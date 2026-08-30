@@ -74,7 +74,7 @@ impl Tool for WriteTool {
             None
         };
 
-        let old_content_for_validation = old_content.as_deref().unwrap_or("");
+        let old_content_for_validation = old_content.as_deref().unwrap_or_default();
         super::team_memory_guard::validate_team_memory_session_log_update(
             &path,
             old_content_for_validation,
