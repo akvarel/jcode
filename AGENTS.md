@@ -29,10 +29,34 @@ Retained upstream workflows:
 - `discord-release.yml` — Discord release announcements (still useful if we tag a release).
 - `ios-testflight.yml` — iOS TestFlight build/upload (Apple signing pipeline, platform-specific).
 
+### Upstream alignment (2026-09 review)
+
+Prefer upstream implementations when they cover the same pain; do not carry
+competing fork code:
+
+- **Dropped** (superseded upstream): `Expose headless session API`,
+  `Make state module public` — nothing consumed them, and programmatic use
+  should go through `crates/jcode-sdk` (session launch, `wake_mode`,
+  externally managed wake requests, session context forking).
+- **Keep** (unique value, no upstream equivalent): external memory enrichment
+  (graphify/vault/pgvector, `JCODE_MEMORY_VAULT_ROOT`) — `ohagent-memory`
+  depends on `jcode-base` directly; durable orchestration watchdog;
+  scalable deferred MCP discovery; OrcaRouter wiring (complements the
+  upstream catalog profile).
+- **Keep** (complementary healing): MCP pooled-client reconnect after a dead
+  process — upstream prevents dead clients in the pool, ours reconnects the
+  surviving ones.
+- **Keep** (still required): `NotifySession` as lightweight control request —
+  upstream's externally managed wake requests target SDK-launched sessions,
+  not the ambient scheduler's internal `Client::connect()` path.
+- Before adding a fork-only fix, check whether upstream already solved the
+  same pain (grep `git log upstream/master`).
+
 ### Updating from upstream
 
-See `~/.jcode/scripts/update-jcode-fork.sh` — fetches upstream, rebases
-`feature/external-memory-enrichment`, rebuilds binary.
+See `~/.jcode/scripts/update-jcode-fork.sh` — fetches upstream, rebases the
+current `update/external-memory-enrichment-v<X.Y.Z>` branch onto the latest
+release tag (branch is versioned per upstream release), rebuilds binary.
 
 ### Submodule in ohAgent
 
