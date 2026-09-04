@@ -222,9 +222,14 @@ fn multi_account_active_switch_works() {
     })
     .unwrap();
 
-    assert_eq!(active_account_label().as_deref(), Some("openai-1"));
-    set_active_account("openai-2").unwrap();
-    assert_eq!(active_account_label().as_deref(), Some("openai-2"));
+    let labels = list_accounts()
+        .unwrap()
+        .into_iter()
+        .map(|account| account.label)
+        .collect::<Vec<_>>();
+    assert_eq!(active_account_label().as_deref(), Some(labels[0].as_str()));
+    set_active_account(&labels[1]).unwrap();
+    assert_eq!(active_account_label().as_deref(), Some(labels[1].as_str()));
 
     let creds = load_credentials().unwrap();
     assert_eq!(creds.access_token, "at_work");

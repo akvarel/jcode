@@ -133,11 +133,16 @@ fn save_claude_tokens_preserves_existing_account_metadata() -> Result<()> {
         id_token: None,
         scopes: Vec::new(),
     };
-    save_claude_tokens_for_account(&refreshed, "claude-1")?;
+    let account_label = crate::auth::claude::list_accounts()?
+        .into_iter()
+        .next()
+        .expect("claude account should exist")
+        .label;
+    save_claude_tokens_for_account(&refreshed, &account_label)?;
 
     let account = crate::auth::claude::list_accounts()?
         .into_iter()
-        .find(|account| account.label == "claude-1")
+        .find(|account| account.label == account_label)
         .expect("claude account should exist");
     assert_eq!(account.access, "new_access");
     assert_eq!(account.refresh, "new_refresh");

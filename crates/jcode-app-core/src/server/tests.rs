@@ -189,6 +189,7 @@ impl ScopedEnvVar {
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let prev = std::env::var_os(key);
         crate::env::set_var(key, value);
+        crate::config::invalidate_config_cache();
         Self { key, prev }
     }
 }
@@ -200,6 +201,7 @@ impl Drop for ScopedEnvVar {
         } else {
             crate::env::remove_var(self.key);
         }
+        crate::config::invalidate_config_cache();
     }
 }
 
@@ -489,10 +491,19 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
     )
     .await;
 
-    let event = timeout(Duration::from_secs(2), member_event_rx.recv())
-        .await
-        .expect("external wake request should arrive promptly")
-        .expect("member event stream should remain open");
+    let event = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = member_event_rx
+                .recv()
+                .await
+                .expect("member event stream should remain open");
+            if matches!(event, ServerEvent::WakeRequested { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("external wake request should arrive promptly");
     match event {
         ServerEvent::WakeRequested {
             session_id: event_session_id,

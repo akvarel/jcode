@@ -437,6 +437,32 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
     if m.contains("grok-code-fast") {
         return Some(256_000);
     }
+    if m.contains("grok-4") {
+        return Some(256_000);
+    }
+
+    // --- Current open-weight coding and general-purpose families ---
+    if m.contains("seed-2.0")
+        || m.contains("step-3.7")
+        || m == "hy3"
+        || m.starts_with("hy3-")
+        || m.contains("command-a")
+    {
+        return Some(262_144);
+    }
+    if m.contains("llama-4") {
+        return Some(1_048_576);
+    }
+    if m.contains("ling-3")
+        || m.contains("inkling")
+        || m.contains("nemotron-3")
+        || m.contains("mistral-large")
+        || m.contains("mistral-medium")
+        || m.contains("mistral-small")
+        || m.contains("gemma-4")
+    {
+        return Some(131_072);
+    }
 
     // --- Perplexity Sonar: 128K context ---
     if m.contains("sonar") {

@@ -1961,10 +1961,6 @@ impl Tool for CommunicateTool {
                     "enum": ["visible", "headless", "inline", "auto"],
                     "description": "Spawn UI mode: visible terminal, headless, inline gallery, or auto. Defaults to inline."
                 },
-                "model": {
-                    "type": "string",
-                    "description": "Model for spawned agents, e.g. 'gpt-5.5' or 'claude-api:opus'. Omit to inherit; see list_models."
-                },
                 "model_fallbacks": {
                     "type": "array",
                     "items": {"type": "string"},

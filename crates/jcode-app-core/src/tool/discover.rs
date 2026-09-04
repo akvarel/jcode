@@ -463,7 +463,7 @@ impl Tool for DiscoverToolsTool {
                     "type": "string",
                     "minLength": DISCOVERY_REASON_MIN_CHARS,
                     "maxLength": DISCOVERY_REASON_MAX_CHARS,
-                    "description": "Why the candidate is relevant, why the chosen integration fits, or why search results were unsuitable. Never include private data."
+                    "description": "Why the candidate fits or search results were unsuitable. Never include private data."
                 },
                 "tool": {
                     "type": "string",
@@ -2194,7 +2194,7 @@ mod tests {
         assert!(schema.contains("details investigates one without selecting it"));
         assert!(schema.contains("May be shared with integration providers"));
         assert!(schema.contains("never secrets or personal data"));
-        assert!(schema.contains("Why the candidate is relevant"));
+        assert!(schema.contains("Why the candidate fits"));
         assert!(schema.contains("known_product"));
         assert!(schema.contains("capability_gap"));
         assert!(schema.contains("prior_request_id"));
