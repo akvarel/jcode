@@ -224,12 +224,12 @@ fn full_and_fast_auth_status_document_cursor_cli_exception() {
     let (full, _) = build_auth_status_uncached(AuthProbeMode::Full);
     let (fast, _) = build_auth_status_uncached(AuthProbeMode::Fast);
 
-    assert_eq!(full.cursor, AuthState::Available);
+    assert_eq!(full.cursor, AuthState::NotConfigured);
     assert_eq!(fast.cursor, AuthState::NotConfigured);
     assert_eq!(
         full.cursor,
-        AuthState::Available,
-        "Full auth probes cursor-agent status; fast auth intentionally skips CLI/vscdb probes"
+        AuthState::NotConfigured,
+        "Cursor CLI process state is not treated as reusable native authentication"
     );
 
     for (key, value) in saved {
@@ -765,7 +765,7 @@ fn cursor_status_is_available_for_authenticated_cli_session() {
     AuthStatus::invalidate_cache();
 
     let status = AuthStatus::check();
-    assert_eq!(status.cursor, AuthState::Available);
+    assert_eq!(status.cursor, AuthState::NotConfigured);
 
     restore_env_var("CURSOR_API_KEY", prev_api_key);
     restore_env_var("JCODE_CURSOR_CLI_PATH", prev_cli_path);
