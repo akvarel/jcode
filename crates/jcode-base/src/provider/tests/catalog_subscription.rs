@@ -196,9 +196,14 @@ fn test_same_provider_account_candidates_include_other_openai_accounts() {
         })
         .unwrap();
 
-        crate::auth::codex::set_active_account("openai-1").unwrap();
+        let labels = crate::auth::codex::list_accounts()
+            .unwrap()
+            .into_iter()
+            .map(|account| account.label)
+            .collect::<Vec<_>>();
+        crate::auth::codex::set_active_account(&labels[0]).unwrap();
         let candidates = MultiProvider::same_provider_account_candidates(ActiveProvider::OpenAI);
-        assert_eq!(candidates, vec!["openai-2".to_string()]);
+        assert_eq!(candidates, vec![labels[1].clone()]);
     });
 }
 
