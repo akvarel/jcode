@@ -8,9 +8,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 mod search;
+
+/// Discovery is a local catalog lookup and must never inherit a wedged MCP
+/// lifecycle lock. Actual server connections and tool calls have their own,
+/// longer timeouts.
+const MCP_SEARCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize)]
 struct McpSearchInput {
@@ -91,9 +97,17 @@ impl Tool for McpSearchTool {
             .query
             .map(|query| query.trim().to_string())
             .filter(|query| !query.is_empty());
-        let manager = self.manager.read().await;
-        let mut catalog = manager.searchable_tools().await;
-        drop(manager);
+        let mut catalog = tokio::time::timeout(MCP_SEARCH_TIMEOUT, async {
+            let manager = self.manager.read().await;
+            manager.searchable_tools().await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "MCP tool discovery did not respond within {}ms; retry after MCP server initialization or reload completes",
+                MCP_SEARCH_TIMEOUT.as_millis()
+            )
+        })?;
 
         catalog.retain(|(server, tool)| {
             let name = dispatch_name(server, &tool.name);
@@ -764,6 +778,32 @@ mod tests {
 
         let result = tool.execute(input, ctx).await.unwrap();
         assert!(result.output.contains("No MCP servers connected"));
+    }
+
+    #[tokio::test]
+    async fn mcp_search_times_out_when_manager_lifecycle_lock_is_stuck() {
+        let manager = Arc::new(RwLock::new(McpManager::with_config(
+            crate::mcp::McpConfig::default(),
+        )));
+        let tool = McpSearchTool::new(manager.clone());
+        let held_write_lock = manager.write().await;
+
+        let started = tokio::time::Instant::now();
+        let error = tool
+            .execute(json!({"query": "drive"}), create_test_context())
+            .await
+            .expect_err("discovery must fail fast instead of waiting forever");
+        let elapsed = started.elapsed();
+
+        drop(held_write_lock);
+        assert!(
+            error.to_string().contains("did not respond within 500ms"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "mcp_search took too long to fail: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
