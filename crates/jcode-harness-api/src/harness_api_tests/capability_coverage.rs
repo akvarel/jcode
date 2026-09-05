@@ -81,10 +81,8 @@ const LEDGER: &[(&str, Disposition)] = &[
 /// Requests the reference clients (TUI) send to the daemon.
 fn reference_client_requests() -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-    for dir in ["../jcode-tui/src"] {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
-        collect_requests(&root, &mut found);
-    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../jcode-tui/src");
+    collect_requests(&root, &mut found);
     // covered by construction and would otherwise pollute the diff.
     for api_only in [
         "CreateSession",
@@ -198,6 +196,16 @@ fn capability_report() {
         println!("    - {name}: {reason}");
     }
     println!();
+}
+
+#[test]
+fn gap_dispositions_retain_their_explanation() {
+    let disposition = Gap("clients cannot reach the capability");
+
+    match disposition {
+        Gap(reason) => assert_eq!(reason, "clients cannot reach the capability"),
+        other => panic!("expected a gap disposition, got {other:?}"),
+    }
 }
 
 /// The SDK mirrors jcode's external credential locations by hand, so a new one
