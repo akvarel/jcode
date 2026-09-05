@@ -1668,342 +1668,350 @@ mod tests {
     /// ungrouped goal unconditionally (not only as a group header), so an
     /// ungrouped goal left over from a previous flat todo list is exactly what
     /// the reporter saw frozen in the panel.
-    #[tokio::test]
-    async fn an_ungrouped_goal_does_not_survive_into_a_grouped_next_task() {
+    #[test]
+    fn an_ungrouped_goal_does_not_survive_into_a_grouped_next_task() {
         let _guard = crate::storage::lock_test_env();
-        let previous_home = std::env::var_os("JCODE_HOME");
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        crate::env::set_var("JCODE_HOME", dir.path());
-        let session = "issue-695-ungrouped";
-        let tool = TodoTool::new();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let previous_home = std::env::var_os("JCODE_HOME");
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            crate::env::set_var("JCODE_HOME", dir.path());
+            let session = "issue-695-ungrouped";
+            let tool = TodoTool::new();
 
-        // Task one: a flat (ungrouped) list, so its goal is the ungrouped one.
-        tool.execute(
-            json!({
-                "todos": [{
-                    "content": "flat task one", "status": "in_progress",
-                    "priority": "high", "id": "t1", "confidence": 70,
-                }],
-                "plan": {"user_intention": "do task one", "understands_user_intent": 97},
-                "goals": [{"closed_feedback_loop": 97, "feedback_loop": "ran the checks"}],
-            }),
-            test_ctx(session),
-        )
-        .await
-        .expect("first write");
-        let stored = load_goals(session).expect("goals");
-        assert_eq!(stored.len(), 1);
-        assert!(
-            stored[0].group.is_none(),
-            "task one goal is the ungrouped one"
-        );
+            // Task one: a flat (ungrouped) list, so its goal is the ungrouped one.
+            tool.execute(
+                json!({
+                    "todos": [{
+                        "content": "flat task one", "status": "in_progress",
+                        "priority": "high", "id": "t1", "confidence": 70,
+                    }],
+                    "plan": {"user_intention": "do task one", "understands_user_intent": 97},
+                    "goals": [{"closed_feedback_loop": 97, "feedback_loop": "ran the checks"}],
+                }),
+                test_ctx(session),
+            )
+            .await
+            .expect("first write");
+            let stored = load_goals(session).expect("goals");
+            assert_eq!(stored.len(), 1);
+            assert!(
+                stored[0].group.is_none(),
+                "task one goal is the ungrouped one"
+            );
 
-        // Task two: a grouped list. The ungrouped goal now describes nothing.
-        tool.execute(
-            json!({
-                "todos": [{
-                    "content": "task two", "status": "in_progress", "priority": "high",
-                    "id": "t2", "group": "second task", "confidence": 70,
-                }],
-                "goals": [{"group": "second task", "closed_feedback_loop": 80,
-                           "feedback_loop": "run the new checks"}],
-            }),
-            test_ctx(session),
-        )
-        .await
-        .expect("second write");
+            // Task two: a grouped list. The ungrouped goal now describes nothing.
+            tool.execute(
+                json!({
+                    "todos": [{
+                        "content": "task two", "status": "in_progress", "priority": "high",
+                        "id": "t2", "group": "second task", "confidence": 70,
+                    }],
+                    "goals": [{"group": "second task", "closed_feedback_loop": 80,
+                               "feedback_loop": "run the new checks"}],
+                }),
+                test_ctx(session),
+            )
+            .await
+            .expect("second write");
 
-        let goals = load_goals(session).expect("goals");
-        assert!(
-            !goals.iter().any(|goal| goal.group.is_none()),
-            "the stale ungrouped goal must not stay in the panel: {goals:?}"
-        );
-        assert_eq!(goals.len(), 1);
-        assert_eq!(goals[0].group.as_deref(), Some("second task"));
+            let goals = load_goals(session).expect("goals");
+            assert!(
+                !goals.iter().any(|goal| goal.group.is_none()),
+                "the stale ungrouped goal must not stay in the panel: {goals:?}"
+            );
+            assert_eq!(goals.len(), 1);
+            assert_eq!(goals[0].group.as_deref(), Some("second task"));
 
-        if let Some(home) = previous_home {
-            crate::env::set_var("JCODE_HOME", home);
-        } else {
-            crate::env::remove_var("JCODE_HOME");
-        }
+            if let Some(home) = previous_home {
+                crate::env::set_var("JCODE_HOME", home);
+            } else {
+                crate::env::remove_var("JCODE_HOME");
+            }
+        });
     }
 
     /// Issue #695, end to end through the real tool: finish task one, then
     /// start task two. What the todos panel renders (stored todos + goals) must
     /// describe task two only, with no leftovers from task one.
-    #[tokio::test]
-    async fn moving_to_a_new_task_replaces_what_the_todos_panel_shows() {
+    #[test]
+    fn moving_to_a_new_task_replaces_what_the_todos_panel_shows() {
         let _guard = crate::storage::lock_test_env();
-        let previous_home = std::env::var_os("JCODE_HOME");
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        crate::env::set_var("JCODE_HOME", dir.path());
-        let session = "issue-695-new-task";
-        let tool = TodoTool::new();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let previous_home = std::env::var_os("JCODE_HOME");
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            crate::env::set_var("JCODE_HOME", dir.path());
+            let session = "issue-695-new-task";
+            let tool = TodoTool::new();
 
-        // Task one, completed. `end_to_end_ownership` clears the completion
-        // gate so the write is actually stored.
-        tool.execute(
-            json!({
-                "todos": [{
-                    "content": "task one",
-                    "status": "completed",
-                    "priority": "high",
-                    "id": "t1",
-                    "group": "first task",
-                    "confidence": 90,
-                    "completion_confidence": 97,
-                }],
-                "plan": {"user_intention": "do task one", "understands_user_intent": 97},
-                "goals": [{
-                    "group": "first task",
-                    "closed_feedback_loop": 97,
-                    "end_to_end_ownership": 97,
-                    "feedback_loop": "ran the checks",
-                }],
-            }),
-            test_ctx(session),
-        )
-        .await
-        .expect("first task write should succeed");
-        assert_eq!(load_goals(session).expect("goals").len(), 1);
+            // Task one, completed. `end_to_end_ownership` clears the completion
+            // gate so the write is actually stored.
+            tool.execute(
+                json!({
+                    "todos": [{
+                        "content": "task one",
+                        "status": "completed",
+                        "priority": "high",
+                        "id": "t1",
+                        "group": "first task",
+                        "confidence": 90,
+                        "completion_confidence": 97,
+                    }],
+                    "plan": {"user_intention": "do task one", "understands_user_intent": 97},
+                    "goals": [{
+                        "group": "first task",
+                        "closed_feedback_loop": 97,
+                        "end_to_end_ownership": 97,
+                        "feedback_loop": "ran the checks",
+                    }],
+                }),
+                test_ctx(session),
+            )
+            .await
+            .expect("first task write should succeed");
+            assert_eq!(load_goals(session).expect("goals").len(), 1);
 
-        // Task two: a fresh todo list in a new group.
-        tool.execute(
-            json!({
-                "todos": [{
-                    "content": "task two",
-                    "status": "in_progress",
-                    "priority": "high",
-                    "id": "t2",
-                    "group": "second task",
-                    "confidence": 70,
-                }],
-                "goals": [{
-                    "group": "second task",
-                    "closed_feedback_loop": 80,
-                    "feedback_loop": "run the new checks",
-                }],
-            }),
-            test_ctx(session),
-        )
-        .await
-        .expect("second task write should succeed");
+            // Task two: a fresh todo list in a new group.
+            tool.execute(
+                json!({
+                    "todos": [{
+                        "content": "task two",
+                        "status": "in_progress",
+                        "priority": "high",
+                        "id": "t2",
+                        "group": "second task",
+                        "confidence": 70,
+                    }],
+                    "goals": [{
+                        "group": "second task",
+                        "closed_feedback_loop": 80,
+                        "feedback_loop": "run the new checks",
+                    }],
+                }),
+                test_ctx(session),
+            )
+            .await
+            .expect("second task write should succeed");
 
-        let todos = load_todos(session).expect("todos");
-        assert_eq!(todos.len(), 1, "panel must show only the current task");
-        assert_eq!(todos[0].group.as_deref(), Some("second task"));
+            let todos = load_todos(session).expect("todos");
+            assert_eq!(todos.len(), 1, "panel must show only the current task");
+            assert_eq!(todos[0].group.as_deref(), Some("second task"));
 
-        let goals = load_goals(session).expect("goals");
-        assert_eq!(
-            goals.len(),
-            1,
-            "the finished task's goal must not linger in the panel: {goals:?}"
-        );
-        assert_eq!(goals[0].group.as_deref(), Some("second task"));
+            let goals = load_goals(session).expect("goals");
+            assert_eq!(
+                goals.len(),
+                1,
+                "the finished task's goal must not linger in the panel: {goals:?}"
+            );
+            assert_eq!(goals[0].group.as_deref(), Some("second task"));
 
-        if let Some(home) = previous_home {
-            crate::env::set_var("JCODE_HOME", home);
-        } else {
-            crate::env::remove_var("JCODE_HOME");
-        }
+            if let Some(home) = previous_home {
+                crate::env::set_var("JCODE_HOME", home);
+            } else {
+                crate::env::remove_var("JCODE_HOME");
+            }
+        });
     }
 
     /// End-to-end through the real tool, which is what the model actually sees.
     /// A first plan write with honestly-moderate scores must come back clean:
     /// this is the exact case that previously returned two nudges and spent the
     /// turn re-justifying the plan instead of doing the work.
-    #[tokio::test]
-    async fn a_moderate_first_write_returns_no_continuation_and_records_instead() {
+    #[test]
+    fn a_moderate_first_write_returns_no_continuation_and_records_instead() {
         let _guard = crate::storage::lock_test_env();
-        let previous_home = std::env::var_os("JCODE_HOME");
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        crate::env::set_var("JCODE_HOME", dir.path());
-        let session = "gate-deferral-execute";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let previous_home = std::env::var_os("JCODE_HOME");
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            crate::env::set_var("JCODE_HOME", dir.path());
+            let session = "gate-deferral-execute";
 
-        let output = TodoTool::new()
-            .execute(
-                json!({
-                    "todos": [{
-                        "content": "make utf16 transcode faster",
-                        "status": "in_progress",
-                        "priority": "high",
-                        "id": "opt",
-                        "group": "speed",
-                        "confidence": 70,
-                    }],
-                    "plan": {
-                        "user_intention": "beat the baseline",
-                        "understands_user_intent": 82,
-                    },
-                    "goals": [{
-                        "group": "speed",
-                        "closed_feedback_loop": 80,
-                        "feedback_loop": "run ./grade and read the score",
-                        "feedback_loop_relevance": "indirect",
-                        "feedback_loop_coverage": "narrow",
-                    }],
-                }),
-                test_ctx(session),
-            )
-            .await
-            .expect("todo write should succeed");
+            let output = TodoTool::new()
+                .execute(
+                    json!({
+                        "todos": [{
+                            "content": "make utf16 transcode faster",
+                            "status": "in_progress",
+                            "priority": "high",
+                            "id": "opt",
+                            "group": "speed",
+                            "confidence": 70,
+                        }],
+                        "plan": {
+                            "user_intention": "beat the baseline",
+                            "understands_user_intent": 82,
+                        },
+                        "goals": [{
+                            "group": "speed",
+                            "closed_feedback_loop": 80,
+                            "feedback_loop": "run ./grade and read the score",
+                            "feedback_loop_relevance": "indirect",
+                            "feedback_loop_coverage": "narrow",
+                        }],
+                    }),
+                    test_ctx(session),
+                )
+                .await
+                .expect("todo write should succeed");
 
-        assert!(
-            !output
-                .output
-                .contains(TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE),
-            "a moderate first write must not be interrupted: {}",
-            output.output
-        );
-        assert!(
-            !output
-                .output
-                .to_ascii_lowercase()
-                .contains("not high enough"),
-            "no gate text should reach the model mid-turn: {}",
-            output.output
-        );
+            assert!(
+                !output
+                    .output
+                    .contains(TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE),
+                "a moderate first write must not be interrupted: {}",
+                output.output
+            );
+            assert!(
+                !output
+                    .output
+                    .to_ascii_lowercase()
+                    .contains("not high enough"),
+                "no gate text should reach the model mid-turn: {}",
+                output.output
+            );
 
-        // The points were recorded for the turn-end digest instead.
-        let observations = crate::todo::load_gate_observations(session).expect("observations");
-        assert_eq!(observations.len(), 5);
-        assert!(
-            observations.iter().any(|observation| {
+            // The points were recorded for the turn-end digest instead.
+            let observations = crate::todo::load_gate_observations(session).expect("observations");
+            assert_eq!(observations.len(), 5);
+            assert!(observations.iter().any(|observation| {
                 observation.kind == GateObservationKind::FeedbackLoopRelevance
-            })
-        );
-        assert!(
-            observations.iter().any(|observation| {
+            }));
+            assert!(observations.iter().any(|observation| {
                 observation.kind == GateObservationKind::FeedbackLoopCoverage
-            })
-        );
-        assert!(observations.iter().any(|observation| {
-            observation.kind == GateObservationKind::FeedbackLoopTraceability
-        }));
+            }));
+            assert!(observations.iter().any(|observation| {
+                observation.kind == GateObservationKind::FeedbackLoopTraceability
+            }));
 
-        // Histories are accumulating, which is what the digest reasons over.
-        let plan = load_plan(session).expect("plan");
-        assert_eq!(
-            plan.understands_user_intent_history,
-            vec![crate::todo::IntentUnderstanding::Partial]
-        );
-        let goals = load_goals(session).expect("goals");
-        assert_eq!(
-            goals[0].closed_feedback_loop_history,
-            vec![crate::todo::FeedbackLoopState::Strong]
-        );
-        assert_eq!(
-            goals[0].feedback_loop_relevance_history,
-            vec![crate::todo::FeedbackLoopRelevance::Indirect]
-        );
-        assert_eq!(
-            goals[0].feedback_loop_coverage_history,
-            vec![crate::todo::FeedbackLoopCoverage::Narrow]
-        );
+            // Histories are accumulating, which is what the digest reasons over.
+            let plan = load_plan(session).expect("plan");
+            assert_eq!(
+                plan.understands_user_intent_history,
+                vec![crate::todo::IntentUnderstanding::Partial]
+            );
+            let goals = load_goals(session).expect("goals");
+            assert_eq!(
+                goals[0].closed_feedback_loop_history,
+                vec![crate::todo::FeedbackLoopState::Strong]
+            );
+            assert_eq!(
+                goals[0].feedback_loop_relevance_history,
+                vec![crate::todo::FeedbackLoopRelevance::Indirect]
+            );
+            assert_eq!(
+                goals[0].feedback_loop_coverage_history,
+                vec![crate::todo::FeedbackLoopCoverage::Narrow]
+            );
 
-        // Second write at a higher score: still silent, history grows, and the
-        // digest now has the trajectory available.
-        let output = TodoTool::new()
-            .execute(
-                json!({"plan": {"understands_user_intent": 97}}),
-                test_ctx(session),
-            )
-            .await
-            .expect("second write should succeed");
-        assert!(
-            !output
-                .output
-                .to_ascii_lowercase()
-                .contains("not high enough")
-        );
-        let plan = load_plan(session).expect("plan");
-        assert_eq!(
-            plan.understands_user_intent_history,
-            vec![
-                crate::todo::IntentUnderstanding::Partial,
-                crate::todo::IntentUnderstanding::Clear
-            ]
-        );
+            // Second write at a higher score: still silent, history grows, and the
+            // digest now has the trajectory available.
+            let output = TodoTool::new()
+                .execute(
+                    json!({"plan": {"understands_user_intent": 97}}),
+                    test_ctx(session),
+                )
+                .await
+                .expect("second write should succeed");
+            assert!(
+                !output
+                    .output
+                    .to_ascii_lowercase()
+                    .contains("not high enough")
+            );
+            let plan = load_plan(session).expect("plan");
+            assert_eq!(
+                plan.understands_user_intent_history,
+                vec![
+                    crate::todo::IntentUnderstanding::Partial,
+                    crate::todo::IntentUnderstanding::Clear
+                ]
+            );
 
-        // The climb does not erase the point. The turn began without solid
-        // understanding, so the work done before it settled still needs a
-        // re-check; the wording just reflects that it settled late.
-        let observations = crate::todo::load_gate_observations(session).expect("observations");
-        let goals = load_goals(session).expect("goals");
-        let digest = crate::todo::build_gate_digest(&observations, &plan, &goals)
-            .expect("both recorded points should be surfaced");
-        assert!(digest.contains("started this work without understanding"));
-        assert!(digest.contains("feedback loop"));
+            // The climb does not erase the point. The turn began without solid
+            // understanding, so the work done before it settled still needs a
+            // re-check; the wording just reflects that it settled late.
+            let observations = crate::todo::load_gate_observations(session).expect("observations");
+            let goals = load_goals(session).expect("goals");
+            let digest = crate::todo::build_gate_digest(&observations, &plan, &goals)
+                .expect("both recorded points should be surfaced");
+            assert!(digest.contains("started this work without understanding"));
+            assert!(digest.contains("feedback loop"));
 
-        match previous_home {
-            Some(value) => crate::env::set_var("JCODE_HOME", value),
-            None => crate::env::remove_var("JCODE_HOME"),
-        }
+            match previous_home {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn low_ownership_completion_is_saved_without_mid_write_rejection() {
+    #[test]
+    fn low_ownership_completion_is_saved_without_mid_write_rejection() {
         let _guard = crate::storage::lock_test_env();
-        let previous_home = std::env::var_os("JCODE_HOME");
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        crate::env::set_var("JCODE_HOME", dir.path());
-        let session = "ownership-save-before-turn-gate";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let previous_home = std::env::var_os("JCODE_HOME");
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            crate::env::set_var("JCODE_HOME", dir.path());
+            let session = "ownership-save-before-turn-gate";
 
-        let output = TodoTool::new()
-            .execute(
-                json!({
-                    "todos": [{
-                        "content": "ship the complete workflow",
-                        "status": "completed",
-                        "priority": "high",
-                        "id": "ship",
-                        "group": "release",
-                        "confidence": 100,
-                        "completion_confidence": 100,
-                    }],
-                    "goals": [{
-                        "group": "release",
-                        "closed_feedback_loop": 100,
-                        "feedback_loop": "run the end-to-end release check",
-                        "feedback_loop_relevance": "indirect",
-                        "feedback_loop_coverage": "narrow",
-                        "end_to_end_ownership": 95,
-                    }],
-                }),
-                test_ctx(session),
-            )
-            .await
-            .expect("low ownership must not reject the todo write");
+            let output = TodoTool::new()
+                .execute(
+                    json!({
+                        "todos": [{
+                            "content": "ship the complete workflow",
+                            "status": "completed",
+                            "priority": "high",
+                            "id": "ship",
+                            "group": "release",
+                            "confidence": 100,
+                            "completion_confidence": 100,
+                        }],
+                        "goals": [{
+                            "group": "release",
+                            "closed_feedback_loop": 100,
+                            "feedback_loop": "run the end-to-end release check",
+                            "feedback_loop_relevance": "indirect",
+                            "feedback_loop_coverage": "narrow",
+                            "end_to_end_ownership": 95,
+                        }],
+                    }),
+                    test_ctx(session),
+                )
+                .await
+                .expect("low ownership must not reject the todo write");
 
-        let saved = load_todos(session).expect("completed todo should be persisted");
-        assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].status, "completed");
-        let saved_goals = load_goals(session).expect("goal should be persisted");
-        let saved_goal = &saved_goals[0];
-        assert_eq!(
-            saved_goal.delivery_state,
-            Some(crate::todo::DeliveryState::WorkflowValidated)
-        );
-        assert_eq!(
-            saved_goal.feedback_loop_relevance,
-            Some(crate::todo::FeedbackLoopRelevance::Indirect)
-        );
-        assert_eq!(
-            saved_goal.feedback_loop_coverage,
-            Some(crate::todo::FeedbackLoopCoverage::Narrow)
-        );
-        assert!(
-            !output
-                .output
-                .contains(crate::todo::TODO_OWNERSHIP_CONTINUATION_MESSAGE),
-            "ownership is enforced after the turn, not by rejecting the write: {}",
-            output.output
-        );
+            let saved = load_todos(session).expect("completed todo should be persisted");
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].status, "completed");
+            let saved_goals = load_goals(session).expect("goal should be persisted");
+            let saved_goal = &saved_goals[0];
+            assert_eq!(
+                saved_goal.delivery_state,
+                Some(crate::todo::DeliveryState::WorkflowValidated)
+            );
+            assert_eq!(
+                saved_goal.feedback_loop_relevance,
+                Some(crate::todo::FeedbackLoopRelevance::Indirect)
+            );
+            assert_eq!(
+                saved_goal.feedback_loop_coverage,
+                Some(crate::todo::FeedbackLoopCoverage::Narrow)
+            );
+            assert!(
+                !output
+                    .output
+                    .contains(crate::todo::TODO_OWNERSHIP_CONTINUATION_MESSAGE),
+                "ownership is enforced after the turn, not by rejecting the write: {}",
+                output.output
+            );
 
-        match previous_home {
-            Some(value) => crate::env::set_var("JCODE_HOME", value),
-            None => crate::env::remove_var("JCODE_HOME"),
-        }
+            match previous_home {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        });
     }
 
     #[test]
@@ -2025,7 +2033,7 @@ mod tests {
             ..before.clone()
         };
 
-        let changes = goal_changes(&[before.clone()], &[after.clone()]);
+        let changes = goal_changes(std::slice::from_ref(&before), std::slice::from_ref(&after));
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].before.as_ref(), Some(&before));
