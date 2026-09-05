@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(BELVEDIR_PROFILE.api_key_env, "BELVEDIR_API_KEY");
         assert_eq!(BELVEDIR_PROFILE.env_file, "belvedir.env");
         assert_eq!(BELVEDIR_PROFILE.default_model, Some("auto"));
-        assert!(BELVEDIR_PROFILE.requires_api_key);
+        const { assert!(BELVEDIR_PROFILE.requires_api_key) };
 
         let provider = resolve_login_provider("belvedir.ai").expect("Belvedir alias resolves");
         assert_eq!(provider.id, "belvedir");

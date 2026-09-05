@@ -124,23 +124,25 @@ fn profile_shadowing_builtin_name_with_other_base_is_user_named() {
 /// End-to-end guard for issue #579: parse a real `config.toml` snippet, build
 /// the provider from it, perform a live `/models` fetch whose catalog omits the
 /// user's declared model, and assert the picker still offers it.
-#[tokio::test]
-async fn config_toml_models_survive_a_real_catalog_fetch() {
+#[test]
+fn config_toml_models_survive_a_real_catalog_fetch() {
     let _lock = ENV_LOCK.lock();
-    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
 
-    let api_base = spawn_models_server(
-        r#"{
+        let api_base = spawn_models_server(
+            r#"{
             "object": "list",
             "data": [
                 {"id": "vendor-live-model", "object": "model", "context_length": 131072}
             ]
         }"#,
-    );
+        );
 
-    // Exactly the shape a user writes in ~/.jcode/config.toml.
-    let toml_src = format!(
-        r#"
+        // Exactly the shape a user writes in ~/.jcode/config.toml.
+        let toml_src = format!(
+            r#"
 base_url = "{api_base}"
 auth = "none"
 model_catalog = true
@@ -150,30 +152,31 @@ default_model = "vendor-live-model"
 id = "my-custom-model"
 context_window = 128000
 "#
-    );
-    let profile: jcode_base::config::NamedProviderConfig =
-        toml::from_str(&toml_src).expect("config.toml profile should parse");
+        );
+        let profile: jcode_base::config::NamedProviderConfig =
+            toml::from_str(&toml_src).expect("config.toml profile should parse");
 
-    let provider = OpenRouterProvider::new_named_openai_compatible("mylocal", &profile)
-        .expect("named profile should initialize");
+        let provider = OpenRouterProvider::new_named_openai_compatible("mylocal", &profile)
+            .expect("named profile should initialize");
 
-    // Real HTTP catalog fetch, mirroring the background refresh that used to
-    // drop config-declared models.
-    provider
-        .fetch_models()
-        .await
-        .expect("live catalog fetch should succeed");
+        // Real HTTP catalog fetch, mirroring the background refresh that used to
+        // drop config-declared models.
+        provider
+            .fetch_models()
+            .await
+            .expect("live catalog fetch should succeed");
 
-    let models = provider.available_models_display();
-    assert!(
-        models.iter().any(|m| m == "my-custom-model"),
-        "config.toml model must survive a live catalog fetch (and must not rely \
-         on the current-model fallback): {models:?}"
-    );
-    assert!(
-        models.iter().any(|m| m == "vendor-live-model"),
-        "live catalog models must still be offered: {models:?}"
-    );
+        let models = provider.available_models_display();
+        assert!(
+            models.iter().any(|m| m == "my-custom-model"),
+            "config.toml model must survive a live catalog fetch (and must not rely \
+             on the current-model fallback): {models:?}"
+        );
+        assert!(
+            models.iter().any(|m| m == "vendor-live-model"),
+            "live catalog models must still be offered: {models:?}"
+        );
+    });
 }
 
 /// Regression test for issue #607.

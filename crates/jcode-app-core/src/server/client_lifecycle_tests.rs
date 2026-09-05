@@ -193,55 +193,59 @@ async fn busy_agent_request_rejection_does_not_wait_for_agent_lock() {
     assert!(client_event_rx.try_recv().is_err());
 }
 
-#[tokio::test]
-async fn context_message_persists_without_starting_turn() {
+#[test]
+fn context_message_persists_without_starting_turn() {
     let _guard = crate::storage::lock_test_env();
-    let _env = IsolatedReloadRecoveryEnv::new();
-    let session_id = "session_context_only_no_reply";
-    let forked = Arc::new(AtomicBool::new(false));
-    let provider: Arc<dyn Provider> = Arc::new(PanicOnForkProvider {
-        forked: Arc::clone(&forked),
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let _env = IsolatedReloadRecoveryEnv::new();
+        let session_id = "session_context_only_no_reply";
+        let forked = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn Provider> = Arc::new(PanicOnForkProvider {
+            forked: Arc::clone(&forked),
+        });
+        let registry = Registry::new(Arc::clone(&provider)).await;
+        let mut session =
+            crate::session::Session::create_with_id(session_id.to_string(), None, None);
+        session.model = Some("panic-on-fork".to_string());
+        let agent = Arc::new(Mutex::new(Agent::new_with_session(
+            provider, registry, session, None,
+        )));
+        let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let before = agent.lock().await.message_count();
+
+        append_context_message(
+            77,
+            "remember this context",
+            vec![("image/png".to_string(), "AAA".to_string())],
+            session_id,
+            false,
+            &agent,
+            &client_event_tx,
+        )
+        .await;
+
+        assert!(matches!(
+            client_event_rx.recv().await,
+            Some(ServerEvent::ContextMessageAdded { id: 77 })
+        ));
+        assert!(client_event_rx.try_recv().is_err());
+        assert!(!forked.load(Ordering::SeqCst));
+
+        let persisted = crate::session::Session::load(session_id).expect("persisted session");
+        assert_eq!(persisted.messages.len(), before + 1);
+        let message = persisted.messages.last().unwrap();
+        assert_eq!(format!("{:?}", message.role), "User");
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::Image { media_type, data }
+                if media_type == "image/png" && data == "AAA"
+        ));
+        assert!(matches!(
+            &message.content[1],
+            ContentBlock::Text { text, .. } if text == "remember this context"
+        ));
     });
-    let registry = Registry::new(Arc::clone(&provider)).await;
-    let mut session = crate::session::Session::create_with_id(session_id.to_string(), None, None);
-    session.model = Some("panic-on-fork".to_string());
-    let agent = Arc::new(Mutex::new(Agent::new_with_session(
-        provider, registry, session, None,
-    )));
-    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let before = agent.lock().await.message_count();
-
-    append_context_message(
-        77,
-        "remember this context",
-        vec![("image/png".to_string(), "AAA".to_string())],
-        session_id,
-        false,
-        &agent,
-        &client_event_tx,
-    )
-    .await;
-
-    assert!(matches!(
-        client_event_rx.recv().await,
-        Some(ServerEvent::ContextMessageAdded { id: 77 })
-    ));
-    assert!(client_event_rx.try_recv().is_err());
-    assert!(!forked.load(Ordering::SeqCst));
-
-    let persisted = crate::session::Session::load(session_id).expect("persisted session");
-    assert_eq!(persisted.messages.len(), before + 1);
-    let message = persisted.messages.last().unwrap();
-    assert_eq!(format!("{:?}", message.role), "User");
-    assert!(matches!(
-        &message.content[0],
-        ContentBlock::Image { media_type, data }
-            if media_type == "image/png" && data == "AAA"
-    ));
-    assert!(matches!(
-        &message.content[1],
-        ContentBlock::Text { text, .. } if text == "remember this context"
-    ));
 }
 
 #[tokio::test]
@@ -967,136 +971,140 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
     });
 }
 
-#[tokio::test]
-async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attachments() {
+#[test]
+fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attachments() {
     let _guard = crate::storage::lock_test_env();
-    let _runtime = IsolatedRuntimeDir::new();
-    let session_id = "session_live_attachment_fanout";
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let _runtime = IsolatedRuntimeDir::new();
+        let session_id = "session_live_attachment_fanout";
 
-    let provider: Arc<dyn Provider> = Arc::new(FanoutStreamProvider);
-    let registry = Registry::new(Arc::clone(&provider)).await;
-    let mut session = crate::session::Session::create_with_id(session_id.to_string(), None, None);
-    session.model = Some("fanout-stream".to_string());
-    let agent = Arc::new(Mutex::new(Agent::new_with_session(
-        provider, registry, session, None,
-    )));
+        let provider: Arc<dyn Provider> = Arc::new(FanoutStreamProvider);
+        let registry = Registry::new(Arc::clone(&provider)).await;
+        let mut session =
+            crate::session::Session::create_with_id(session_id.to_string(), None, None);
+        session.model = Some("fanout-stream".to_string());
+        let agent = Arc::new(Mutex::new(Agent::new_with_session(
+            provider, registry, session, None,
+        )));
 
-    let (origin_tx, mut origin_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let (attached_tx, mut attached_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        SwarmMember {
-            session_id: session_id.to_string(),
-            event_tx: origin_tx.clone(),
-            event_txs: HashMap::from([("origin".to_string(), origin_tx.clone())]),
-            working_dir: None,
-            swarm_id: None,
-            swarm_enabled: false,
-            status: "ready".to_string(),
-            detail: None,
-            task_label: None,
-            friendly_name: None,
-            report_back_to_session_id: None,
-            latest_completion_report: None,
-            role: "agent".to_string(),
-            joined_at: Instant::now(),
-            last_status_change: Instant::now(),
-            is_headless: false,
-            output_tail: None,
-            todo_progress: None,
-            todo_items: Vec::new(),
-            runtime: crate::protocol::SwarmMemberRuntime::default(),
-        },
-    )])));
-    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
-    let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
-    let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (swarm_event_tx, _) = broadcast::channel(8);
-    let (processing_done_tx, mut processing_done_rx) = mpsc::unbounded_channel();
-    let mut client_is_processing = false;
-    let mut processing_message_id = None;
-    let mut processing_session_id = None;
-    let mut processing_task = None;
+        let (origin_tx, mut origin_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let (attached_tx, mut attached_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            SwarmMember {
+                session_id: session_id.to_string(),
+                event_tx: origin_tx.clone(),
+                event_txs: HashMap::from([("origin".to_string(), origin_tx.clone())]),
+                working_dir: None,
+                swarm_id: None,
+                swarm_enabled: false,
+                status: "ready".to_string(),
+                detail: None,
+                task_label: None,
+                friendly_name: None,
+                report_back_to_session_id: None,
+                latest_completion_report: None,
+                role: "agent".to_string(),
+                joined_at: Instant::now(),
+                last_status_change: Instant::now(),
+                is_headless: false,
+                output_tail: None,
+                todo_progress: None,
+                todo_items: Vec::new(),
+                runtime: crate::protocol::SwarmMemberRuntime::default(),
+            },
+        )])));
+        let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+        let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+        let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (swarm_event_tx, _) = broadcast::channel(8);
+        let (processing_done_tx, mut processing_done_rx) = mpsc::unbounded_channel();
+        let mut client_is_processing = false;
+        let mut processing_message_id = None;
+        let mut processing_session_id = None;
+        let mut processing_task = None;
 
-    start_processing_message(
-        ProcessingMessage {
-            id: 479,
-            content: "stream to every attachment".to_string(),
-            images: Vec::new(),
-            system_reminder: None,
-            active_skill: None,
-        },
-        session_id,
-        &mut ProcessingState {
-            client_is_processing: &mut client_is_processing,
-            message_id: &mut processing_message_id,
-            session_id: &mut processing_session_id,
-            task: &mut processing_task,
-        },
-        &agent,
-        &origin_tx,
-        &processing_done_tx,
-        Vec::new(),
-        &SwarmStatusRefs {
-            members: &swarm_members,
-            swarms_by_id: &swarms_by_id,
-            event_history: &event_history,
-            event_counter: &event_counter,
-            event_tx: &swarm_event_tx,
-        },
-    )
-    .await;
+        start_processing_message(
+            ProcessingMessage {
+                id: 479,
+                content: "stream to every attachment".to_string(),
+                images: Vec::new(),
+                system_reminder: None,
+                active_skill: None,
+            },
+            session_id,
+            &mut ProcessingState {
+                client_is_processing: &mut client_is_processing,
+                message_id: &mut processing_message_id,
+                session_id: &mut processing_session_id,
+                task: &mut processing_task,
+            },
+            &agent,
+            &origin_tx,
+            &processing_done_tx,
+            Vec::new(),
+            &SwarmStatusRefs {
+                members: &swarm_members,
+                swarms_by_id: &swarms_by_id,
+                event_history: &event_history,
+                event_counter: &event_counter,
+                event_tx: &swarm_event_tx,
+            },
+        )
+        .await;
 
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), origin_rx.recv())
-            .await
-            .expect("origin should receive the initial stream event promptly")
-            .expect("origin event channel should remain open");
-        if matches!(event, ServerEvent::TextDelta { ref text } if text == "before attach") {
-            break;
-        }
-    }
-
-    crate::server::register_session_event_sender(
-        &swarm_members,
-        session_id,
-        "attached",
-        attached_tx,
-    )
-    .await;
-
-    for rx in [&mut origin_rx, &mut attached_rx] {
-        let mut saw_post_attach_delta = false;
-        let mut saw_message_end = false;
-        let mut saw_done = false;
-        while !saw_post_attach_delta || !saw_message_end || !saw_done {
-            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), origin_rx.recv())
                 .await
-                .expect("attachment should receive streamed event promptly")
-                .expect("attachment event channel should remain open");
-            saw_post_attach_delta |= matches!(
-                event,
-                ServerEvent::TextDelta { ref text } if text == "after attach"
-            );
-            if matches!(event, ServerEvent::MessageEnd { .. }) {
-                assert!(!saw_done, "MessageEnd must precede the terminal Done event");
-                saw_message_end = true;
+                .expect("origin should receive the initial stream event promptly")
+                .expect("origin event channel should remain open");
+            if matches!(event, ServerEvent::TextDelta { ref text } if text == "before attach") {
+                break;
             }
-            saw_done |= matches!(event, ServerEvent::Done { id: 479 });
         }
-    }
 
-    let (done_id, result, _) =
-        tokio::time::timeout(Duration::from_secs(2), processing_done_rx.recv())
-            .await
-            .expect("processing should complete promptly")
-            .expect("processing completion channel should remain open");
-    assert_eq!(done_id, 479);
-    result.expect("turn should complete successfully");
+        crate::server::register_session_event_sender(
+            &swarm_members,
+            session_id,
+            "attached",
+            attached_tx,
+        )
+        .await;
 
-    if let Some(handle) = processing_task.take() {
-        handle.await.expect("processing task join");
-    }
+        for rx in [&mut origin_rx, &mut attached_rx] {
+            let mut saw_post_attach_delta = false;
+            let mut saw_message_end = false;
+            let mut saw_done = false;
+            while !saw_post_attach_delta || !saw_message_end || !saw_done {
+                let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("attachment should receive streamed event promptly")
+                    .expect("attachment event channel should remain open");
+                saw_post_attach_delta |= matches!(
+                    event,
+                    ServerEvent::TextDelta { ref text } if text == "after attach"
+                );
+                if matches!(event, ServerEvent::MessageEnd { .. }) {
+                    assert!(!saw_done, "MessageEnd must precede the terminal Done event");
+                    saw_message_end = true;
+                }
+                saw_done |= matches!(event, ServerEvent::Done { id: 479 });
+            }
+        }
+
+        let (done_id, result, _) =
+            tokio::time::timeout(Duration::from_secs(2), processing_done_rx.recv())
+                .await
+                .expect("processing should complete promptly")
+                .expect("processing completion channel should remain open");
+        assert_eq!(done_id, 479);
+        result.expect("turn should complete successfully");
+
+        if let Some(handle) = processing_task.take() {
+            handle.await.expect("processing task join");
+        }
+    });
 }
 
 #[test]
