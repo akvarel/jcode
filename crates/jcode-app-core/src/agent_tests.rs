@@ -1127,6 +1127,8 @@ async fn explicit_provider_pin_is_persisted_and_reapplied_on_restore() {
     let registry = Registry::new(provider_dyn.clone()).await;
     let mut agent = Agent::new(provider_dyn, registry);
 
+    // Explicitly saved sessions retain model choices before their first turn.
+    agent.session.saved = true;
     agent
         .set_model("z-ai/glm-5.2@Novita")
         .expect("set explicitly pinned model");
@@ -1322,6 +1324,7 @@ async fn mark_closed_persists_soft_interrupts_for_restore_after_reload() {
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider.clone(), registry.clone());
     let session_id = agent.session_id().to_string();
+    agent.session.saved = true;
     agent.session.save().expect("save active session");
     agent.queue_soft_interrupt(
         "resume me after reload".to_string(),

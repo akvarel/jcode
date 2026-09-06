@@ -120,12 +120,16 @@ pub(crate) fn register_session_tool_policy(
     let mut policies = SESSION_TOOL_POLICIES
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let team_memory_writer = policies
+        .get(session_id)
+        .is_none_or(|policy| policy.team_memory_writer);
     policies.insert(
         session_id.to_string(),
         SessionToolPolicy {
             allowed_tools,
             disabled_tools,
             owner: Some(owner),
+            team_memory_writer,
         },
     );
     SessionToolPolicyRegistration {

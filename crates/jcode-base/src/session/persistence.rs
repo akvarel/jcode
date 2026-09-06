@@ -377,9 +377,10 @@ impl Session {
         let journal_path = session_journal_path_from_snapshot(&path);
 
         // A newly opened panel contains only its hidden session-context message.
-        // Do not turn that implementation detail into a transcript on disk. An
-        // explicitly empty session or one with durable metadata is not untouched
-        // and must still be persisted for programmatic restore and coordination.
+        // Explicitly empty handoff snapshots and durable work still persist.
+        // Do not turn that implementation detail into a transcript on disk. Once
+        // the user (or a programmatic caller) adds a real conversation message,
+        // the normal first snapshot includes all of the accumulated context.
         //
         // A caller-chosen `title` (review/judge sessions, menubar sessions) is
         // explicit state just like `custom_title`, so it must persist even
@@ -390,27 +391,14 @@ impl Session {
         if !self.persist_state.snapshot_exists
             && self.messages.len() == 1
             && self.has_session_context_message()
-            && self.parent_id.is_none()
+            && !self.is_canary
+            && self.testing_build.is_none()
+            && self.memory_injections.is_empty()
+            && self.replay_events.is_empty()
             && !self.saved
             && self.custom_title.is_none()
             && self.title.is_none()
-            && self.provider_session_id.is_none()
-            && self.provider_key.is_none()
-            && self.model.is_none()
-            && self.route_api_method.is_none()
-            && self.reasoning_effort.is_none()
-            && self.subagent_model.is_none()
-            && self.improve_mode.is_none()
-            && self.autoreview_enabled.is_none()
-            && self.autojudge_enabled.is_none()
-            && !self.is_debug
-            && !self.is_canary
-            && self.testing_build.is_none()
-            && self.status == super::SessionStatus::Active
-            && self.save_label.is_none()
-            && self.env_snapshots.is_empty()
-            && self.memory_injections.is_empty()
-            && self.replay_events.is_empty()
+            && self.parent_id.is_none()
         {
             return Ok(());
         }

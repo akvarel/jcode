@@ -480,9 +480,10 @@ mod public_acceptance_tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn public_socket_keeps_its_attachment_after_another_sessions_state() {
+    #[test]
+    fn public_socket_keeps_its_attachment_after_another_sessions_state() {
         let _home_lock = translate::jcode_home_test_lock();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
         let root = std::env::temp_dir().join(format!(
             "jcode-api-attachment-{}-{}",
             std::process::id(),
@@ -575,7 +576,7 @@ mod public_acceptance_tests {
             .expect("message should cross the API/legacy boundary")
             .unwrap();
         bridge.abort();
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root);        });
     }
 }
 
