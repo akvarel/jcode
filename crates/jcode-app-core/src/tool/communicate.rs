@@ -1777,10 +1777,6 @@ struct CommunicateInput {
     /// threshold.
     #[serde(default)]
     tldr: Option<String>,
-    /// Per-spawn model override for spawn/assign_task/assign_next/run_plan
-    /// spawns. Takes precedence over agents.swarm_model config.
-    #[serde(default)]
-    model: Option<String>,
     /// Ordered fallback models used by run_plan retries.
     #[serde(default)]
     model_fallbacks: Option<Vec<String>>,
@@ -1969,7 +1965,7 @@ impl Tool for CommunicateTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for newly spawned workers (spawn, assign_task, assign_next, fill_slots, run_plan), e.g. 'gpt-6-astra' or 'openai-api:gpt-5.6-luna'. Overrides agents.swarm_model. Omit to use that default or inherit the coordinator if unset. Use 'inherit' to force the coordinator's model and route. Does not change reused workers. See list_models."
+                    "description": "New workers' model. Overrides agents.swarm_model. Use 'inherit' for coordinator route. See list_models."
                 },
                 "model_fallbacks": {
                     "type": "array",

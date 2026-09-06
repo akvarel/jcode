@@ -190,6 +190,9 @@ pub(super) fn send_transcript_payload(payload: Value) -> bool {
 }
 
 pub(super) fn send_payload(mut payload: Value, mode: DeliveryMode) -> bool {
+    super::concurrency::mark_legacy_concurrency_unavailable(&mut payload);
+    #[cfg(test)]
+    super::tests::TEST_DELIVERY_MODES.lock().unwrap().push(mode);
     #[cfg(test)]
     if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
         emitted.push(payload.clone());

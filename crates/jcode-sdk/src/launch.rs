@@ -783,12 +783,13 @@ mod tests {
             OsString::from("unwanted-model"),
         );
 
-        assert!(
-            launch_instance(&options).is_err(),
-            "fake runtime should fail startup"
-        );
+        let error = launch_instance(&options)
+            .err()
+            .expect("fake runtime should fail startup");
         assert_eq!(
-            fs::read_to_string(captured).expect("captured model"),
+            fs::read_to_string(captured).unwrap_or_else(|capture_error| panic!(
+                "captured model: {capture_error}; launch failed: {error}"
+            )),
             "inherit"
         );
     }
