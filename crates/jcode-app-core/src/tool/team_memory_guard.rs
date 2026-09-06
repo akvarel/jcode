@@ -167,6 +167,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_write_denial_survives_policy_registration_and_replacement() {
+        let session = "team-memory-policy-registration-regression";
+        crate::tool::deny_session_team_memory_writes(session);
+        let first = crate::tool::register_session_tool_policy(session, None, Default::default());
+        assert!(
+            !crate::tool::session_tool_policy(session)
+                .unwrap()
+                .team_memory_writer
+        );
+        let replacement =
+            crate::tool::register_session_tool_policy(session, None, Default::default());
+        drop(first);
+        assert!(
+            !crate::tool::session_tool_policy(session)
+                .unwrap()
+                .team_memory_writer
+        );
+        drop(replacement);
+        assert!(crate::tool::session_tool_policy(session).is_none());
+    }
+
+    #[test]
     fn rejects_worker_writes() {
         let err =
             validate_team_memory_session_log_update(path(), "", "# Log\n", false).unwrap_err();

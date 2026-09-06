@@ -237,98 +237,100 @@ impl Drop for ScopedLoginTestHome {
     }
 }
 
-#[tokio::test]
-async fn scoped_concurrent_begin_completion_and_cancel_are_isolated() {
+#[test]
+fn scoped_concurrent_begin_completion_and_cancel_are_isolated() {
     let _guard = crate::storage::lock_test_env();
-    let temp = tempfile::TempDir::new().unwrap();
-    let _home = ScopedLoginTestHome::new(temp.path());
-    let provider = crate::provider_catalog::resolve_login_provider("openai").unwrap();
-    let options_a = LoginOptions {
-        flow_id: Some("flow-a".into()),
-        print_auth_url: true,
-        json: true,
-        no_browser: true,
-        ..Default::default()
-    };
-    let options_b = LoginOptions {
-        flow_id: Some("flow-b".into()),
-        ..options_a.clone()
-    };
-    let (a, b) = tokio::join!(
-        start_scriptable_login(provider, None, &options_a),
-        start_scriptable_login(provider, None, &options_b),
-    );
-    assert_eq!(a.unwrap(), LoginFlowOutcome::Deferred);
-    assert_eq!(b.unwrap(), LoginFlowOutcome::Deferred);
-    let path_a = pending_login_path("openai", Some("flow-a")).unwrap();
-    let path_b = pending_login_path("openai", Some("flow-b")).unwrap();
-    assert_ne!(path_a, path_b);
-    let record_a: PendingScriptableLoginRecord =
-        serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
-    let record_b: PendingScriptableLoginRecord =
-        serde_json::from_str(&std::fs::read_to_string(&path_b).unwrap()).unwrap();
-    match (&record_a.login, &record_b.login) {
-        (
-            PendingScriptableLogin::Openai {
-                verifier: a,
-                state: sa,
-                ..
-            },
-            PendingScriptableLogin::Openai {
-                verifier: b,
-                state: sb,
-                ..
-            },
-        ) => {
-            assert_ne!(a, b);
-            assert_ne!(sa, sb);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = ScopedLoginTestHome::new(temp.path());
+        let provider = crate::provider_catalog::resolve_login_provider("openai").unwrap();
+        let options_a = LoginOptions {
+            flow_id: Some("flow-a".into()),
+            print_auth_url: true,
+            json: true,
+            no_browser: true,
+            ..Default::default()
+        };
+        let options_b = LoginOptions {
+            flow_id: Some("flow-b".into()),
+            ..options_a.clone()
+        };
+        let (a, b) = tokio::join!(
+            start_scriptable_login(provider, None, &options_a),
+            start_scriptable_login(provider, None, &options_b),
+        );
+        assert_eq!(a.unwrap(), LoginFlowOutcome::Deferred);
+        assert_eq!(b.unwrap(), LoginFlowOutcome::Deferred);
+        let path_a = pending_login_path("openai", Some("flow-a")).unwrap();
+        let path_b = pending_login_path("openai", Some("flow-b")).unwrap();
+        assert_ne!(path_a, path_b);
+        let record_a: PendingScriptableLoginRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
+        let record_b: PendingScriptableLoginRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path_b).unwrap()).unwrap();
+        match (&record_a.login, &record_b.login) {
+            (
+                PendingScriptableLogin::Openai {
+                    verifier: a,
+                    state: sa,
+                    ..
+                },
+                PendingScriptableLogin::Openai {
+                    verifier: b,
+                    state: sb,
+                    ..
+                },
+            ) => {
+                assert_ne!(a, b);
+                assert_ne!(sa, sb);
+            }
+            _ => panic!("expected OpenAI records"),
         }
-        _ => panic!("expected OpenAI records"),
-    }
-    assert!(!pending_login_path("openai", None).unwrap().exists());
-    // Auth-code rejection happens only after loading the selected flow, before any HTTP call.
-    let error = complete_scriptable_openai_login(
-        "openai",
-        &options_a,
-        ProvidedAuthInput::AuthCode("unused".into()),
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("requires --callback-url"));
-    let missing = LoginOptions {
-        flow_id: Some("missing".into()),
-        ..options_a.clone()
-    };
-    let error = complete_scriptable_openai_login(
-        "openai",
-        &missing,
-        ProvidedAuthInput::AuthCode("unused".into()),
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("No pending"));
-    let legacy = pending_login_path("openai", None).unwrap();
-    let other_provider = pending_login_path("claude", Some("flow-a")).unwrap();
-    let credentials = temp.path().join("openai-auth.json");
-    for path in [&legacy, &other_provider, &credentials] {
-        std::fs::write(path, "preserve me").unwrap();
-    }
-    let before_b = std::fs::read(&path_b).unwrap();
-    let cancel = LoginOptions {
-        flow_id: Some("flow-a".into()),
-        cancel: true,
-        json: true,
-        ..Default::default()
-    };
-    run_login_provider(provider, None, cancel.clone())
+        assert!(!pending_login_path("openai", None).unwrap().exists());
+        // Auth-code rejection happens only after loading the selected flow, before any HTTP call.
+        let error = complete_scriptable_openai_login(
+            "openai",
+            &options_a,
+            ProvidedAuthInput::AuthCode("unused".into()),
+        )
         .await
-        .unwrap();
-    run_login_provider(provider, None, cancel).await.unwrap();
-    assert!(!path_a.exists());
-    assert_eq!(std::fs::read(&path_b).unwrap(), before_b);
-    for path in [&legacy, &other_provider, &credentials] {
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "preserve me");
-    }
+        .unwrap_err();
+        assert!(error.to_string().contains("requires --callback-url"));
+        let missing = LoginOptions {
+            flow_id: Some("missing".into()),
+            ..options_a.clone()
+        };
+        let error = complete_scriptable_openai_login(
+            "openai",
+            &missing,
+            ProvidedAuthInput::AuthCode("unused".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("No pending"));
+        let legacy = pending_login_path("openai", None).unwrap();
+        let other_provider = pending_login_path("claude", Some("flow-a")).unwrap();
+        let credentials = temp.path().join("openai-auth.json");
+        for path in [&legacy, &other_provider, &credentials] {
+            std::fs::write(path, "preserve me").unwrap();
+        }
+        let before_b = std::fs::read(&path_b).unwrap();
+        let cancel = LoginOptions {
+            flow_id: Some("flow-a".into()),
+            cancel: true,
+            json: true,
+            ..Default::default()
+        };
+        run_login_provider(provider, None, cancel.clone())
+            .await
+            .unwrap();
+        run_login_provider(provider, None, cancel).await.unwrap();
+        assert!(!path_a.exists());
+        assert_eq!(std::fs::read(&path_b).unwrap(), before_b);
+        for path in [&legacy, &other_provider, &credentials] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "preserve me");
+        }
+    });
 }
 
 #[tokio::test]

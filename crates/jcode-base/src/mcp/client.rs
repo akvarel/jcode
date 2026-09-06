@@ -52,6 +52,7 @@ impl McpHandle {
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            request_timeout: DEFAULT_MCP_REQUEST_TIMEOUT,
         }
     }
 

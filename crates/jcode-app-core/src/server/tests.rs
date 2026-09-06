@@ -345,6 +345,8 @@ fn persisted_headless_member(
 
 #[tokio::test]
 async fn background_task_wake_runs_live_session_immediately_when_idle() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _wake_mode = ScopedEnvVar::set("JCODE_WAKE_MODE", "internal");
     let provider = Arc::new(StreamingMockProvider::default());
     provider.queue_response(vec![
         StreamEvent::TextDelta("Build result processed.".to_string()),
