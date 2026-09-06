@@ -25,7 +25,7 @@
     "crates/jcode-tui/src/tui/app/tests/commands_accounts_01/part_01.rs": 1677,
     "crates/jcode-tui/src/tui/app/tests/onboarding_eval.rs": 3303,
     "crates/jcode-tui/src/tui/app/tests/onboarding_flow.rs": 1818,
-    "crates/jcode-tui/src/tui/app/tests/remote_events_reload_01/part_01.rs": 2014,
+    "crates/jcode-tui/src/tui/app/tests/remote_events_reload_01/part_01.rs": 2020,
     "crates/jcode-tui/src/tui/app/tests/remote_events_reload_04.rs": 2490,
     "crates/jcode-tui/src/tui/app/tests/remote_startup_input_02/part_01.rs": 2023,
     "crates/jcode-tui/src/tui/app/tests/remote_startup_input_03/part_01.rs": 1308,

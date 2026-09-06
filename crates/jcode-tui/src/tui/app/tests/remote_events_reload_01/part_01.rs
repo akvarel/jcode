@@ -902,6 +902,8 @@ fn test_handle_post_connect_marker_without_reload_context_does_not_queue_selfdev
     crate::env::set_var("JCODE_HOME", temp_home.path());
 
     let mut app = create_test_app();
+    // Exercise reconnect handling independently of locally installed upgrades.
+    app.client_binary_mtime = None;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _enter = rt.enter();
     let backend = ratatui::backend::TestBackend::new(80, 24);
@@ -972,6 +974,8 @@ fn test_handle_post_connect_defers_reload_followup_to_server_history_payload() {
     .expect("save reload context");
 
     let mut app = create_test_app();
+    // Exercise reconnect handling independently of locally installed upgrades.
+    app.client_binary_mtime = None;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _enter = rt.enter();
     let backend = ratatui::backend::TestBackend::new(80, 24);
@@ -1030,6 +1034,8 @@ fn test_handle_post_connect_clears_deferred_dispatch_before_reload_followup() {
     .expect("save reload context");
 
     let mut app = create_test_app();
+    // Exercise reconnect handling independently of locally installed upgrades.
+    app.client_binary_mtime = None;
     app.pending_queued_dispatch = true;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _enter = rt.enter();

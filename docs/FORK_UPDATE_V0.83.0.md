@@ -36,6 +36,12 @@ Environment-mutating async tests hold the environment lock outside their runtime
 future. The WebSocket handshake fixture retains a scoped lint expectation for
 Tungstenite's required large error-response callback type.
 
+Run the full library acceptance suite with
+`cargo test --workspace --lib -- --test-threads=1`. Parallel TUI execution can
+still deadlock on process-global test state. Reconnect-only fixtures explicitly
+clear their binary timestamp so a newly installed build does not redirect them
+into client replacement while they are testing history and queued work.
+
 Use `scripts/install_release.sh --fast` for installation with refreshed Git
 metadata. Update the ohAgent gitlink separately and preserve unrelated parent
 repository changes.
