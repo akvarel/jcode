@@ -48,15 +48,27 @@ through patch-identity detection.
 
 ## Validation
 
-Run against the rebased branch before installation:
+Executed on the rebased branch:
 
-- `scripts/check_guardrails.sh` for format, clippy, panic-budget and
-  swallowed-error gates.
-- `scripts/check_code_size_budget.py` and `scripts/check_test_size_budget.py`
-  (`tracked=106` and `tracked=44`, no regressions).
-- Workspace library tests for the crates touched by the imported fixes.
-- `scripts/install_release.sh --fast` with refreshed Git metadata, followed by a
-  version check on the installed launcher.
+- `scripts/check_guardrails.sh` passes every gate: module declarations, `cargo fmt --check`,
+  `cargo check --all-targets --all-features`, `cargo clippy -- -D warnings`, lockfile freshness,
+  warning budget, oversized-file and oversized-test ratchets, panic-prone and swallowed-error
+  ratchets, crate dependency boundaries, wildcard re-exports, and onboarding invariants.
+- Ratchets after refresh: oversized files `tracked=106`, oversized test files `tracked=44`,
+  panic-prone `total=87 files=29`, swallowed-error `total=3244 files=470`.
+- Two `clippy::collapsible_if` sites that clippy 1.96 rejects under `-D warnings` are fixed:
+  one in the imported `update.rs` guard path and one in upstream's remote-login clipboard paste.
+- Focused tests: `cargo test -p jcode-app-core --lib -- update` (92 passed) and
+  `cargo test -p jcode-harness-api-server --lib` (97 passed), covering the imported
+  dev-build guard and the bridge history/activity frames.
+- Full library suite: `cargo test --workspace --lib -- --test-threads=1`: 83 binaries,
+  7382 passed, 0 failed, 33 ignored, exit 0. Parallel TUI execution is avoided because
+  process-global test state can deadlock.
+- `scripts/install_release.sh --fast` with `JCODE_BUILD_GIT_HASH=441f7fd5f` built and installed
+  `jcode v0.84.54-dev (441f7fd5f)`, updating the `stable`, `current` and launcher symlinks and
+  reloading the running server onto the new binary. The base version `0.84.0` and the commit
+  hash both report correctly.
 
-Update the ohAgent gitlink separately on `update/jcode-v0.84.0` and preserve
-unrelated parent repository changes.
+Update the ohAgent gitlink separately on `update/jcode-v0.84.0` and preserve unrelated parent
+repository changes.
+
