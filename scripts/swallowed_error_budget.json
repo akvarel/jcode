@@ -1,7 +1,7 @@
 {
-  "total": 3241,
+  "total": 3244,
   "totals_by_pattern": {
-    "dot_ok": 1202,
+    "dot_ok": 1205,
     "let_underscore": 1220,
     "unwrap_or_default": 819
   },
@@ -570,6 +570,11 @@
       "dot_ok": 2,
       "let_underscore": 6,
       "unwrap_or_default": 9
+    },
+    "crates/jcode-app-core/src/update_dev_guard.rs": {
+      "dot_ok": 4,
+      "let_underscore": 0,
+      "unwrap_or_default": 0
     },
     "crates/jcode-app-core/src/update_metadata.rs": {
       "dot_ok": 1,
@@ -1770,11 +1775,6 @@
       "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 4
-    },
-    "crates/jcode-tui/src/tui/app/auth_remote.rs": {
-      "dot_ok": 1,
-      "let_underscore": 0,
-      "unwrap_or_default": 0
     },
     "crates/jcode-tui/src/tui/app/auth_remote/command.rs": {
       "dot_ok": 4,
