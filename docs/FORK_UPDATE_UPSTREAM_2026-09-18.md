@@ -63,3 +63,20 @@ are not claimed. Upstream unused-function/profile warnings remain.
 
 Detailed local command logs are retained in ~/.jcode/jcode-upstream-20260918-*.log.
 The parent ohAgent update records final installed binary and daemon observations.
+
+## Final upstream snapshot
+
+Upstream advanced during the build. The final integration also merges
+`13fe80db7bced201ec54c709b93508f7eac836e5`, including subscription voice and
+microphone stop/transcription cancellation fixes. This is a normal merge on the
+already published custom branch, not another history rewrite.
+
+The nine default-feature voice tests passed, including malformed WAV input,
+auth/header contracts, redacted errors, timeouts and response limits. Formatting
+and diff checks passed. Hardware capture and the optional voice-capture feature
+were not exercised. The imported voice module adds one bounded four-byte WAV
+conversion unwrap and seven best-effort channel/worker cleanup operations.
+Inspection confirmed WAV bounds precede reads and cleanup paths preserve the
+primary error/result. Their exact imported counts were recorded in the ratchets
+(120 panic-like and 3297 swallowed-error-like usages), without extra headroom.
+All four ratchet checks pass. These counts are not a claim of zero technical debt.
