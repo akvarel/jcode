@@ -678,8 +678,22 @@ pub fn openai_compatible_profile_context_limit(profile_id: &str, model: &str) ->
     let model = model.trim().to_ascii_lowercase();
 
     match profile_id.as_str() {
-        "conifer" => conifer_context_limit(&model)
-            .or_else(|| jcode_provider_core::models::open_weight_family_context_limit(&model)),
+        // Conifer publishes an exact route table, so an unverified member of a
+        // route family Conifer documents must not silently inherit another
+        // route's window from the shared classifier: an unknown `grok-*` id, or
+        // the undocumented `nemotron-3-ultra-together` alias, would otherwise
+        // borrow DeepInfra's / generic grok window. Verified ids never reach the
+        // predicate because `conifer_context_limit` resolves them first, and
+        // families Conifer does not document keep the shared fallback (the
+        // conifer arm of `conifer_context_limits_match_public_catalog_snapshot`
+        // pins `kimi-k3` to it).
+        "conifer" => conifer_context_limit(&model).or_else(|| {
+            if conifer_may_use_shared_family_fallback(&model) {
+                jcode_provider_core::models::open_weight_family_context_limit(&model)
+            } else {
+                None
+            }
+        }),
         // The selected upstream model may vary. Use Jcode's conservative
         // compatible-provider context budget for the Belvedir auto router.
         "belvedir" if model == "auto" => Some(128_000),
@@ -717,6 +731,18 @@ fn conifer_context_limit(model: &str) -> Option<usize> {
         "gemma-4-31b" => 128_000,
         _ => return None,
     })
+}
+
+/// Whether the shared open-weight family classifier may be consulted for a
+/// model that Conifer's exact route table does not cover.
+///
+/// Conifer documents individual routes rather than whole families, so an
+/// unverified member of a documented family must not inherit a sibling route's
+/// window (issue #1274). Verified ids are resolved by `conifer_context_limit`
+/// before this predicate is consulted, and families Conifer does not document
+/// keep the shared fallback.
+pub fn conifer_may_use_shared_family_fallback(model: &str) -> bool {
+    !(model.starts_with("grok") || model.starts_with("nemotron-3"))
 }
 
 pub fn apply_openai_compatible_profile_env(profile: Option<OpenAiCompatibleProfile>) {

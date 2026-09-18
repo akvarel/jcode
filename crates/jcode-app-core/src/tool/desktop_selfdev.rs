@@ -37,17 +37,17 @@ impl Tool for DesktopSelfDevTool {
     }
 
     fn description(&self) -> &str {
-        "Develop Jcode Desktop from its checkout only. Status, paired host/UI build, private-socket rebuild/reload, tests, isolated Xvfb screenshot, or read-only preview catalog. Never builds/reloads the Jcode CLI or focuses a window. Reload acknowledgement is not build/reload completion."
+        "Develop Jcode Desktop from its checkout; never rebuild the CLI or focus windows."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({"type":"object", "required":["action"], "properties": {
             "intent": super::intent_schema_property(),
-            "action": {"type":"string", "enum":["status","build","reload","build-reload","test","screenshot","inspect"]},
+            "action": {"type":"string", "enum":["status","build","reload","build-reload","test","screenshot","inspect"], "description":"Private-socket builds/reloads. Reload acknowledgement is not completion; inspect status."},
             "instance": {"type":"string", "enum":["main","no-sidebar"], "description":"Required when both Desktop instances exist. No arbitrary socket paths."},
             "command": {"type":"string", "description":"Optional test shell command, run with the Desktop repository as cwd. Default cargo test."},
-            "output": {"type":"string", "description":"Screenshot output relative to target/. Default desktop-selfdev.png. Uses a private Xvfb, never the live desktop."},
-            "timeout_seconds": {"type":"integer", "minimum":1, "maximum":600, "description":"Bounded command timeout, default 120 seconds. For longer jobs use bash/background in the Desktop checkout."}
+            "output": {"type":"string", "description":"Private Xvfb screenshot, never live desktop. Under target/, default desktop-selfdev.png."},
+            "timeout_seconds": {"type":"integer", "minimum":1, "maximum":600, "description":"Timeout seconds, default 120. Longer jobs: bash/background in the Desktop checkout."}
         }})
     }
 

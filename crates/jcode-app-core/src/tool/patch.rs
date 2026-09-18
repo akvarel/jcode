@@ -223,7 +223,10 @@ async fn apply_patch_with_diff(
             let old = tokio::fs::read_to_string(path).await.ok();
             let old_content = old.as_deref().unwrap_or("");
             super::team_memory_guard::validate_team_memory_session_log_update(
-                path, old_content, "", team_memory_writer,
+                path,
+                old_content,
+                "",
+                team_memory_writer,
             )?;
             tokio::fs::remove_file(path).await?;
             super::edit_stats::record(ctx, old_content, "", old.is_none()).await;

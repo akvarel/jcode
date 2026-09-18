@@ -392,6 +392,7 @@ impl Session {
             && self.messages.len() == 1
             && self.has_session_context_message()
             && !self.is_canary
+            && !self.is_debug
             && self.testing_build.is_none()
             && self.memory_injections.is_empty()
             && self.replay_events.is_empty()

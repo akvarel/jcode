@@ -806,6 +806,15 @@ impl Provider for OpenRouterProvider {
         {
             return limit;
         }
+        // Do not reintroduce an unverified Conifer alias through the second,
+        // generic fallback after the route-specific lookup rejected it.
+        if self.profile_id.as_deref() == Some("conifer")
+            && !jcode_base::provider_catalog::conifer_may_use_shared_family_fallback(
+                &normalized_model_id,
+            )
+        {
+            return jcode_provider_core::DEFAULT_CONTEXT_LIMIT;
+        }
         jcode_provider_core::context_limit_for_model_with_provider(&model_id, Some(self.name()))
             .unwrap_or(jcode_provider_core::DEFAULT_CONTEXT_LIMIT)
     }
