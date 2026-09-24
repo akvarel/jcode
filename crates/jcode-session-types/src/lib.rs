@@ -281,6 +281,10 @@ pub enum StoredDisplayRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredTokenUsage {
+    /// Full prompt size resolved per request, before provider identity can change.
+    /// Older records lack this and cannot safely reconstruct mixed-provider totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1095,4 +1099,19 @@ mod session_search_tests {
         assert!(fenced.starts_with("````text\n"));
         assert!(fenced.ends_with("\n````"));
     }
+}
+
+/// Why a turn stopped abnormally. Natural completion has no stop reason.
+/// Unknown future reasons remain decodable by older clients.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStopReason {
+    Interrupted,
+    Failure,
+    /// A caught runtime panic, not an inference from a lost connection.
+    Crash,
+    ProviderGuardrail,
+    LimitReached,
+    #[serde(other)]
+    Unknown,
 }

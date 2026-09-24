@@ -2,8 +2,8 @@ use crate::id::{extract_session_name, new_id, new_memorable_session_id_avoiding}
 use crate::message::{ContentBlock, Message, Role};
 pub use crate::storage::{
     SessionCounts, SessionPresence, active_session_ids, find_active_session_id_by_pid,
-    mark_streaming, session_counts, session_presence, unmark_streaming, user_session_counts,
-    user_session_presence,
+    mark_streaming, session_counts, session_presence, streaming_session_ids, unmark_streaming,
+    user_session_counts, user_session_presence,
 };
 use crate::storage::{active_pids_dir, register_active_pid, unregister_active_pid};
 
@@ -111,6 +111,9 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<StoredMessage>,
+    /// Full assembled system prompt replacement, including an intentionally empty prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Durable logical input turn identity for per-route usage deduplication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_usage_turn_id: Option<String>,
@@ -211,6 +214,8 @@ struct SessionStartupStub {
     title: Option<String>,
     #[serde(default)]
     custom_title: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -325,6 +330,7 @@ impl Session {
     fn session_from_startup_stub(stub: SessionStartupStub) -> Self {
         let mut session = Self::create_with_id(stub.id, stub.parent_id, stub.title);
         session.custom_title = stub.custom_title;
+        session.system_prompt = stub.system_prompt;
         session.created_at = stub.created_at;
         session.updated_at = stub.updated_at;
         session.compaction = stub.compaction;
@@ -359,6 +365,7 @@ impl Session {
     fn session_from_remote_startup_snapshot(snapshot: RemoteStartupSessionSnapshot) -> Self {
         let mut session = Self::create_with_id(snapshot.id, snapshot.parent_id, snapshot.title);
         session.custom_title = snapshot.custom_title;
+        session.system_prompt = snapshot.system_prompt;
         session.created_at = snapshot.created_at;
         session.updated_at = snapshot.updated_at;
         session.messages = snapshot.messages;
@@ -499,6 +506,7 @@ impl Session {
             parent_id: self.parent_id.clone(),
             title: self.title.clone(),
             custom_title: self.custom_title.clone(),
+            system_prompt: self.system_prompt.clone(),
             updated_at: self.updated_at,
             compaction: self.compaction.clone(),
             provider_session_id: self.provider_session_id.clone(),
@@ -701,6 +709,7 @@ impl Session {
         self.parent_id = meta.parent_id;
         self.title = meta.title;
         self.custom_title = meta.custom_title;
+        self.system_prompt = meta.system_prompt;
         self.updated_at = meta.updated_at;
         self.compaction = meta.compaction;
         self.provider_session_id = meta.provider_session_id;
@@ -742,6 +751,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            system_prompt: None,
             model_usage_turn_id: None,
             compaction: None,
             provider_session_id: None,
@@ -797,6 +807,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            system_prompt: None,
             model_usage_turn_id: None,
             compaction: None,
             provider_session_id: None,
@@ -1186,7 +1197,10 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn token_usage_totals(&self) -> crate::protocol::TokenUsageTotals {
-        let mut totals = crate::protocol::TokenUsageTotals::default();
+        let mut totals = crate::protocol::TokenUsageTotals {
+            cache_prompt_tokens: Some(0),
+            ..Default::default()
+        };
         for message in &self.messages {
             let Some(usage) = message.token_usage.as_ref() else {
                 continue;
@@ -1197,6 +1211,10 @@ request in this new forked session, using the inherited conversation only as con
             if usage.cache_read_input_tokens.is_some()
                 || usage.cache_creation_input_tokens.is_some()
             {
+                totals.cache_prompt_tokens = totals
+                    .cache_prompt_tokens
+                    .zip(usage.prompt_tokens)
+                    .map(|(total, prompt)| total.saturating_add(prompt));
                 totals.cache_reported_input_tokens = totals
                     .cache_reported_input_tokens
                     .saturating_add(usage.input_tokens);
@@ -1610,6 +1628,8 @@ struct RemoteStartupSessionSnapshot {
     title: Option<String>,
     #[serde(default)]
     custom_title: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     #[serde(default)]

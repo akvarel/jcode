@@ -219,6 +219,7 @@ fn token_usage_totals_counts_cache_reported_inputs_only_when_cache_fields_exist(
         }],
         None,
         Some(StoredTokenUsage {
+            prompt_tokens: None,
             input_tokens: 100,
             output_tokens: 10,
             cache_read_input_tokens: None,
@@ -233,6 +234,7 @@ fn token_usage_totals_counts_cache_reported_inputs_only_when_cache_fields_exist(
         }],
         None,
         Some(StoredTokenUsage {
+            prompt_tokens: None,
             input_tokens: 200,
             output_tokens: 20,
             cache_read_input_tokens: Some(150),
@@ -2661,4 +2663,94 @@ fn rendered_image_history_boundary_is_backward_compatible() {
         serde_json::from_value::<RenderedImage>(encoded).unwrap(),
         image
     );
+}
+
+#[test]
+fn cache_prompt_totals_preserve_mixed_provider_accounting_and_legacy_unknown() {
+    let mut session = Session::create_with_id("cache_prompt_totals".into(), None, None);
+    for usage in [
+        // Inclusive OpenAI input: read and write are subsets.
+        StoredTokenUsage {
+            prompt_tokens: Some(10_000),
+            input_tokens: 10_000,
+            output_tokens: 100,
+            cache_read_input_tokens: Some(6_000),
+            cache_creation_input_tokens: Some(2_000),
+        },
+        // Anthropic uncached input: read and write are disjoint.
+        StoredTokenUsage {
+            prompt_tokens: Some(10_000),
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_read_input_tokens: Some(7_000),
+            cache_creation_input_tokens: Some(2_000),
+        },
+    ] {
+        let json = serde_json::to_string(&usage).unwrap();
+        let restored: StoredTokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.prompt_tokens, Some(10_000));
+        session.add_message_ext(Role::Assistant, vec![], None, Some(restored));
+    }
+    let totals = session.token_usage_totals();
+    assert_eq!(totals.cache_prompt_tokens, Some(20_000));
+    assert_eq!(totals.cache_reported_input_tokens, 11_000);
+    assert_eq!(totals.cache_read_input_tokens, 13_000);
+    assert_eq!(totals.cache_creation_input_tokens, 4_000);
+    let legacy: StoredTokenUsage = serde_json::from_str(r#"{"input_tokens":10000,"output_tokens":100,"cache_read_input_tokens":6000,"cache_creation_input_tokens":2000}"#).unwrap();
+    assert_eq!(legacy.prompt_tokens, None);
+    session.add_message_ext(Role::Assistant, vec![], None, Some(legacy));
+    assert_eq!(session.token_usage_totals().cache_prompt_tokens, None);
+    assert_eq!(session.token_usage_totals().cache_read_input_tokens, 19_000);
+}
+
+#[test]
+fn system_prompt_persists_before_first_message_and_across_metadata_updates() -> Result<()> {
+    let _lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path());
+    for prompt in ["custom system prompt", ""] {
+        let mut session = Session::create(None, None);
+        assert_eq!(session.system_prompt, None);
+        session.system_prompt = Some(prompt.into());
+        session.save()?;
+        assert_eq!(
+            Session::load(&session.id)?.system_prompt.as_deref(),
+            Some(prompt)
+        );
+        assert_eq!(
+            Session::load_startup_stub(&session.id)?
+                .system_prompt
+                .as_deref(),
+            Some(prompt)
+        );
+        // Unchanged prompt survives metadata-only journal persistence too.
+        session.model = Some("test-model".into());
+        session.save()?;
+        assert_eq!(
+            Session::load(&session.id)?.system_prompt.as_deref(),
+            Some(prompt)
+        );
+        session.system_prompt = Some("replacement".into());
+        session.save()?;
+        assert_eq!(
+            Session::load_startup_stub(&session.id)?
+                .system_prompt
+                .as_deref(),
+            Some("replacement")
+        );
+        session.system_prompt = None;
+        session.save()?;
+        assert_eq!(Session::load(&session.id)?.system_prompt, None);
+    }
+    Ok(())
+}
+
+#[test]
+fn system_prompt_missing_in_legacy_session_defaults_to_none() -> Result<()> {
+    let session = Session::create_with_id("legacy-prompt-test".into(), None, None);
+    let json = serde_json::to_value(&session)?;
+    assert!(json.get("system_prompt").is_none());
+    let restored: Session = serde_json::from_value(json)?;
+    assert_eq!(restored.system_prompt, None);
+    Ok(())
 }

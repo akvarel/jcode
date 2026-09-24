@@ -402,6 +402,7 @@ impl AuthStatus {
             || self.gemini == AuthState::Available
             || self.cursor == AuthState::Available
             || self.grok_build == AuthState::Available
+            || self.openai_compatible_any == AuthState::Available
     }
 
     /// Emit a structured, non-secret snapshot of which providers currently have
@@ -991,7 +992,7 @@ fn build_auth_status_uncached(mode: AuthProbeMode) -> (AuthStatus, Vec<(&'static
         // An official Gemini Developer API key is a static credential with no
         // expiry handshake, so treat its presence as immediately Available and
         // fall back to OAuth token state otherwise.
-        status.gemini = if gemini::has_api_key() {
+        status.gemini = if gemini::uses_api_key() {
             AuthState::Available
         } else {
             refreshable_token_state(
@@ -1010,6 +1011,17 @@ fn build_auth_status_uncached(mode: AuthProbeMode) -> (AuthStatus, Vec<(&'static
         } else {
             AuthState::NotConfigured
         }
+    });
+    record_auth_probe_step(&mut timings, "openai_compatible", || {
+        let configured = crate::provider_catalog::openai_compatible_profiles()
+            .iter()
+            .copied()
+            .any(crate::provider_catalog::openai_compatible_profile_is_configured);
+        status.openai_compatible_any = if configured {
+            AuthState::Available
+        } else {
+            AuthState::NotConfigured
+        };
     });
     record_auth_probe_step(&mut timings, "google", || probe_google_status(&mut status));
 

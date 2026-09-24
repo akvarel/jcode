@@ -628,6 +628,7 @@ fn test_remote_fallback_offer_accept_stages_switch_and_resends() {
             model: "claude-sonnet-4".to_string(),
             provider_name: Some("Anthropic".to_string()),
             error: None,
+            resolved_credential: None,
         },
         &mut remote,
     );
@@ -672,6 +673,7 @@ fn test_remote_fallback_resend_dropped_when_switch_fails() {
             model: "claude-sonnet-4".to_string(),
             provider_name: None,
             error: Some("switch failed".to_string()),
+            resolved_credential: None,
         },
         &mut remote,
     );
@@ -1729,6 +1731,7 @@ fn test_resumed_session_seeds_cost_from_history_token_totals() {
     crate::provider::anthropic::set_cache_ttl_1h(true);
 
     let totals = crate::protocol::TokenUsageTotals {
+        cache_prompt_tokens: Some(141_000),
         messages_with_token_usage: 3,
         input_tokens: 1_000,
         output_tokens: 2_000,
@@ -2489,5 +2492,41 @@ fn test_credential_failure_breaker_resets_on_turn_success() {
     assert_eq!(
         app.consecutive_credential_failures, 0,
         "a successful turn must reset the credential-failure streak"
+    );
+}
+
+/// An OAuth -> API-key route switch must update the auth badge immediately,
+/// instead of keeping the previous route's server-resolved credential.
+#[test]
+fn test_remote_model_changed_updates_resolved_credential() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("Claude".to_string());
+    app.remote_resolved_credential = Some(jcode_provider_core::ResolvedCredential::Oauth);
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ModelChanged {
+            id: 0,
+            model: "claude-opus-5-5".to_string(),
+            provider_name: Some("Claude".to_string()),
+            error: None,
+            resolved_credential: Some(jcode_provider_core::ResolvedCredential::ApiKey),
+        },
+        &mut remote,
+    );
+
+    assert_eq!(
+        app.remote_resolved_credential,
+        Some(jcode_provider_core::ResolvedCredential::ApiKey)
+    );
+    let data = crate::tui::TuiState::info_widget_data(&app);
+    assert_eq!(
+        data.auth_method,
+        crate::tui::info_widget::AuthMethod::AnthropicApiKey
     );
 }

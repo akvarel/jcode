@@ -69,7 +69,10 @@ impl Agent {
 
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(&messages);
         let pending = if fresh_user_turn {
-            crate::memory::take_pending_memory(session_id)
+            crate::memory::take_pending_memory_for_project(
+                session_id,
+                self.session.working_dir.as_deref(),
+            )
         } else {
             None
         };
@@ -117,7 +120,7 @@ impl Agent {
         &self,
         memory_prompt: Option<&str>,
     ) -> crate::prompt::SplitSystemPrompt {
-        if let Some(ref override_prompt) = self.system_prompt_override {
+        if let Some(ref override_prompt) = self.session.system_prompt {
             return crate::prompt::SplitSystemPrompt {
                 static_part: override_prompt.clone(),
                 dynamic_part: String::new(),

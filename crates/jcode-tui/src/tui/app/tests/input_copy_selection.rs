@@ -21,11 +21,7 @@ fn input_pane_screen_points(
     points
 }
 
-fn drag_copy(
-    app: &mut App,
-    start: (u16, u16),
-    end: (u16, u16),
-) -> String {
+fn drag_copy(app: &mut App, start: (u16, u16), end: (u16, u16)) -> String {
     let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let copied_for_closure = copied.clone();
     app.handle_copy_selection_mouse_with(
@@ -58,7 +54,7 @@ fn drag_copy(
             true
         },
     );
-    
+
     copied.lock().unwrap().clone()
 }
 
@@ -103,7 +99,9 @@ fn test_input_composer_drag_selects_and_copies_typed_text() {
         app.status_notice(),
         Some("Copied selection · highlight remains visible".to_string())
     );
-    // Selection remains visible after copying so users can confirm the range.
+    // The highlight stays visible after copying (c7afd6620), but the drag ends.
+    assert!(!app.copy_selection_mode);
+    assert!(!app.copy_selection_dragging);
     assert!(app.copy_selection_anchor.is_some());
     assert!(app.copy_selection_cursor.is_some());
 }

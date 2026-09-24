@@ -42,9 +42,10 @@ async fn wait_for_prewarm(slot: &openai_websocket_prewarm::PrewarmSlot) {
     .expect("prewarm should become ready");
 }
 
-#[expect(clippy::result_large_err, reason = "WebSocket handshake callback requires tungstenite ErrorResponse") ]
-#[test]
-fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_state() {
+#[tokio::test]
+// The tungstenite handshake callback signature fixes the large Err type.
+#[allow(clippy::result_large_err)]
+async fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_state() {
     let _lock = jcode_base::storage::lock_test_env();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -210,44 +211,48 @@ fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_state() {
 #[test]
 fn unfinished_or_incompatible_prewarm_is_cancelled_without_foreground_wait() {
     let _lock = jcode_base::storage::lock_test_env();
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
-    let credentials = prewarm_test_credentials();
-    let slot = Arc::new(openai_websocket_prewarm::PrewarmSlot::default());
-    let request = serde_json::json!({
-        "model": "gpt-5.6-sol", "instructions": "original", "tools": [],
-        "input": [], "stream": true
-    });
-    let accepted = Arc::new(tokio::sync::Notify::new());
-    let server_accepted = Arc::clone(&accepted);
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let _ = socket.next().await;
-        server_accepted.notify_one();
-        let closed = tokio::time::timeout(Duration::from_secs(1), socket.next()).await;
-        assert!(matches!(
-            closed,
-            Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_)))
-        ));
-    });
-    slot.start(Arc::new(RwLock::new(credentials.clone())), &request);
-    accepted.notified().await;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
+            let credentials = prewarm_test_credentials();
+            let slot = Arc::new(openai_websocket_prewarm::PrewarmSlot::default());
+            let request = serde_json::json!({
+                "model": "gpt-5.6-sol", "instructions": "original", "tools": [],
+                "input": [], "stream": true
+            });
+            let accepted = Arc::new(tokio::sync::Notify::new());
+            let server_accepted = Arc::clone(&accepted);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let _ = socket.next().await;
+                server_accepted.notify_one();
+                let closed = tokio::time::timeout(Duration::from_secs(1), socket.next()).await;
+                assert!(matches!(
+                    closed,
+                    Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_)))
+                ));
+            });
+            slot.start(Arc::new(RwLock::new(credentials.clone())), &request);
+            accepted.notified().await;
 
-    let incompatible = serde_json::json!({
-        "model": "gpt-5.6-sol", "instructions": "changed", "tools": [],
-        "input": [], "stream": true
-    });
-    let before = Instant::now();
-    assert!(slot.take_ready(&incompatible, &credentials).is_none());
-    assert!(
-        before.elapsed() < Duration::from_millis(100),
-        "foreground must not wait for warmup"
-    );
-    server.await.expect("unfinished server");
-    });
+            let incompatible = serde_json::json!({
+                "model": "gpt-5.6-sol", "instructions": "changed", "tools": [],
+                "input": [], "stream": true
+            });
+            let before = Instant::now();
+            assert!(slot.take_ready(&incompatible, &credentials).is_none());
+            assert!(
+                before.elapsed() < Duration::from_millis(100),
+                "foreground must not wait for warmup"
+            );
+            server.await.expect("unfinished server");
+        });
 }
 
 #[test]

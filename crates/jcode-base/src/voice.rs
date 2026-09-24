@@ -1,10 +1,27 @@
-//! Subscription-backed voice transcription. No provider credential is needed on clients.
+//! Native Nari streaming and subscription-backed WAV transcription.
 //!
 //! Capability checks never open a microphone. Call `MicrophoneRecording::start` only
 //! after an explicit user action. Capture is opt-in via the `voice-capture` feature.
+//! `NariRecording` combines confirmed network setup and native capture for desktop
+//! clients. `NariSession` and `nari_pcm_channel` accept bounded mono 16 kHz PCM16
+//! from any source without the capture feature. Nari requires a caller-supplied
+//! provider key. The existing subscription APIs still need no provider key.
 use crate::{subscription_api, subscription_catalog};
 use serde::Deserialize;
 use std::{fmt, time::Duration};
+
+mod nari;
+pub mod timing;
+pub use nari::{
+    NARI_PCM_CHUNK_SAMPLES, NARI_USD_PER_AUDIO_HOUR, NariEvent, NariSession, correct_transcript,
+    estimated_transcription_usd, nari_api_key, nari_pcm_channel, recognition_prompt,
+};
+#[cfg(any(feature = "voice-capture", test))]
+mod resample;
+#[cfg(feature = "voice-capture")]
+mod streaming_capture;
+#[cfg(feature = "voice-capture")]
+pub use streaming_capture::{NariRecording, PcmRecording};
 
 pub const MAX_AUDIO_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_RECORDING_DURATION: Duration = Duration::from_secs(5 * 60);
@@ -14,6 +31,9 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 /// Deliberately retains no URLs, credentials, provider errors, or response bodies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceError {
+    NariNotConfigured,
+    NariCreditsExhausted,
+    NariRejected,
     NotConfigured,
     InvalidAudio,
     InvalidLanguage,
@@ -30,6 +50,15 @@ pub enum VoiceError {
 impl fmt::Display for VoiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NariNotConfigured => {
+                f.write_str("Configure a valid Nari API key to use voice transcription")
+            }
+            Self::NariCreditsExhausted => {
+                f.write_str("Nari credits are exhausted. Add credits before retrying")
+            }
+            Self::NariRejected => f.write_str(
+                "Nari rejected the voice session. Check your key, credits, and settings",
+            ),
             Self::NotConfigured => f.write_str("Sign in to Jcode to use voice transcription"),
             Self::InvalidAudio => {
                 f.write_str("Audio must be a nonempty mono PCM16 WAV, at most 5 minutes and 10 MiB")
@@ -190,7 +219,7 @@ async fn transcribe_with(
     }
     let transcript: Transcript = serde_json::from_slice(&response_bytes(response).await?)
         .map_err(|_| VoiceError::InvalidResponse)?;
-    Ok(transcript.text)
+    Ok(nari::correct_transcript(&transcript.text))
 }
 
 /// Validate the PCM16 mono WAV format emitted by capture, including duration.
@@ -233,7 +262,7 @@ fn validate_wav(bytes: &[u8]) -> Result<(), VoiceError> {
                 rate = Some(sample_rate);
             }
             b"data" => {
-                if data_len.is_some() || len == 0 || len % 2 != 0 {
+                if data_len.is_some() || len == 0 || !len.is_multiple_of(2) {
                     return Err(invalid());
                 }
                 data_len = Some(len);
@@ -484,6 +513,35 @@ mod capture {
         state.full = state.samples.len() == max_samples;
     }
 
+    fn build<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        buffer: Arc<Mutex<Buffer>>,
+        max_samples: usize,
+    ) -> Result<cpal::Stream, VoiceError>
+    where
+        T: cpal::SizedSample,
+        f32: cpal::FromSample<T>,
+    {
+        let errors = buffer.clone();
+        let channels = config.channels as usize;
+        device
+            .build_input_stream(
+                config,
+                move |data: &[T], _| {
+                    let Ok(mut state) = buffer.lock() else { return };
+                    append_samples(&mut state, data, channels, max_samples);
+                },
+                move |_| {
+                    if let Ok(mut state) = errors.lock() {
+                        state.failed = true;
+                    }
+                },
+                None,
+            )
+            .map_err(|_| VoiceError::MicrophoneUnavailable)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -564,35 +622,6 @@ mod capture {
             assert!(cancel.load(Ordering::SeqCst));
             assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         }
-    }
-
-    fn build<T>(
-        device: &cpal::Device,
-        config: &cpal::StreamConfig,
-        buffer: Arc<Mutex<Buffer>>,
-        max_samples: usize,
-    ) -> Result<cpal::Stream, VoiceError>
-    where
-        T: cpal::SizedSample,
-        f32: cpal::FromSample<T>,
-    {
-        let errors = buffer.clone();
-        let channels = config.channels as usize;
-        device
-            .build_input_stream(
-                config,
-                move |data: &[T], _| {
-                    let Ok(mut state) = buffer.lock() else { return };
-                    append_samples(&mut state, data, channels, max_samples);
-                },
-                move |_| {
-                    if let Ok(mut state) = errors.lock() {
-                        state.failed = true;
-                    }
-                },
-                None,
-            )
-            .map_err(|_| VoiceError::MicrophoneUnavailable)
     }
 }
 

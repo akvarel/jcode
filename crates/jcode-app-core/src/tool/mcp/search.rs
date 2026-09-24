@@ -1,4 +1,4 @@
-use crate::mcp::{McpToolDef, dispatch_name};
+use crate::mcp::McpToolDef;
 use serde::Serialize;
 use serde_json::Value;
 use std::cmp::Reverse;
@@ -37,8 +37,14 @@ pub(super) struct SearchMatch {
     pub input_schema: Option<Value>,
 }
 
+/// Rank and paginate a catalog of `(server, tool, dispatch_name)` entries.
+///
+/// Dispatch names are computed by the caller for the complete server surface so
+/// collision-safe aliases are threaded through ranking and pagination instead of
+/// being recomputed per entry: a page must report the exact identity that
+/// dispatch and session policy use.
 pub(super) fn search_tools(
-    catalog: Vec<(String, McpToolDef)>,
+    catalog: Vec<(String, McpToolDef, String)>,
     options: SearchOptions,
 ) -> SearchPage {
     let requested_limit = if options.limit == 0 {
@@ -57,20 +63,20 @@ pub(super) fn search_tools(
 
     let mut matches: Vec<SearchMatch> = catalog
         .into_iter()
-        .filter(|(server, _)| {
+        .filter(|(server, _, _)| {
             options
                 .server
                 .as_deref()
                 .is_none_or(|wanted| wanted == server)
         })
-        .filter_map(|(server, tool)| {
+        .filter_map(|(server, tool, name)| {
             let description = tool.description.unwrap_or_else(|| "MCP tool".to_string());
             let score = relevance_score(&query, &query_terms, &server, &tool.name, &description);
             if !query.is_empty() && score == 0 {
                 return None;
             }
             Some(SearchMatch {
-                name: dispatch_name(&server, &tool.name),
+                name,
                 server,
                 tool: tool.name,
                 description,
@@ -186,6 +192,7 @@ fn terms(value: &str) -> Vec<String> {
 mod tests {
     use super::{SearchOptions, search_tools};
     use crate::mcp::McpToolDef;
+    use crate::mcp::dispatch_name;
     use serde_json::json;
 
     fn tool(server: &str, name: &str, description: &str) -> (String, McpToolDef) {
@@ -200,6 +207,17 @@ mod tests {
                 }),
             },
         )
+    }
+
+    /// Wrap a legacy unaliased catalog the way the production caller does.
+    fn named(catalog: Vec<(String, McpToolDef)>) -> Vec<(String, McpToolDef, String)> {
+        catalog
+            .into_iter()
+            .map(|(server, tool)| {
+                let name = dispatch_name(&server, &tool.name);
+                (server, tool, name)
+            })
+            .collect()
     }
 
     #[test]
@@ -223,7 +241,7 @@ mod tests {
         ];
 
         let page = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 query: Some("query performance".to_string()),
                 ..SearchOptions::default()
@@ -242,7 +260,7 @@ mod tests {
             .collect();
 
         let page = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 query: Some("bulk".to_string()),
                 limit: 7,
@@ -266,7 +284,7 @@ mod tests {
             .collect();
 
         let page = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 limit: usize::MAX,
                 ..SearchOptions::default()
@@ -284,7 +302,7 @@ mod tests {
             .collect();
 
         let page = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 limit: 50,
                 include_schema: true,
@@ -305,11 +323,11 @@ mod tests {
             "Explain a SQL query plan",
         )];
 
-        let compact = search_tools(catalog.clone(), SearchOptions::default());
+        let compact = search_tools(named(catalog.clone()), SearchOptions::default());
         assert!(compact.matches[0].input_schema.is_none());
 
         let detailed = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 include_schema: true,
                 ..SearchOptions::default()
@@ -332,7 +350,7 @@ mod tests {
         ];
 
         let page = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 server: Some("postgres-archive".to_string()),
                 query: Some("search".to_string()),
@@ -362,7 +380,7 @@ mod tests {
             .collect();
 
         let page = search_tools(
-            catalog,
+            named(catalog),
             SearchOptions {
                 query: Some("postgresql query latency".to_string()),
                 ..SearchOptions::default()
@@ -373,5 +391,49 @@ mod tests {
         assert_eq!(page.matches[0].tool, "tool_07777");
         assert!(page.matches[0].input_schema.is_none());
         assert!(!serde_json::to_string(&page).unwrap().contains("properties"));
+    }
+
+    #[test]
+    fn keeps_precomputed_collision_safe_names_across_pagination() {
+        let catalog = vec![
+            (
+                "server-a".to_string(),
+                McpToolDef {
+                    name: "query-docs".to_string(),
+                    description: Some("first".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                "mcp__server_a__query_docs__deadbeef".to_string(),
+            ),
+            (
+                "server_a".to_string(),
+                McpToolDef {
+                    name: "query_docs".to_string(),
+                    description: Some("second".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                "mcp__server_a__query_docs__feedface".to_string(),
+            ),
+        ];
+
+        let page = search_tools(
+            catalog,
+            SearchOptions {
+                query: Some("query docs".to_string()),
+                limit: 1,
+                offset: 1,
+                ..SearchOptions::default()
+            },
+        );
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].name, "mcp__server_a__query_docs__feedface");
+        assert_eq!(page.matches[0].server, "server_a");
+        assert_ne!(
+            page.matches[0].name,
+            crate::mcp::dispatch_name(&page.matches[0].server, &page.matches[0].tool),
+            "a suffixed collision alias must not collapse back to the lossy base name"
+        );
     }
 }

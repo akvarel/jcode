@@ -87,6 +87,7 @@ pub(super) enum RemoteEventOutcome {
 }
 
 pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) -> bool {
+    app.refresh_terminal_title_metrics();
     crate::tui::ui::set_frame_input_attribution(crate::tui::ui::FrameInputAttribution {
         event: Some("tick".to_string()),
         scroll_delta: None,
@@ -96,6 +97,32 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             .is_some_and(|state| state.kind == crate::tui::PickerKind::Model),
     });
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
+    needs_redraw |= app.poll_usage_reset();
+    if let Some(account) = app.usage_reset.invalidate_account.take() {
+        match remote.invalidate_openai_usage(account).await {
+            Ok(id) => {
+                app.usage_reset.invalidate_requests.insert(id, Some(Instant::now()));
+            }
+            Err(error) => app.push_display_message(DisplayMessage::error(format!(
+                "Reset result is unchanged, but the daemon usage cache could not be refreshed: {error}. Reconnect to refresh daemon state."
+            ))),
+        }
+        needs_redraw = true;
+    }
+    let mut refresh_timed_out = false;
+    for sent_at in app.usage_reset.invalidate_requests.values_mut() {
+        if sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(10)) {
+            // Retain the ID so a late control acknowledgement never ends an agent turn.
+            *sent_at = None;
+            refresh_timed_out = true;
+        }
+    }
+    if refresh_timed_out {
+        app.push_display_message(DisplayMessage::system(
+            "Reset result is unchanged, but the daemon usage refresh has not been acknowledged. Reconnect if usage stays stale.".to_string(),
+        ));
+        needs_redraw = true;
+    }
     needs_redraw |= app.poll_ssh_login(remote).await;
     needs_redraw |= app.poll_ssh_login_onboarding();
     needs_redraw |= app.flush_pending_resize_redraw();
@@ -394,7 +421,7 @@ async fn apply_terminal_event(
     };
     match event {
         Some(Ok(Event::FocusGained)) => {
-            crate::tui::reapply_configured_terminal_modes();
+            crate::tui::reapply_configured_terminal_modes_after_focus();
             input_attribution.event = Some("focus_gained".to_string());
             needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
@@ -779,7 +806,7 @@ fn handle_terminal_event_while_disconnected(
 
     match event {
         Some(Ok(Event::FocusGained)) => {
-            crate::tui::reapply_configured_terminal_modes();
+            crate::tui::reapply_configured_terminal_modes_after_focus();
             needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
         }

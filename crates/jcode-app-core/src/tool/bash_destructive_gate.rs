@@ -82,7 +82,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "stall_wake_seconds": {
                 "type": "integer",
-                "description": "Background-only idle timeout before waking the agent (minimum 30 seconds)."
+                "description": "With run_in_background: wake after N seconds without output/progress (min 30). For jobs that may hang."
             },
             "justification": {
                 "type": "string",
