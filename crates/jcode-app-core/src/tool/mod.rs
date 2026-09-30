@@ -1321,9 +1321,7 @@ impl Registry {
         let mut tools = self.tools.write().await;
         let mut removed = Vec::new();
         tools.retain(|name, tool| {
-            let keep = tool
-                .mcp_identity()
-                .is_none_or(|(owner, _)| owner != server);
+            let keep = tool.mcp_identity().is_none_or(|(owner, _)| owner != server);
             if !keep {
                 removed.push(name.clone());
             }

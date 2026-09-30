@@ -39,6 +39,8 @@ The newer upstream master commit only updates the weekly stars chart.
   jcode-app-core -p jcode-base -p jcode-provider-grok-build-runtime -p
   jcode-telemetry-core --lib`. Application core: 1,460 passed, 13 ignored.
   Base: 1,701 passed, 5 ignored. Grok runtime: 5 passed. Telemetry: 66 passed.
+- Final lint-fix revalidation: 60 Jev/transcript/redaction tests passed (1 ignored)
+  and 48 MCP tests passed, including real stdio lifecycle and permission checks.
 - TUI conflict-specific tests and onboarding invariants: 10 passed, 1 ignored.
   The new MCP pagination/native-reference regression passed in the core suite.
 - Compilation caught missing telemetry usage APIs/helper import, an upstream
