@@ -186,7 +186,10 @@ impl App {
                         match event {
                             Some(Ok(Event::Key(key))) => {
                                 self.update_copy_badge_key_event(key);
-                                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                self.observe_voice_key_release(&key);
+                                if self.handle_voice_key_event(&key) {
+                                    // Voice keys work from every screen and never type.
+                                } else if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                     let scroll_only = super::input::is_scroll_only_key(self, key.code, key.modifiers);
                                     let _ = self.handle_key_press_event(key);
                                     if self.cancel_requested {
@@ -212,6 +215,19 @@ impl App {
                                 status_spinner_renderer.draw_full(self, terminal)?;
                                 super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                             }
+                            Some(Ok(Event::FocusGained)) => {
+                                // Track focus state during the API wait so unfocused
+                                // animations and feature unlocks behave the same as
+                                // in the primary handler. Without this arm the
+                                // terminal's focus-in byte leaks into the catch-all
+                                // and the app stays stuck in "unfocused" mode.
+                                crate::tui::reapply_configured_terminal_modes_after_focus();
+                                self.note_client_focus(true);
+                                let _ = self.set_client_focused(true);
+                            }
+                            Some(Ok(Event::FocusLost)) => {
+                                self.set_client_focused(false);
+                            }
                             Some(Ok(Event::Mouse(mouse))) => {
                                 if !matches!(mouse.kind, MouseEventKind::Moved) {
                                     let scroll_only = self.handle_mouse_event(mouse);
@@ -226,6 +242,15 @@ impl App {
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                     super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                                 }
+                            }
+                            Some(Err(error)) => {
+                                // Never propagate Err out of the event loop; a
+                                // transient ConPTY sync error during a focus event
+                                // used to crash the tokio task and shut the runtime
+                                // down. Log and keep going.
+                                crate::logging::warn(&format!(
+                                    "tui: transient event-stream error during api wait: {error}"
+                                ));
                             }
                             _ => {}
                         }
@@ -294,6 +319,9 @@ impl App {
             let mut first_event = true;
             let mut saw_message_end = false;
             let mut call_output_tokens_seen: u64 = 0;
+            // Latest provider-reported usage for this API call, for usage_report.
+            let mut call_usage = jcode_provider_core::SimpleCompletionUsage::default();
+            let model_at_request_start = self.provider.model();
             let mut interleaved = false; // Track if we interleaved a message mid-stream
             // Track tool results from provider (already executed by Claude Code CLI)
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
@@ -350,7 +378,10 @@ impl App {
                         match event {
                             Some(Ok(Event::Key(key))) => {
                                 self.update_copy_badge_key_event(key);
-                                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                self.observe_voice_key_release(&key);
+                                if self.handle_voice_key_event(&key) {
+                                    // Voice keys work from every screen and never type.
+                                } else if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                     let scroll_only = super::input::is_scroll_only_key(self, key.code, key.modifiers);
                                     let _ = self.handle_key_press_event(key);
                                     // Check for cancel request
@@ -499,6 +530,20 @@ impl App {
                                 self.handle_paste(text);
                                 status_spinner_renderer.draw_full(self, terminal)?;
                             }
+                            Some(Ok(Event::FocusGained)) => {
+                                // Track focus state mid-stream so unfocused
+                                // animations and feature unlocks react to the
+                                // user clicking back into the terminal. Without
+                                // this arm the focus-in byte leaks into the
+                                // catch-all and the app stays stuck in
+                                // "unfocused" mode for the rest of the stream.
+                                crate::tui::reapply_configured_terminal_modes_after_focus();
+                                self.note_client_focus(true);
+                                let _ = self.set_client_focused(true);
+                            }
+                            Some(Ok(Event::FocusLost)) => {
+                                self.set_client_focused(false);
+                            }
                             Some(Ok(Event::Mouse(mouse))) => {
                                 if !matches!(mouse.kind, MouseEventKind::Moved) {
                                     let scroll_only = self.handle_mouse_event(mouse);
@@ -511,6 +556,15 @@ impl App {
                                 if self.should_redraw_after_resize() {
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                 }
+                            }
+                            Some(Err(error)) => {
+                                // Never propagate Err out of the streaming event
+                                // loop; a transient ConPTY sync error during a
+                                // focus event used to crash the tokio task and
+                                // shut the runtime down. Log and keep going.
+                                crate::logging::warn(&format!(
+                                    "tui: transient event-stream error during stream: {error}"
+                                ));
                             }
                             _ => {}
                         }
@@ -678,6 +732,12 @@ impl App {
                                         cache_read_input_tokens,
                                         cache_creation_input_tokens,
                                     } => {
+                                        call_usage.observe(
+                                            input_tokens,
+                                            output_tokens,
+                                            cache_read_input_tokens,
+                                            cache_creation_input_tokens,
+                                        );
                                         let mut usage_changed = self
                                             .apply_stream_usage_input_report(
                                                 input_tokens,
@@ -1111,6 +1171,16 @@ impl App {
                 }
             }
 
+            // Record before the interleave early-continue: an interrupted call
+            // still consumed whatever the provider reported.
+            crate::telemetry::record_simple_completion_usage(
+                Some(&self.session.id),
+                &provider_name,
+                &model_at_request_start,
+                crate::telemetry::UsageSource::Agent,
+                call_usage,
+            );
+
             // If we interleaved a message, skip post-processing and go straight to new API call
             if interleaved {
                 continue;
@@ -1348,7 +1418,10 @@ impl App {
                             match event {
                                 Some(Ok(Event::Key(key))) => {
                                     self.update_copy_badge_key_event(key);
-                                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                    self.observe_voice_key_release(&key);
+                                    if self.handle_voice_key_event(&key) {
+                                        // Voice keys work from every screen and never type.
+                                    } else if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                         let scroll_only = super::input::is_scroll_only_key(self, key.code, key.modifiers);
                                         let _ = self.handle_key_press_event(key);
                                         if self.cancel_requested {
@@ -1393,6 +1466,20 @@ impl App {
                                     self.handle_paste(text);
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                 }
+                                Some(Ok(Event::FocusGained)) => {
+                                    // Track focus state during tool execution so
+                                    // unfocused animations and feature unlocks
+                                    // react to the user clicking back into the
+                                    // terminal. Without this arm the focus-in
+                                    // byte leaks into the catch-all and the app
+                                    // stays stuck in "unfocused" mode.
+                                    crate::tui::reapply_configured_terminal_modes_after_focus();
+                                    self.note_client_focus(true);
+                                    let _ = self.set_client_focused(true);
+                                }
+                                Some(Ok(Event::FocusLost)) => {
+                                    self.set_client_focused(false);
+                                }
                                 Some(Ok(Event::Mouse(mouse))) => {
                                     if !matches!(mouse.kind, MouseEventKind::Moved) {
                                         let scroll_only = self.handle_mouse_event(mouse);
@@ -1405,6 +1492,16 @@ impl App {
                                     if self.should_redraw_after_resize() {
                                         status_spinner_renderer.draw_full(self, terminal)?;
                                     }
+                                }
+                                Some(Err(error)) => {
+                                    // Never propagate Err out of the tool-execution
+                                    // event loop; a transient ConPTY sync error
+                                    // during a focus event used to crash the tokio
+                                    // task and shut the runtime down. Log and keep
+                                    // going.
+                                    crate::logging::warn(&format!(
+                                        "tui: transient event-stream error during tool exec: {error}"
+                                    ));
                                 }
                                 _ => {}
                             }

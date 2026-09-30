@@ -1373,6 +1373,9 @@ pub(super) fn handle_prompt_history_navigation(
                 return history
                     .last()
                     .map(|prompt| {
+                        app.remember_input_undo_state();
+                        app.history_draft =
+                            Some((app.input.clone(), app.cursor_pos.min(app.input.len())));
                         app.input = prompt.clone();
                         app.cursor_pos = app.input.len();
                         app.reset_tab_completion();
@@ -1386,8 +1389,13 @@ pub(super) fn handle_prompt_history_navigation(
             KeyCode::Up => Some(current_index.saturating_sub(1)),
             KeyCode::Down if current_index + 1 < history.len() => Some(current_index + 1),
             KeyCode::Down => {
-                app.input.clear();
-                app.cursor_pos = 0;
+                if let Some((draft, cursor_pos)) = app.history_draft.take() {
+                    app.input = draft;
+                    app.cursor_pos = cursor_pos;
+                } else {
+                    app.input.clear();
+                    app.cursor_pos = 0;
+                }
                 app.reset_tab_completion();
                 app.sync_model_picker_preview_from_input();
                 return true;
@@ -2421,6 +2429,14 @@ pub(super) fn handle_pre_control_shortcuts(
         return true;
     }
 
+    if app
+        .toggle_keys
+        .diagram_pane_visibility
+        .matches(code, modifiers)
+    {
+        app.toggle_diagram_pane();
+        return true;
+    }
     if app.toggle_keys.side_panel.matches(code, modifiers) {
         app.toggle_side_panel();
         return true;
@@ -2775,7 +2791,14 @@ pub(super) fn handle_global_control_shortcuts(
                 } else {
                     app.set_status_notice("Interrupting...");
                 }
+            } else if !app.input.is_empty() {
+                // First Ctrl+C: clear the input box
+                app.input.clear();
+                app.pending_images.clear();
+                app.cursor_pos = 0;
+                app.set_status_notice("Input cleared. Press Ctrl+C again to quit");
             } else {
+                // Second Ctrl+C (input already empty): proceed with quit
                 app.handle_quit_request();
             }
             true
@@ -3260,7 +3283,17 @@ impl App {
     fn commit_resize_redraw(&mut self, now: std::time::Instant) -> bool {
         self.last_resize_redraw = Some(now);
         self.resize_redraw_pending = false;
+        // A paused viewport holds a wrapped line index; capture the reading
+        // position in content coordinates before the rewrap, so the same
+        // message stays under the reader (issue #1412, persistent half).
+        self.capture_resize_anchor();
         self.handle_diagram_geometry_change();
+        // A resize rewraps the transcript, so the wrapped-line extent changes
+        // without the user scrolling. While following the tail that reads as a
+        // large append and the renderer starts its catch-up slide from the
+        // pre-resize offset, which looks like the view jumping up and sliding
+        // back down (issue #1412). Snap to the new bottom on the next frame.
+        crate::tui::ui::request_tail_follow_snap();
         true
     }
 
@@ -3846,7 +3879,8 @@ impl App {
         let trimmed = input.trim();
         let handled = super::commands_dispatch::dispatch_local_command(self, trimmed);
         if handled {
-            if trimmed.starts_with('/') {
+            let embedded = super::commands_dispatch::contains_registered_slash_command(trimmed);
+            if trimmed.starts_with('/') || embedded {
                 crate::telemetry::record_command_family(trimmed);
             }
             return;

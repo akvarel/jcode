@@ -24,14 +24,13 @@ use crate::external_auth::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProviderChoice {
     Jcode,
+    /// Native Claude (Anthropic OAuth/API). `claude-subprocess` is kept as a
+    /// hidden alias for old scripts; the Claude Code CLI subprocess transport
+    /// has been removed.
+    #[value(alias = "claude-subprocess")]
     Claude,
     #[value(alias = "claude-api", alias = "anthropic-key", alias = "claude-key")]
     AnthropicApi,
-    #[deprecated(
-        note = "Claude Code CLI subprocess transport is deprecated; use ProviderChoice::Claude for native Anthropic OAuth/API transport"
-    )]
-    #[value(alias = "claude-subprocess", hide = true)]
-    ClaudeSubprocess,
     Openai,
     #[value(
         alias = "openai-key",
@@ -111,6 +110,7 @@ pub enum ProviderChoice {
     MetaMuse,
     #[value(alias = "celeris-ai", alias = "celeris1", alias = "celeris-1")]
     Celeris,
+    YoloAuto,
     #[value(alias = "lm-studio")]
     Lmstudio,
     Ollama,
@@ -152,7 +152,6 @@ impl ProviderChoice {
             Self::Jcode => "jcode",
             Self::Claude => "claude",
             Self::AnthropicApi => "anthropic-api",
-            Self::ClaudeSubprocess => "claude-subprocess",
             Self::Openai => "openai",
             Self::OpenaiApi => "openai-api",
             Self::Openrouter => "openrouter",
@@ -189,6 +188,7 @@ impl ProviderChoice {
             Self::XiaomiMimo => "xiaomi-mimo",
             Self::MetaMuse => "meta-muse",
             Self::Celeris => "celeris",
+            Self::YoloAuto => "yolo-auto",
             Self::Lmstudio => "lmstudio",
             Self::Ollama => "ollama",
             Self::Chutes => "chutes",
@@ -221,10 +221,6 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
     (
         ProviderChoice::AnthropicApi,
         crate::provider_catalog::ANTHROPIC_API_LOGIN_PROVIDER,
-    ),
-    (
-        ProviderChoice::ClaudeSubprocess,
-        crate::provider_catalog::CLAUDE_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::Openai,
@@ -375,6 +371,10 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
         crate::provider_catalog::CELERIS_LOGIN_PROVIDER,
     ),
     (
+        ProviderChoice::YoloAuto,
+        crate::provider_catalog::YOLO_AUTO_LOGIN_PROVIDER,
+    ),
+    (
         ProviderChoice::Lmstudio,
         crate::provider_catalog::LMSTUDIO_LOGIN_PROVIDER,
     ),
@@ -455,9 +455,7 @@ pub fn login_provider_for_choice(choice: &ProviderChoice) -> Option<LoginProvide
 pub fn choice_for_login_provider(provider: LoginProviderDescriptor) -> Option<ProviderChoice> {
     PROVIDER_CHOICE_LOGIN_PROVIDERS
         .iter()
-        .find(|(choice, candidate)| {
-            candidate.id == provider.id && !matches!(choice, ProviderChoice::ClaudeSubprocess)
-        })
+        .find(|(_, candidate)| candidate.id == provider.id)
         .map(|(choice, _)| *choice)
 }
 
@@ -643,30 +641,40 @@ impl AutoProviderAvailability {
     }
 }
 
-fn maybe_enable_config_default_provider_for_auto() -> Result<bool> {
+fn maybe_enable_compat_provider_for_auto() -> Result<bool> {
     let cfg = crate::config::config();
-    let Some(default_provider) = cfg
+    if let Some(default_provider) = cfg
         .provider
         .default_provider
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        return Ok(false);
-    };
-
-    if let Some(profile) =
-        crate::provider_catalog::resolve_openai_compatible_profile_selection(default_provider)
     {
-        apply_openai_compatible_profile_env(Some(profile));
-        return Ok(provider::openrouter::has_credentials());
+        if let Some(profile) =
+            crate::provider_catalog::resolve_openai_compatible_profile_selection(default_provider)
+        {
+            apply_openai_compatible_profile_env(Some(profile));
+            return Ok(provider::openrouter::has_credentials());
+        }
+
+        if cfg.providers.contains_key(default_provider) {
+            crate::provider_catalog::apply_named_provider_profile_env_from_config(
+                default_provider,
+                cfg,
+            )?;
+            return Ok(provider::openrouter::has_credentials());
+        }
     }
 
-    if cfg.providers.contains_key(default_provider) {
-        crate::provider_catalog::apply_named_provider_profile_env_from_config(
-            default_provider,
-            cfg,
-        )?;
+    // No usable [provider] default: enable the first configured OpenAI-compatible
+    // profile (deepseek, xiaomi-mimo, ...) so `--provider auto` notices direct
+    // compat credentials instead of booting an empty deferred-auth MultiProvider.
+    if let Some(profile) = crate::provider_catalog::openai_compatible_profiles()
+        .iter()
+        .copied()
+        .find(|profile| crate::provider_catalog::openai_compatible_profile_is_configured(*profile))
+    {
+        apply_openai_compatible_profile_env(Some(profile));
         return Ok(provider::openrouter::has_credentials());
     }
 
@@ -1496,19 +1504,6 @@ async fn init_provider_with_options(
             select_initial_model_provider("claude");
             Arc::new(provider::MultiProvider::with_preference_fast(false))
         }
-        ProviderChoice::ClaudeSubprocess => {
-            disable_subscription_runtime_mode();
-            ensure_claude_auth_allowed_for_explicit_choice()?;
-            crate::logging::warn(
-                "Using --provider claude-subprocess is deprecated and will be removed. Prefer `--provider claude`.",
-            );
-            crate::env::set_var("JCODE_USE_CLAUDE_CLI", "1");
-            init_notice(
-                "Using deprecated Claude subprocess transport as the initial provider (legacy compatibility mode)",
-            );
-            select_initial_model_provider("claude");
-            Arc::new(provider::MultiProvider::with_preference_fast(false))
-        }
         ProviderChoice::Openai => {
             disable_subscription_runtime_mode();
             ensure_openai_auth_allowed_for_explicit_choice()?;
@@ -1554,7 +1549,7 @@ async fn init_provider_with_options(
         }
         ProviderChoice::GrokBuild => {
             disable_subscription_runtime_mode();
-            init_notice("Using Grok Build subscription via the authenticated Grok CLI");
+            init_notice("Using Grok Build subscription (Grok CLI login, direct HTTPS)");
             clear_initial_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "grok-build");
             crate::provider::external::instantiate_external_provider(
@@ -1615,6 +1610,7 @@ async fn init_provider_with_options(
         | ProviderChoice::XiaomiMimo
         | ProviderChoice::MetaMuse
         | ProviderChoice::Celeris
+        | ProviderChoice::YoloAuto
         | ProviderChoice::Lmstudio
         | ProviderChoice::Ollama
         | ProviderChoice::Chutes
@@ -1775,7 +1771,7 @@ async fn init_provider_with_options(
                 }
 
                 if !has_openrouter {
-                    has_openrouter = maybe_enable_config_default_provider_for_auto()?;
+                    has_openrouter = maybe_enable_compat_provider_for_auto()?;
                 }
 
                 has_other_provider = has_openai

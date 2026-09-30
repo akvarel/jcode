@@ -49,6 +49,9 @@ fn post_payload(payload: Value, timeout: Duration) -> bool {
     let Some(client) = http_client() else {
         return false;
     };
+    // Newer event types can reach an older worker that rejects them as unknown.
+    // That must only drop the one payload, never disable all telemetry.
+    let breaker_exempt = payload_is_breaker_exempt(&payload);
     match client
         .post(TELEMETRY_ENDPOINT)
         .timeout(timeout)
@@ -58,7 +61,7 @@ fn post_payload(payload: Value, timeout: Duration) -> bool {
         Ok(response) if response.status().is_success() => true,
         Ok(response) => {
             let status = response.status();
-            if telemetry_status_is_permanent(status.as_u16()) {
+            if telemetry_status_is_permanent(status.as_u16()) && !breaker_exempt {
                 TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
                 logging::warn(&format!(
                     "telemetry endpoint permanently rejected payload with HTTP {status}; suppressing telemetry delivery for this process"
@@ -75,6 +78,15 @@ fn post_payload(payload: Value, timeout: Duration) -> bool {
             false
         }
     }
+}
+
+/// Event types added after the worker's validation was frozen. A 4xx for one of
+/// these means "this worker does not know the event yet", not "stop sending".
+pub(super) fn payload_is_breaker_exempt(payload: &Value) -> bool {
+    matches!(
+        payload.get("event").and_then(|value| value.as_str()),
+        Some("usage_report")
+    )
 }
 
 #[cfg(not(test))]

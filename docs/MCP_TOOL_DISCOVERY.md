@@ -13,13 +13,14 @@ Configure the behavior in `~/.jcode/config.toml`:
 ```toml
 [tools]
 mcp_tools = "auto" # auto | eager | deferred
-mcp_tools_token_threshold = 8000
+# Legacy mcp_tools_token_threshold values still parse but are ignored.
 ```
 
 - `eager` exposes every connected MCP tool directly.
-- `deferred` exposes only `mcp_search` and `mcp_call`.
-- `auto` uses eager exposure until the filtered MCP definitions exceed the
-  configured token threshold, then switches to deferred exposure.
+- `deferred` uses provider-native deferred loading where supported, otherwise
+  the fixed `mcp_search` and `mcp_call` surface.
+- `auto` behaves like `deferred`, keeping the prompt tool list stable when
+  servers connect, reconnect, or register late.
 
 The searchable catalog combines live definitions with the on-disk schema cache
 for configured servers. Live definitions replace cached definitions when both
@@ -38,7 +39,10 @@ exist. Calling a cached tool can connect its server on first use.
 
 Compact searches omit `input_schema`. Schema-bearing searches are capped at
 five matches even when a larger limit is requested. The result envelope reports
-`matches`, `total`, `offset`, `limit`, and `has_more`.
+`matches`, `total`, `offset`, `limit`, and `has_more`. Search output also carries
+up to 32 canonical dispatch names from the returned page as `tool_references`
+metadata for provider-native loading. Permission filtering and pagination happen
+before those references are emitted.
 
 Ranking is deterministic. Exact tool and server names rank above phrase and
 individual-term matches in names and descriptions. Equal scores are ordered by

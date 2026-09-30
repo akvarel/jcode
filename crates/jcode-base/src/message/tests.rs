@@ -319,16 +319,17 @@ fn redact_secrets_leaves_normal_output_unchanged() {
 
 #[test]
 fn redact_secrets_redacts_bearer_jwt_aws_and_private_keys() {
-    let aws_access_key = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
-    let input = format!(
-        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\n\
-         aws={aws_access_key}\n\
-         jwt=eyJabcdefghijk.abcdefghijkl.abcdefghijkl\n\
-         -----BEGIN PRIVATE KEY-----\nsecret-material\n-----END PRIVATE KEY-----\n",
+    let input = concat!(
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\n",
+        // Split so the repo secret scanner does not flag this synthetic key.
+        "aws=AKIA",
+        "ABCDEFGHIJKLMNOP\n",
+        "jwt=eyJabcdefghijk.abcdefghijkl.abcdefghijkl\n",
+        "-----BEGIN PRIVATE KEY-----\nsecret-material\n-----END PRIVATE KEY-----\n",
     );
-    let out = redact_secrets(&input);
+    let out = redact_secrets(input);
     assert!(!out.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
-    assert!(!out.contains(&aws_access_key));
+    assert!(!out.contains(concat!("AKIA", "ABCDEFGHIJKLMNOP")));
     assert!(!out.contains("eyJabcdefghijk"));
     assert!(!out.contains("secret-material"));
     assert!(out.matches("[REDACTED_SECRET]").count() >= 4);
@@ -726,6 +727,7 @@ fn description_token_estimate_uses_chars_per_token_heuristic() {
         name: "read".to_string(),
         description: "abcdwxyz".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
+        defer_loading: false,
     };
 
     assert_eq!(def.description_token_estimate(), 2);

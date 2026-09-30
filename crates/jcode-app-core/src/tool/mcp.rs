@@ -32,6 +32,10 @@ struct McpSearchInput {
     include_schema: bool,
 }
 
+/// Upper bound on definitions one `mcp_search` call loads into context via
+/// tool references, so an empty or broad query cannot pull in a whole catalog.
+const MAX_SEARCH_TOOL_REFERENCES: usize = 32;
+
 /// Fixed MCP discovery surface used when individual server definitions are deferred.
 pub struct McpSearchTool {
     manager: Arc<RwLock<McpManager>>,
@@ -160,9 +164,28 @@ impl Tool for McpSearchTool {
                 include_schema: params.include_schema,
             },
         );
-        let title = format!("MCP tools ({} of {})", page.matches.len(), page.total);
-        Ok(ToolOutput::new(serde_json::to_string_pretty(&page)?).with_title(title))
+        mcp_search_output(&page)
     }
+}
+
+/// Render a deferred MCP search page.
+///
+/// The ranked page is the tool result, and its native-loadable
+/// `tool_references` metadata is the page's match names capped exactly like the
+/// schemas, so the references always mirror the returned page. This is the one
+/// place that mapping is built, which keeps `mcp_search` and its regression
+/// test on the same code path.
+fn mcp_search_output(page: &search::SearchPage) -> Result<ToolOutput> {
+    let references: Vec<&str> = page
+        .matches
+        .iter()
+        .take(MAX_SEARCH_TOOL_REFERENCES)
+        .map(|m| m.name.as_str())
+        .collect();
+    let title = format!("MCP tools ({} of {})", page.matches.len(), page.total);
+    Ok(ToolOutput::new(serde_json::to_string_pretty(page)?)
+        .with_title(title)
+        .with_metadata(json!({ "tool_references": references })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,7 +318,15 @@ impl Tool for McpCallTool {
                     output_parts.push(format!("[Image: {} ({} bytes)]", mime_type, data.len()));
                 }
                 ContentBlock::Resource { resource } => {
-                    if let Some(text) = resource.text {
+                    if let Some(rendered) = crate::applets::mount_mcp_resource(
+                        &ctx.session_id,
+                        &ctx.tool_call_id,
+                        &resource.uri,
+                        resource.mime_type.as_deref(),
+                        resource.text.as_deref(),
+                    ) {
+                        output_parts.push(rendered);
+                    } else if let Some(text) = resource.text {
                         output_parts.push(text);
                     } else if let Some(blob) = resource.blob {
                         output_parts.push(format!(
@@ -615,19 +646,39 @@ impl McpManagementTool {
                     server_name,
                     server_tools.len()
                 );
+                let mut references = Vec::new();
                 for ((_, tool), fallback) in server_tools {
                     let name = registry
                         .as_ref()
                         .and_then(|r| r.mcp_alias(&server_name, &tool.name))
                         .unwrap_or_else(|| fallback.clone());
+                    // The schema is part of the result on purpose: on providers
+                    // without native deferred loading the cached tool list never
+                    // changes, so this transcript entry is the only place the
+                    // model learns how to call the new tool (via `mcp_call`).
                     output.push_str(&format!(
-                        "  - {}: {}\n",
+                        "  - {}: {}\n    tool: {}  input_schema: {}\n",
                         name,
-                        tool.description.as_deref().unwrap_or("(no description)")
+                        tool.description.as_deref().unwrap_or("(no description)"),
+                        tool.name,
+                        serde_json::to_string(&tool.input_schema)
+                            .unwrap_or_else(|_| "{}".to_string()),
                     ));
+                    references.push(name);
                 }
+                references.truncate(MAX_SEARCH_TOOL_REFERENCES);
+                output.push_str(&format!(
+                    "\nCall these tools directly by name if they appear in your tool list; \
+                     otherwise use mcp_call with server=\"{}\", tool=<tool>, and arguments \
+                     matching input_schema.\n",
+                    server_name
+                ));
 
-                Ok(ToolOutput::new(output).with_title(format!("MCP: Connected {}", server_name)))
+                // The new server's tools load as provider-native deferred
+                // definitions (no prompt-cache miss) where supported.
+                Ok(ToolOutput::new(output)
+                    .with_title(format!("MCP: Connected {}", server_name))
+                    .with_metadata(json!({ "tool_references": references })))
             }
             Err(e) => {
                 crate::logging::event_warn(
@@ -912,6 +963,66 @@ mod tests {
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["server"].is_object());
         assert!(schema["properties"]["command"].is_object());
+    }
+
+    #[test]
+    fn mcp_search_tool_references_equal_paginated_match_names() {
+        // The regression: upstream adds `tool_references` metadata while the
+        // fork keeps ranked pagination. The metadata must be exactly the names
+        // of the page returned, not the whole catalog.
+        let catalog = vec![
+            (
+                "srv".to_string(),
+                crate::mcp::McpToolDef {
+                    name: "alpha".to_string(),
+                    description: Some("alpha search tool".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                "srv_alpha".to_string(),
+            ),
+            (
+                "srv".to_string(),
+                crate::mcp::McpToolDef {
+                    name: "beta".to_string(),
+                    description: Some("beta search tool".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                "srv_beta".to_string(),
+            ),
+            (
+                "srv".to_string(),
+                crate::mcp::McpToolDef {
+                    name: "gamma".to_string(),
+                    description: Some("gamma search tool".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                "srv_gamma".to_string(),
+            ),
+        ];
+        let page = search::search_tools(
+            catalog,
+            search::SearchOptions {
+                server: None,
+                query: Some("search".to_string()),
+                limit: 2,
+                offset: 0,
+                include_schema: false,
+            },
+        );
+        assert_eq!(page.total, 3, "total counts every match before pagination");
+        assert_eq!(page.matches.len(), 2, "limit bounds the returned page");
+
+        let output = mcp_search_output(&page).expect("search output renders");
+        let expected: Vec<&str> = page.matches.iter().map(|m| m.name.as_str()).collect();
+        let metadata = output.metadata.as_ref().expect("tool_references metadata");
+        let references = metadata["tool_references"]
+            .as_array()
+            .expect("tool_references is an array")
+            .iter()
+            .map(|value| value.as_str().expect("reference is a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(references, expected);
+        assert_eq!(references.len(), page.matches.len());
     }
 
     #[test]

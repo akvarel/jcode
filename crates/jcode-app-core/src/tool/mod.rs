@@ -4,6 +4,8 @@ mod apply_patch;
 mod bash;
 mod batch;
 mod bg;
+#[cfg(unix)]
+pub(crate) mod bridge_reload;
 mod browser;
 mod communicate;
 mod compile_remote;
@@ -21,6 +23,9 @@ mod feedback;
 mod file_diff;
 pub(crate) mod file_lock;
 mod gmail;
+// The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
+pub mod applet;
+#[allow(dead_code)]
 mod goal;
 pub mod inflight;
 mod invalid;
@@ -407,6 +412,7 @@ impl Registry {
                 side_panel::SidePanelTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "panel", panel::PanelTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "applet", applet::AppletTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "edit", edit::EditTool::new);
             // `multiedit` merged into `edit`, and `patch` into `apply_patch`.
             // Both old names still resolve through `resolve_tool_name`.
@@ -874,15 +880,13 @@ impl Registry {
         let tools = self.tools.read().await;
         let resolved_name = Self::resolve_tool_name_for_session(&ctx.session_id, name);
         let is_custom = sdk::custom(&ctx.session_id, resolved_name);
-        if is_custom {
-            if let Some(config) = sdk::config(&ctx.session_id) {
-                let disabled = config.disabled.into_iter().collect();
-                anyhow::ensure!(
-                    !self.tool_is_disabled(&disabled, resolved_name),
-                    "Tool '{}' is disabled",
-                    resolved_name
-                );
-            }
+        if is_custom && let Some(config) = sdk::config(&ctx.session_id) {
+            let disabled = config.disabled.into_iter().collect();
+            anyhow::ensure!(
+                !self.tool_is_disabled(&disabled, resolved_name),
+                "Tool '{}' is disabled",
+                resolved_name
+            );
         }
         // Enforce product separation here too: batch/subcalls dispatch through
         // the registry without going through Agent::validate_tool_allowed.
@@ -946,14 +950,22 @@ impl Registry {
         // Drop the lock before executing
         drop(tools);
 
+        let working_dir = ctx
+            .working_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string());
+        let input = crate::hooks::transform_tool_input(
+            &ctx.session_id,
+            working_dir.as_deref(),
+            resolved_name,
+            input,
+        )
+        .await;
+
         // User-configured pre_tool gate: external policy hook that can block
         // this call (exit 2). Skipped entirely when not configured.
         if crate::hooks::hook_configured("pre_tool") {
             let input_json = input.to_string();
-            let working_dir = ctx
-                .working_dir
-                .as_ref()
-                .map(|dir| dir.display().to_string());
             let decision = crate::hooks::run_pre_tool_gate(
                 &ctx.session_id,
                 working_dir.as_deref(),
@@ -1226,6 +1238,17 @@ impl Registry {
             .any(|name| tool_name_is_disabled(disabled, name))
     }
 
+    /// Original `(server, tool)` for a registered MCP alias. Aliases are
+    /// sanitized for providers, so they cannot be split back reliably.
+    pub(crate) fn mcp_identity_for_alias(&self, alias: &str) -> Option<(String, String)> {
+        self.mcp_policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .get(alias)
+            .cloned()
+    }
+
     fn mcp_dispatch_is_allowed(
         &self,
         session: &str,
@@ -1298,9 +1321,9 @@ impl Registry {
         let mut tools = self.tools.write().await;
         let mut removed = Vec::new();
         tools.retain(|name, tool| {
-            let keep = !tool
+            let keep = tool
                 .mcp_identity()
-                .is_some_and(|(owner, _)| owner == server);
+                .is_none_or(|(owner, _)| owner != server);
             if !keep {
                 removed.push(name.clone());
             }
@@ -1476,7 +1499,12 @@ impl Registry {
             let registry = self.clone();
             tokio::spawn(async move {
                 let (successes, failures) = {
-                    let manager = mcp_manager.write().await;
+                    // `connect_all` mutates the manager's internal connection
+                    // maps but does not mutate the manager object itself. A
+                    // read guard lets MCP list and other management actions
+                    // inspect those maps while a slow initialize handshake is
+                    // in flight.
+                    let manager = mcp_manager.read().await;
                     manager.connect_all().await.unwrap_or((0, Vec::new()))
                 };
 

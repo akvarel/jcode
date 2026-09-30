@@ -5,6 +5,8 @@ async fn communicate_list_and_await_members_work_end_to_end() {
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     // Independently created root sessions own separate swarms (83dbc36dc);
@@ -136,6 +138,8 @@ async fn communicate_await_members_background_returns_immediately_and_notifies()
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     // Independently created root sessions own separate swarms (83dbc36dc);
@@ -242,6 +246,8 @@ async fn communicate_run_plan_with_empty_plan_returns_inline_even_in_background_
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     let _swarm = EnvGuard::set("JCODE_SWARM_ID", "communicate-e2e");
@@ -298,6 +304,8 @@ async fn communicate_status_returns_busy_snapshot_for_running_member() {
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     // Independently created root sessions own separate swarms (83dbc36dc);
@@ -383,6 +391,8 @@ async fn communicate_spawn_reports_completion_back_to_spawner() {
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     let _swarm = EnvGuard::set("JCODE_SWARM_ID", "communicate-e2e");
@@ -462,6 +472,8 @@ async fn communicate_spawn_with_prompt_and_summary_work_end_to_end() {
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     let _swarm = EnvGuard::set("JCODE_SWARM_ID", "communicate-e2e");
@@ -565,6 +577,8 @@ async fn communicate_message_routes_as_dm_while_broadcast_targets_swarm() {
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    // Keep the developer's real config (agents.swarm_model, providers) out of spawns.
+    let _home = EnvGuard::set("JCODE_HOME", runtime_dir.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
     // Independently created root sessions own separate swarms (83dbc36dc);
@@ -629,6 +643,27 @@ async fn communicate_message_routes_as_dm_while_broadcast_targets_swarm() {
         dm_scope.as_deref(),
         Some("dm"),
         "message with to_session should be delivered with dm scope"
+    );
+
+    // A long DM without a sender summary must still deliver.
+    let long_dm_output = tool
+        .execute(
+            json!({
+                "action": "dm",
+                "message": format!("long-dm {}", "x".repeat(244)),
+                "to_session": peer_session.clone()
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("long DM without tldr should succeed");
+    assert!(long_dm_output.output.contains("Direct message sent to"));
+    assert_eq!(
+        peer.next_message_notification(Duration::from_secs(5))
+            .await
+            .expect("peer should receive long DM")
+            .as_deref(),
+        Some("dm")
     );
 
     // Broadcasts are scoped to the sender's spawned subtree; the coordinator
