@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -161,6 +163,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -302,6 +306,8 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -509,6 +515,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
