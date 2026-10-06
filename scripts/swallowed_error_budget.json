@@ -1,9 +1,9 @@
 {
-  "total": 3609,
+  "total": 3626,
   "totals_by_pattern": {
-    "dot_ok": 1374,
-    "let_underscore": 1341,
-    "unwrap_or_default": 894
+    "dot_ok": 1384,
+    "let_underscore": 1343,
+    "unwrap_or_default": 899
   },
   "tracked_files": {
     "crates/jcode-app-core/src/agent.rs": {
@@ -342,7 +342,7 @@
       "unwrap_or_default": 1
     },
     "crates/jcode-app-core/src/server/util.rs": {
-      "dot_ok": 13,
+      "dot_ok": 12,
       "let_underscore": 0,
       "unwrap_or_default": 0
     },
@@ -694,6 +694,11 @@
     "crates/jcode-base/src/auth/google.rs": {
       "dot_ok": 4,
       "let_underscore": 0,
+      "unwrap_or_default": 1
+    },
+    "crates/jcode-base/src/auth/google/setup.rs": {
+      "dot_ok": 6,
+      "let_underscore": 0,
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/auth/grok_build.rs": {
@@ -747,13 +752,18 @@
       "unwrap_or_default": 6
     },
     "crates/jcode-base/src/browser.rs": {
-      "dot_ok": 12,
-      "let_underscore": 12,
+      "dot_ok": 11,
+      "let_underscore": 9,
       "unwrap_or_default": 2
     },
     "crates/jcode-base/src/browser_detect.rs": {
       "dot_ok": 4,
       "let_underscore": 0,
+      "unwrap_or_default": 0
+    },
+    "crates/jcode-base/src/browser_session.rs": {
+      "dot_ok": 1,
+      "let_underscore": 3,
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/bus.rs": {
@@ -846,6 +856,11 @@
       "let_underscore": 0,
       "unwrap_or_default": 2
     },
+    "crates/jcode-base/src/google_calendar.rs": {
+      "dot_ok": 0,
+      "let_underscore": 0,
+      "unwrap_or_default": 1
+    },
     "crates/jcode-base/src/hooks.rs": {
       "dot_ok": 0,
       "let_underscore": 2,
@@ -875,6 +890,11 @@
       "dot_ok": 4,
       "let_underscore": 0,
       "unwrap_or_default": 0
+    },
+    "crates/jcode-base/src/mcp/budget.rs": {
+      "dot_ok": 1,
+      "let_underscore": 0,
+      "unwrap_or_default": 1
     },
     "crates/jcode-base/src/mcp/client.rs": {
       "dot_ok": 0,
@@ -1501,6 +1521,11 @@
       "let_underscore": 0,
       "unwrap_or_default": 0
     },
+    "crates/jcode-provider-core/src/service_tier.rs": {
+      "dot_ok": 0,
+      "let_underscore": 0,
+      "unwrap_or_default": 2
+    },
     "crates/jcode-provider-cursor-runtime/src/agent_transport.rs": {
       "dot_ok": 6,
       "let_underscore": 37,
@@ -1985,6 +2010,11 @@
       "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 4
+    },
+    "crates/jcode-tui/src/tui/app/commands_desktop.rs": {
+      "dot_ok": 1,
+      "let_underscore": 2,
+      "unwrap_or_default": 0
     },
     "crates/jcode-tui/src/tui/app/commands_dispatch.rs": {
       "dot_ok": 0,
@@ -2540,6 +2570,11 @@
       "dot_ok": 0,
       "let_underscore": 1,
       "unwrap_or_default": 1
+    },
+    "src/cli/login/google.rs": {
+      "dot_ok": 3,
+      "let_underscore": 0,
+      "unwrap_or_default": 0
     },
     "src/cli/login/scriptable.rs": {
       "dot_ok": 0,
