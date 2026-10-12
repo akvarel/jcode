@@ -600,9 +600,12 @@ async fn ensure_firefox_ready(
     // verify the live bridge before launching an action because the browser or
     // the extension may have stopped or become incompatible since then.
     let name = target.kind.display_name();
+    // Throttled (every few hours) check for a newer bridge release.
+    let update_note = crate::browser::auto_update_before_action(target.kind).await;
     let mut status = crate::browser::ensure_browser_ready_noninteractive_for(target).await?;
     if status.ready {
-        return ready_in_requested_browser(&status, target.kind, explicit);
+        return ready_in_requested_browser(&status, target.kind, explicit)
+            .map(|note| note.or(update_note));
     }
 
     // The most common "not responding" cause after a completed setup is that
@@ -1026,7 +1029,7 @@ async fn firefox_run_bridge_command(
     #[cfg(not(windows))]
     if std::env::var("BROWSER_SESSION").is_err()
         && let Some(session_name) =
-            crate::browser::ensure_browser_session_for(&_ctx.session_id, browser)
+            crate::browser::ensure_browser_session_for_async(&_ctx.session_id, browser).await
     {
         command.env("BROWSER_SESSION", session_name);
     }

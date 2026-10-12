@@ -12,6 +12,9 @@ concurrency:
 
 env:
   JCODE_CI: "1"
+  # CI builds without the local parallel-frontend rustc wrapper from
+  # .cargo/config.toml (a POSIX shell script; see scripts/rustc-parallel-frontend).
+  CARGO_BUILD_RUSTC_WRAPPER: ""
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
 
@@ -51,6 +54,10 @@ jobs:
         # binary", skipping all of its validation steps. This catches it in
         # seconds, on the job that already owns dependency hygiene.
         run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Warning budget gate contract tests
+        shell: bash
+        run: scripts/test_check_warning_budget.sh
 
       - name: Enforce warning budget
         shell: bash
@@ -226,6 +233,91 @@ jobs:
           python3 .github/scripts/run_with_timeout.py 600 \
             "$(rustup which cargo)" test --target ${{ matrix.target }} \
             -p jcode-app-core --lib retention_readiness -- --nocapture
+
+      - name: Run secret-input pty cohort (all platforms with a pty)
+        if: runner.os != 'Windows'
+        shell: bash
+        # `jcode-base --lib` is never executed on Linux CI: the only jcode-base
+        # test invocation anywhere in this workflow is a Windows-only
+        # `power_inhibit::tests::windows_` filter. So the masking fix for #660 had
+        # a test that was compiled and never run, which is the same
+        # looks-green-but-never-ran shape as the warning budget and the stdin
+        # detector (#651). These tests fork a pty, so they cannot run on the
+        # Windows runner; everywhere else they take about a second.
+        #
+        # 600s, not 300s: the budget is dominated by cold-compiling the
+        # jcode-base lib test harness, which exceeded 300s on a hosted macOS
+        # runner (run 30591536707) while the cohort itself runs in a second.
+        run: |
+          python3 .github/scripts/run_with_timeout.py 600 \
+            "$(rustup which cargo)" test --target ${{ matrix.target }} \
+            -p jcode-base --lib secret_input -- --nocapture
+
+      - name: Run browser session liveness and reuse regressions
+        shell: bash
+        run: |
+          cargo test --target ${{ matrix.target }} -p jcode-base --lib browser_session -- --nocapture
+          cargo test --target ${{ matrix.target }} -p jcode-app-core --lib browser_session -- --nocapture
+
+      - name: Run embedding numeric-stability cohort (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        # `minilm_embedding_is_numerically_stable_across_inference_engines` pins
+        # the model's actual output, which is the only thing that can catch an
+        # inference-engine upgrade silently changing embeddings: persisted
+        # memories are keyed by model_id, which does not change across a tract
+        # bump, so the stale-embedding filter cannot notice (#657).
+        #
+        # That test skips itself when the model is absent, and jcode-embedding
+        # tests are not otherwise run here at all, so without this step it would
+        # never execute. Fetch the model first (~87MB) so the cohort is real
+        # rather than a silent skip.
+        run: |
+          set -euo pipefail
+          model_dir="$HOME/.jcode/models/all-MiniLM-L6-v2"
+          mkdir -p "$model_dir"
+          base="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main"
+          curl -sSfL --retry 3 -o "$model_dir/model.onnx" "$base/onnx/model.onnx"
+          curl -sSfL --retry 3 -o "$model_dir/tokenizer.json" "$base/tokenizer.json"
+          # Fail loudly if the fetch produced something unusable, so this cannot
+          # degrade back into a silent skip.
+          test -s "$model_dir/model.onnx"
+          test -s "$model_dir/tokenizer.json"
+          python3 .github/scripts/run_with_timeout.py 600 \
+            "$(rustup which cargo)" test --target ${{ matrix.target }} \
+            -p jcode-embedding --lib -- --nocapture \
+            | tee /tmp/embedding-cohort.log
+          # The test is present and the harness ran it (rather than the binary
+          # failing to build).
+          grep -q "minilm_embedding_is_numerically_stable_across_inference_engines ... ok" \
+            /tmp/embedding-cohort.log
+          # This is the check that matters. A skipped test still reports "ok",
+          # so the reported result alone cannot distinguish "verified" from
+          # "silently did nothing"; only the skip message can.
+          if grep -q "skip: MiniLM model not present" /tmp/embedding-cohort.log; then
+            echo "::error::embedding cohort skipped despite fetching the model"
+            exit 1
+          fi
+
+      - name: Run stdin-forwarding cohort (all platforms)
+        shell: bash
+        # These tests exercise the per-platform stdin detector, whose
+        # implementations are entirely separate (`/proc/PID/syscall` on Linux,
+        # `proc_pidinfo` + thread state on macOS). They were never gated: the
+        # only `jcode-app-core --lib` run above is filtered to
+        # `retention_readiness`, and the broader suite is Linux-only, so the
+        # macOS detector had no coverage at all. `TH_STATE_WAITING` was defined
+        # as 2 (`TH_STATE_STOPPED`) rather than 3, which silently disabled
+        # macOS stdin forwarding entirely until #651.
+        #
+        # Deliberately not Linux-gated: running this on both Unix platforms is
+        # the whole point. Windows is a separate job and is not covered here,
+        # because these tests drive `head -n1`, which stock Windows does not
+        # provide; the Windows detector still has no test coverage.
+        run: |
+          python3 .github/scripts/run_with_timeout.py 600 \
+            "$(rustup which cargo)" test --target ${{ matrix.target }} \
+            -p jcode-app-core --lib tool::bash::tests::test_stdin_forwarding -- --nocapture
 
       - name: Run TUI library tests (Linux only)
         if: runner.os == 'Linux'

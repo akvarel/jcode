@@ -1,6 +1,10 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 use super::*;
 
+#[cfg(unix)]
+#[path = "browser_session_tests.rs"]
+mod browser_session_tests;
+
 #[test]
 fn press_script_uses_selector_when_present() {
     let script = build_press_script(Some("Enter"), Some("#email")).unwrap();
@@ -259,10 +263,12 @@ fn readiness_does_not_trust_a_stale_setup_marker() {
     runtime.block_on(async {
         let prev_home = std::env::var_os("JCODE_HOME");
         let prev_autolaunch = std::env::var_os("JCODE_BROWSER_AUTOLAUNCH");
+        let prev_auto_update = std::env::var_os("JCODE_BROWSER_AUTO_UPDATE");
         let temp = tempfile::TempDir::new().expect("create temp dir");
         jcode_base::env::set_var("JCODE_HOME", temp.path());
-        // Keep the test hermetic: never launch a real Firefox from here.
+        // Keep the test hermetic: never launch a real Firefox or query GitHub.
         jcode_base::env::set_var("JCODE_BROWSER_AUTOLAUNCH", "0");
+        jcode_base::env::set_var("JCODE_BROWSER_AUTO_UPDATE", "0");
 
         let browser_dir = temp.path().join("browser");
         std::fs::create_dir_all(&browser_dir).expect("create browser dir");
@@ -300,6 +306,10 @@ fn readiness_does_not_trust_a_stale_setup_marker() {
             jcode_base::env::set_var("JCODE_BROWSER_AUTOLAUNCH", prev_autolaunch);
         } else {
             jcode_base::env::remove_var("JCODE_BROWSER_AUTOLAUNCH");
+        }
+        match prev_auto_update {
+            Some(v) => jcode_base::env::set_var("JCODE_BROWSER_AUTO_UPDATE", v),
+            None => jcode_base::env::remove_var("JCODE_BROWSER_AUTO_UPDATE"),
         }
     });
 }

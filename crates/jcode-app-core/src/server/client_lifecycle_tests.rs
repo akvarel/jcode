@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 use super::*;
-use crate::message::{ContentBlock, Message, StreamEvent, ToolDefinition};
+use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
 use async_trait::async_trait;
 use futures::stream;
@@ -17,6 +17,51 @@ struct IsolatedReloadRecoveryEnv {
     prev_runtime: Option<std::ffi::OsString>,
     _home: tempfile::TempDir,
     _runtime: tempfile::TempDir,
+}
+
+#[test]
+fn cancel_soft_interrupts_by_id_reports_each_requested_id_exactly_once() {
+    let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let control = SessionControlHandle::cancel_only(
+        "session_cancel_by_id_test",
+        Arc::clone(&queue),
+        InterruptSignal::new(),
+    );
+    let user = SoftInterruptSource::User;
+    for (content, id) in [
+        ("a", Some("f1")),
+        ("b", None),
+        ("c", Some("f2")),
+        ("d", Some("f3")),
+    ] {
+        assert!(control.queue_soft_interrupt_with_id(
+            content.into(),
+            Vec::new(),
+            false,
+            user,
+            id.map(str::to_string),
+        ));
+    }
+    assert_eq!(control.pending_soft_interrupt_count(), 4);
+
+    let requested: Vec<String> = ["f3", "gone", "f1", "f3"].map(String::from).to_vec();
+    let (cancelled, not_queued) = control.cancel_soft_interrupts_by_id(&requested);
+    assert_eq!(cancelled, vec!["f3".to_string(), "f1".to_string()]);
+    assert_eq!(not_queued, vec!["gone".to_string()]);
+
+    let remaining: Vec<String> = queue
+        .lock()
+        .expect("queue lock")
+        .iter()
+        .map(|message| message.content.clone())
+        .collect();
+    assert_eq!(remaining, vec!["b".to_string(), "c".to_string()]);
+
+    // Once drained (injected), the same id can no longer be cancelled.
+    queue.lock().expect("queue lock").clear();
+    let (cancelled, not_queued) = control.cancel_soft_interrupts_by_id(&["f2".to_string()]);
+    assert!(cancelled.is_empty());
+    assert_eq!(not_queued, vec!["f2".to_string()]);
 }
 
 #[tokio::test]
@@ -1760,6 +1805,17 @@ async fn sdk_socket_configure_list_callback_and_busy_rejection() {
     let mut other_session =
         crate::session::Session::create_with_id("sdk_other_session".into(), None, None);
     other_session.working_dir = Some(home._home.path().to_string_lossy().into_owned());
+    // `save()` omits sessions whose only message is the hidden session-context
+    // note. Add a visible marker turn so the resumed fixture is durable; an
+    // unsaved empty root would otherwise send this connection's later
+    // disconnect down the 30s idle-reconnect grace instead of ordinary cleanup.
+    other_session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "observer fixture marker".to_string(),
+            cache_control: None,
+        }],
+    );
     other_session.save().unwrap();
     let other_registry = Registry::new(provider_template.clone()).await;
     sessions.write().await.insert(
@@ -1776,10 +1832,25 @@ async fn sdk_socket_configure_list_callback_and_busy_rejection() {
         json!({"type":"resume_session","id":23,"session_id":"sdk_other_session"}),
     )
     .await;
-    until(&mut observer_reader, |e| {
-        matches!(e, ServerEvent::Done { id: 23 })
+    let resumed = until(&mut observer_reader, |e| {
+        matches!(
+            e,
+            ServerEvent::Done { id: 23 } | ServerEvent::Error { id: 23, .. }
+        )
     })
     .await;
+    assert!(
+        matches!(resumed, ServerEvent::Done { .. }),
+        "observer resume must succeed: {resumed:?}"
+    );
+    assert!(
+        client_connections
+            .read()
+            .await
+            .values()
+            .any(|info| info.session_id == "sdk_other_session"),
+        "observer must be bound to the resumed session before disconnect"
+    );
     send(
         &mut client_writer,
         json!({"type":"message","id":24,"content":"call read after owner switch"}),

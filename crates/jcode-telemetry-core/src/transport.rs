@@ -1,19 +1,32 @@
+#[cfg(not(test))]
 use jcode_logging as logging;
 use serde_json::Value;
+#[cfg(not(test))]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+#[cfg(not(test))]
+use std::sync::mpsc::TrySendError;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 pub(super) const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
 pub(super) const TRANSCRIPT_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/transcript";
+#[cfg(not(test))]
 const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
 const BACKGROUND_QUEUE_CAPACITY: usize = 2048;
+#[cfg(not(test))]
 static TELEMETRY_PERMANENTLY_REJECTED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
 static TELEMETRY_QUEUE_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
+static TELEMETRY_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(test))]
 static TELEMETRY_BACKGROUND_SENDER: OnceLock<Result<SyncSender<Value>, String>> = OnceLock::new();
 #[cfg(not(test))]
 static TRANSCRIPT_BACKGROUND_SENDER: OnceLock<Result<SyncSender<Value>, String>> = OnceLock::new();
+#[cfg(not(test))]
 static TELEMETRY_HTTP_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
 #[cfg(test)]
 pub(super) static TEST_EMITTED_PAYLOADS: std::sync::Mutex<Vec<Value>> =
@@ -25,6 +38,26 @@ pub(super) enum DeliveryMode {
     Blocking(Duration),
 }
 
+/// Wait for queued telemetry delivery, bounded by the caller's deadline.
+pub fn flush_pending(timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while TELEMETRY_IN_FLIGHT.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn flush_pending_respects_deadline_and_drained_queue() {
+    TELEMETRY_IN_FLIGHT.store(1, Ordering::Release);
+    flush_pending(Duration::ZERO);
+    assert_eq!(TELEMETRY_IN_FLIGHT.load(Ordering::Acquire), 1);
+    TELEMETRY_IN_FLIGHT.store(0, Ordering::Release);
+    flush_pending(Duration::from_secs(1));
+    assert_eq!(TELEMETRY_IN_FLIGHT.load(Ordering::Acquire), 0);
+}
+
+#[cfg(not(test))]
 fn http_client() -> Option<&'static reqwest::blocking::Client> {
     match TELEMETRY_HTTP_CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
@@ -42,6 +75,7 @@ fn http_client() -> Option<&'static reqwest::blocking::Client> {
     }
 }
 
+#[cfg(not(test))]
 fn post_payload(payload: Value, timeout: Duration) -> bool {
     if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
         return false;
@@ -85,7 +119,7 @@ fn post_payload(payload: Value, timeout: Duration) -> bool {
 pub(super) fn payload_is_breaker_exempt(payload: &Value) -> bool {
     matches!(
         payload.get("event").and_then(|value| value.as_str()),
-        Some("usage_report")
+        Some("usage_report" | "desktop_active" | "desktop_upgrade" | "desktop_update")
     )
 }
 
@@ -137,6 +171,7 @@ where
     Ok(sender)
 }
 
+#[cfg(not(test))]
 fn initialized_sender(
     slot: &'static OnceLock<Result<SyncSender<Value>, String>>,
     label: &str,
@@ -153,12 +188,31 @@ fn initialized_sender(
     }
 }
 
+#[cfg(not(test))]
 fn background_sender() -> Option<&'static SyncSender<Value>> {
     initialized_sender(&TELEMETRY_BACKGROUND_SENDER, "telemetry", || {
         spawn_background_worker(BACKGROUND_QUEUE_CAPACITY, |payload| {
-            post_payload(payload, ASYNC_SEND_TIMEOUT);
+            post_payload_with_retry(payload, ASYNC_SEND_TIMEOUT);
+            TELEMETRY_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
         })
     })
+}
+
+#[cfg(not(test))]
+fn post_payload_with_retry(payload: Value, timeout: Duration) -> bool {
+    if post_payload(payload.clone(), timeout) {
+        return true;
+    }
+    for delay in [Duration::from_millis(200), Duration::from_millis(800)] {
+        if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(delay);
+        if post_payload(payload.clone(), timeout) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(not(test))]
@@ -207,14 +261,20 @@ pub(super) fn send_payload(mut payload: Value, mode: DeliveryMode) -> bool {
     super::tests::TEST_DELIVERY_MODES.lock().unwrap().push(mode);
     #[cfg(test)]
     if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
-        emitted.push(payload.clone());
+        emitted.push(payload);
     }
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
     match mode {
         DeliveryMode::Background => send_in_background(payload),
         DeliveryMode::Blocking(timeout) => send_blocking(payload, timeout),
     }
 }
 
+#[cfg(not(test))]
 fn send_in_background(payload: Value) -> bool {
     if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
         return false;
@@ -223,12 +283,14 @@ fn send_in_background(payload: Value) -> bool {
     let Some(sender) = background_sender() else {
         return false;
     };
+    TELEMETRY_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
     match sender.try_send(payload) {
         Ok(()) => {
             TELEMETRY_QUEUE_OVERFLOW_WARNED.store(false, Ordering::Relaxed);
             true
         }
         Err(TrySendError::Full(_)) => {
+            TELEMETRY_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
             if !TELEMETRY_QUEUE_OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
                 logging::warn(&format!(
                     "telemetry background queue is full (capacity={BACKGROUND_QUEUE_CAPACITY}); dropping events until delivery catches up"
@@ -237,12 +299,14 @@ fn send_in_background(payload: Value) -> bool {
             false
         }
         Err(TrySendError::Disconnected(_)) => {
+            TELEMETRY_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
             logging::warn("telemetry background worker stopped; dropping payload");
             false
         }
     }
 }
 
+#[cfg(not(test))]
 fn send_blocking(payload: Value, timeout: Duration) -> bool {
     logging::debug(&format!(
         "sending telemetry payload with blocking timeout={}ms",

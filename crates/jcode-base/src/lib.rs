@@ -33,6 +33,7 @@ pub mod compaction;
 pub mod config;
 pub mod console;
 pub mod copilot_usage;
+pub mod detected_emails;
 pub mod dictation;
 #[cfg(feature = "embeddings")]
 pub mod embedding;
@@ -86,6 +87,7 @@ pub mod recent_session_index;
 pub mod registry;
 pub mod runtime_memory_log;
 pub mod safety;
+pub mod scratch_maintenance;
 pub mod secret_input;
 pub mod session;
 pub mod session_list_cache;
