@@ -234,10 +234,6 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
         crate::provider_catalog::OPENROUTER_LOGIN_PROVIDER,
     ),
     (
-        ProviderChoice::Orcarouter,
-        crate::provider_catalog::ORCAROUTER_LOGIN_PROVIDER,
-    ),
-    (
         ProviderChoice::Bedrock,
         crate::provider_catalog::BEDROCK_LOGIN_PROVIDER,
     ),

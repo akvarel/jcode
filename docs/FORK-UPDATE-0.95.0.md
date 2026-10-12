@@ -47,6 +47,10 @@ The first application-core suite found three failures, all investigated:
    resume succeeds and binds the intended session. Preserve the five-second
    pending-callback teardown assertion and all production reconnect behavior.
 
+The additional CLI provider suite detected a duplicate OrcaRouter mapping: the
+old fork entry now overlaps upstream's canonical compatible-provider entry.
+Remove only the superseded entry, preserving the upstream route and its aliases.
+
 ## Executed validation
 
 - Locked dependency fetch and workspace metadata checks passed.
@@ -63,6 +67,7 @@ The first application-core suite found three failures, all investigated:
   had one subprocess-start failure (`JcodeNotFound`) in an auth fixture;
   the full serial suite, including that test, passed without code changes.
 - Telemetry worker: 91 passed.
+- CLI provider initialization: 24 passed after deduplicating OrcaRouter.
 - Formatting, staged and unstaged whitespace, module declarations, dependency
   boundaries, wildcard exports, code-size, test-size, panic, and swallowed-error
   budget checks passed.
