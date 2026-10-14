@@ -120,7 +120,13 @@ impl SharedMcpPool {
         }
 
         if successes == 0 {
-            successes = self.handles.read().await.len();
+            successes = self
+                .handles
+                .read()
+                .await
+                .values()
+                .filter(|handle| !handle.is_closed())
+                .count();
         }
 
         (successes, failures)
@@ -183,7 +189,11 @@ impl SharedMcpPool {
     /// Increments reference counts.
     pub async fn acquire_handles(&self, session_id: &str) -> HashMap<String, McpHandle> {
         let handles = self.handles.read().await;
-        let result = handles.clone();
+        let result: HashMap<String, McpHandle> = handles
+            .iter()
+            .filter(|(_, handle)| !handle.is_closed())
+            .map(|(name, handle)| (name.clone(), handle.clone()))
+            .collect();
 
         let mut refs = self.ref_counts.lock().await;
         for name in result.keys() {
@@ -223,7 +233,10 @@ impl SharedMcpPool {
     /// Get a handle for a specific server
     pub async fn get_handle(&self, name: &str) -> Option<McpHandle> {
         let handles = self.handles.read().await;
-        handles.get(name).cloned()
+        handles
+            .get(name)
+            .filter(|handle| !handle.is_closed())
+            .cloned()
     }
 
     /// Get all available tools from all connected servers
@@ -231,6 +244,9 @@ impl SharedMcpPool {
         let handles = self.handles.read().await;
         let mut tools = Vec::new();
         for (server_name, handle) in handles.iter() {
+            if handle.is_closed() {
+                continue;
+            }
             for tool in handle.tools() {
                 tools.push((server_name.clone(), tool));
             }
@@ -241,7 +257,11 @@ impl SharedMcpPool {
     /// Get list of connected server names
     pub async fn connected_servers(&self) -> Vec<String> {
         let handles = self.handles.read().await;
-        handles.keys().cloned().collect()
+        handles
+            .iter()
+            .filter(|(_, handle)| !handle.is_closed())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Call a tool on a specific server
@@ -254,6 +274,7 @@ impl SharedMcpPool {
         let handles = self.handles.read().await;
         let handle = handles
             .get(server)
+            .filter(|handle| !handle.is_closed())
             .with_context(|| format!("MCP server '{}' not connected", server))?;
         handle.call_tool(tool, arguments).await
     }
@@ -273,7 +294,7 @@ impl SharedMcpPool {
     /// Check if any servers are connected
     pub async fn has_connections(&self) -> bool {
         let handles = self.handles.read().await;
-        !handles.is_empty()
+        handles.values().any(|handle| !handle.is_closed())
     }
 
     /// Get reference counts (for debugging)
@@ -287,31 +308,16 @@ impl SharedMcpPool {
             return ConnectAttempt::Wait(Arc::clone(notify));
         }
 
-        if self.handles.read().await.contains_key(name) {
-            // The pool may hold a handle whose child process died (e.g. the
-            // MCP server crashed or was killed externally). Detect that here
-            // so a reconnect spawns a fresh process instead of returning the
-            // stale handle, which would make every tool call fail with
-            // "Failed to send request" (writer channel closed).
-            let mut clients = self.clients.lock().await;
-            let dead = match clients.get_mut(name) {
-                Some(client) => !client.is_running(),
-                None => true, // handle without client -> treat as dead
-            };
-            if dead {
-                clients.remove(name);
-                drop(clients);
-                let mut handles = self.handles.write().await;
-                handles.remove(name);
-                let mut refs = self.ref_counts.lock().await;
-                refs.remove(name);
-                let mut errors = self.last_errors.write().await;
-                errors.remove(name);
-            } else {
-                drop(clients);
+        {
+            let mut handles = self.handles.write().await;
+            if handles.get(name).is_some_and(|handle| !handle.is_closed()) {
                 return ConnectAttempt::Connected;
             }
+            handles.remove(name);
         }
+        // Preserve reference counts held by existing sessions, but release the
+        // dead transport before starting a fresh initialization handshake.
+        self.clients.lock().await.remove(name);
 
         let notify = Arc::new(Notify::new());
         connecting.insert(name.to_string(), Arc::clone(&notify));
@@ -384,8 +390,14 @@ impl SharedMcpPool {
         match self.begin_connect(&name).await {
             ConnectAttempt::Connected => Ok(false),
             ConnectAttempt::Wait(notify) => {
-                notify.notified().await;
-                if self.handles.read().await.contains_key(&name) {
+                self.wait_for_connect(&name, &notify).await;
+                if self
+                    .handles
+                    .read()
+                    .await
+                    .get(&name)
+                    .is_some_and(|handle| !handle.is_closed())
+                {
                     Ok(false)
                 } else {
                     let error = self
@@ -412,8 +424,31 @@ impl SharedMcpPool {
         }
     }
 
+    async fn wait_for_connect(&self, name: &str, notify: &Arc<Notify>) {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Registration must precede this check because notify_waiters does
+        // not retain a permit when the leader finishes before we start waiting.
+        if self
+            .connecting
+            .lock()
+            .await
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, notify))
+        {
+            notified.await;
+        }
+    }
+
     async fn recent_failure(&self, name: &str) -> Option<FailedConnectRecord> {
-        if self.handles.read().await.contains_key(name) {
+        if self
+            .handles
+            .read()
+            .await
+            .get(name)
+            .is_some_and(|handle| !handle.is_closed())
+        {
             return None;
         }
 
@@ -557,7 +592,27 @@ mod tests {
         // The stale handle must be gone from the pool.
         assert!(!pool.handles.read().await.contains_key("stale"));
         assert!(!pool.clients.lock().await.contains_key("stale"));
-        assert!(!pool.ref_counts.lock().await.contains_key("stale"));
+        // Existing sessions still own references while transport reconnects.
+        assert_eq!(pool.ref_counts.lock().await.get("stale"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn reconnect_waiter_observes_leader_completion_before_registration() {
+        let pool = SharedMcpPool::new(McpConfig::default());
+        let ConnectAttempt::Leader(leader) = pool.begin_connect("early").await else {
+            panic!("leader");
+        };
+        let ConnectAttempt::Wait(waiter) = pool.begin_connect("early").await else {
+            panic!("waiter");
+        };
+        pool.finish_connect("early", leader, Err(anyhow::anyhow!("fixture failure")))
+            .await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool.wait_for_connect("early", &waiter),
+        )
+        .await
+        .expect("an already-completed attempt must not wait for a lost notification");
     }
 
     #[tokio::test]

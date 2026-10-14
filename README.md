@@ -1,5 +1,10 @@
 <div align="center">
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/jcode-mark-inverse.svg">
+  <img src="assets/brand/jcode-mark.svg" alt="jcode halftone donut logo" width="160">
+</picture>
+
 # jcode
 
 [![Latest Release](https://badgen.net/github/release/1jehuang/jcode?icon=github)](https://github.com/1jehuang/jcode/releases)
@@ -420,6 +425,17 @@ jcode works with subscription-backed OAuth flows and many provider integrations,
 - **Custom OpenAI-compatible endpoint** (`jcode login --provider openai-compatible`)
 
 For custom OpenAI-compatible endpoints, jcode now prompts for the API base and supports local localhost servers without requiring an API key.
+
+Azure OpenAI accepts a resource URL or a base URL ending in `/openai/v1`, a
+deployment name, and either an API key or Microsoft Entra ID. Agent turns use
+`/openai/v1/responses`, including tool calls with reasoning enabled. The
+Responses route carries encrypted reasoning and tool results between turns;
+`/chat/completions` cannot combine function tools with reasoning on GPT-5.6
+and later Azure deployments. The saved Azure credentials remain in
+`~/.config/jcode/azure-openai.env`. Azure omits reasoning effort unless you
+set `AZURE_OPENAI_REASONING_EFFORT` for a deployment that supports it; this
+avoids sending the global OpenAI default to non-reasoning deployments.
+See the [Azure reasoning model guide](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning#tool-calling-with-reasoning-models).
 
 The native OpenAI providers use Responses WebSocket v2 with opportunistic
 background prewarming and HTTPS fallback. See [OpenAI WebSocket transport](docs/OPENAI_WEBSOCKET.md)
