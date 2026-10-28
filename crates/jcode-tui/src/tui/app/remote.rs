@@ -2,8 +2,9 @@
 
 use super::{
     App, DisplayMessage, MAX_TURN_HOLD_SECS, PendingReloadReconnectStatus, ProcessingStatus,
-    RemoteResumeActivity, SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
-    remote_notifications::present_swarm_notification, spawn_in_new_terminal,
+    RemoteResumeActivity, SendAction, auth::auth_muse_helpers, ctrl_bracket_fallback_to_esc, input,
+    parse_rate_limit_error, remote_notifications::present_swarm_notification,
+    spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
 use crate::message::ToolCall;
@@ -99,8 +100,23 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             .is_some_and(|state| state.kind == crate::tui::PickerKind::Model),
     });
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
+    needs_redraw |= app.poll_pending_startup_transcript();
+    if remote.has_loaded_history()
+        && let Err(error) = remote.poll_account_usage().await
+    {
+        crate::logging::warn(&format!("Failed to request daemon account usage: {error}"));
+    }
+    if app.model_catalog_after_history && remote.has_loaded_history() {
+        app.model_catalog_after_history = false;
+        if let Err(error) = remote.request_model_catalog().await {
+            crate::logging::warn(&format!(
+                "Failed to hydrate model routes after History: {error}"
+            ));
+        }
+    }
     needs_redraw |= app.retire_expired_status_notice();
     needs_redraw |= app.poll_usage_reset();
+    needs_redraw |= app.poll_cloud_job();
     if let Some((provider, account)) = app.usage_reset.invalidate_account.take() {
         let sent = match provider {
             super::usage_reset::Provider::OpenAi => remote.invalidate_openai_usage(account).await,
@@ -138,6 +154,17 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     needs_redraw |= app.flush_pending_resize_redraw();
     app.maybe_capture_runtime_memory_heartbeat();
     app.maybe_release_idle_heap();
+    needs_redraw |= app.poll_idle_hibernation();
+    if std::mem::take(&mut app.idle_hibernation.history_reload_needed) {
+        // Transcript-mode hibernation released the transcript; refetch it.
+        match remote.request_history().await {
+            Ok(_) => app.set_status_notice("Reloading transcript after hibernation…"),
+            Err(err) => {
+                crate::logging::warn(&format!("hibernation wake: history request failed: {err}"))
+            }
+        }
+        needs_redraw = true;
+    }
     // Surface the cold-cache transcript warning the moment the TTL expires
     // while idle, not only when the next request starts.
     needs_redraw |= app.maybe_push_idle_cold_cache_warning();
@@ -214,6 +241,10 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     }
 
     if app.remote_model_switch_in_flight && app.pending_fallback_resend.is_some() {
+        return needs_redraw;
+    }
+
+    if app.cloud_handoff_blocks_work() {
         return needs_redraw;
     }
 
@@ -554,10 +585,12 @@ async fn apply_terminal_event<B: Backend>(
                                             app.provider.context_window(),
                                         );
                                         let _ = remote.switch_anthropic_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to Anthropic account `{}`.",
-                                            label
-                                        )));
+                                        app.push_display_message(DisplayMessage::system(
+                                            crate::tui::app::helpers::account_switch_notice(
+                                                "Anthropic",
+                                                &label,
+                                            ),
+                                        ));
                                         app.set_status_notice(format!(
                                             "Account: switched to {}",
                                             label
@@ -576,10 +609,11 @@ async fn apply_terminal_event<B: Backend>(
                                             app.provider.context_window(),
                                         );
                                         let _ = remote.switch_openai_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to OpenAI account `{}`.",
-                                            label
-                                        )));
+                                        app.push_display_message(DisplayMessage::system(
+                                            crate::tui::app::helpers::account_switch_notice(
+                                                "OpenAI", &label,
+                                            ),
+                                        ));
                                         app.set_status_notice(format!(
                                             "OpenAI account: switched to {}",
                                             label
@@ -707,7 +741,7 @@ pub(super) async fn handle_bus_event(
                 app.set_status_notice("Local login does not change SSH server credentials");
                 return true;
             }
-            let success = login.success && login.provider != "copilot_code";
+            let success = login.success && auth_muse_helpers::is_completed_login(&login);
             let provider_hint = auth_provider_hint_for_login_provider(&login.provider);
             let auth = auth_changed_event_for_login_provider(&login.provider);
             let prefer_strongest = success && app.onboarding_should_prefer_strongest_model();
@@ -991,7 +1025,9 @@ pub(super) async fn handle_remote_event<B: Backend>(
             let output = handle_debug_command(app, &command, remote).await;
             let _ = remote.send_client_debug_response(id, output).await;
             process_remote_followups(app, remote).await;
-            Ok((RemoteEventOutcome::Continue, false))
+            // A forced hibernation needs the regular completed-frame renderer,
+            // not a debug-only draw, and should not wait for a periodic tick.
+            Ok((RemoteEventOutcome::Continue, command.trim() == "hibernate"))
         }
         RemoteRead::Event(ServerEvent::Transcript { text, mode }) => {
             let mut needs_redraw = false;
@@ -1123,6 +1159,7 @@ pub(super) fn handle_disconnect(
 /// normal (slow) bootstrap completes on its own, short enough that a genuinely
 /// stuck session recovers in seconds instead of requiring a manual `/restart`.
 const REMOTE_HISTORY_RECOVERY_FIRST_DELAY: Duration = Duration::from_secs(6);
+const REMOTE_HISTORY_DELTA_RECOVERY_DELAY: Duration = Duration::from_secs(30);
 /// Spacing between subsequent re-requests after the first one.
 const REMOTE_HISTORY_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// How many times we re-request history before giving up and telling the user
@@ -1180,6 +1217,15 @@ async fn recover_stuck_remote_history(app: &mut App, remote: &mut RemoteConnecti
     };
 
     if waited < REMOTE_HISTORY_RECOVERY_FIRST_DELAY {
+        return false;
+    }
+
+    // A Subscribe carrying a history base is still queued server-side (during
+    // a reconnect storm setup alone can take >10s). Requests are processed in
+    // order, so a GetHistory now would only arrive after that History anyway,
+    // and it would make the server send the full multi-MB transcript instead
+    // of the delta. Give the pending bootstrap much longer before re-requesting.
+    if app.advertised_history_base.is_some() && waited < REMOTE_HISTORY_DELTA_RECOVERY_DELAY {
         return false;
     }
 
@@ -1309,6 +1355,9 @@ async fn dispatch_pending_server_reload(app: &mut App, remote: &mut RemoteConnec
 }
 
 pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteConnection) {
+    if app.cloud_handoff_blocks_work() {
+        return;
+    }
     if app.pending_provider_failover.is_some()
         || (app.remote_model_switch_in_flight && app.pending_fallback_resend.is_some())
     {
@@ -2225,100 +2274,5 @@ fn handle_disconnected_key_internal(
 }
 
 #[cfg(test)]
-mod stall_guard_tests {
-    use super::*;
-
-    #[test]
-    fn stall_timeout_never_below_two_minutes() {
-        // Even with the default 180s provider idle timeout, the client stall
-        // guard must give the server-side timeout room to fire first.
-        let timeout = stall_timeout();
-        assert!(
-            timeout >= Duration::from_secs(2 * 60),
-            "stall timeout regressed below 2 minutes: {timeout:?}"
-        );
-        // And it must exceed the max provider idle budget so a healthy silent
-        // reasoning stretch is cancelled server-side (visible error + retry)
-        // rather than by the client watchdog (issue #434).
-        let provider_idle = crate::provider::max_stream_idle_timeout();
-        assert!(
-            timeout > provider_idle,
-            "stall timeout {timeout:?} must exceed provider idle timeout {provider_idle:?}"
-        );
-    }
-
-    #[test]
-    fn format_stall_duration_is_human_readable() {
-        assert_eq!(format_stall_duration(Duration::from_secs(90)), "90 seconds");
-        assert_eq!(format_stall_duration(Duration::from_secs(120)), "2 minutes");
-        assert_eq!(
-            format_stall_duration(Duration::from_secs(210)),
-            "3.5 minutes"
-        );
-        assert_eq!(
-            format_stall_duration(Duration::from_secs(430)),
-            "7.2 minutes"
-        );
-    }
-
-    /// The stranded-auto-poke bug: a continuation sits in `queued_messages`
-    /// with `pending_queued_dispatch` already consumed, so nothing ever sends
-    /// it while `is_processing()` (queue-aware) keeps the spinner up.
-    #[test]
-    fn starved_queued_followup_is_rearmed_after_timeout() {
-        let mut app = App::new_for_remote(None);
-        app.is_processing = false;
-        app.pending_queued_dispatch = false;
-        app.queued_messages
-            .push(crate::todo::build_auto_poke_message(2));
-
-        // First observation only arms the timer; it must not re-dispatch yet.
-        assert!(!detect_starved_queued_followup(&mut app));
-        assert!(app.queued_followup_starved_since.is_some());
-        assert!(!app.pending_queued_dispatch);
-
-        // Backdate past the timeout to simulate a stranded follow-up.
-        app.queued_followup_starved_since =
-            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
-        assert!(detect_starved_queued_followup(&mut app));
-        assert!(
-            app.pending_queued_dispatch,
-            "watchdog must re-arm dispatch so the queued poke is actually sent"
-        );
-        assert!(app.queued_followup_starved_since.is_none());
-        assert_eq!(
-            app.queued_messages.len(),
-            1,
-            "watchdog must not drop the queued continuation"
-        );
-    }
-
-    /// A live turn (or an already-armed dispatch) is normal, not starvation.
-    #[test]
-    fn starvation_watchdog_ignores_healthy_states() {
-        let mut app = App::new_for_remote(None);
-
-        // Empty queue: nothing to starve.
-        assert!(!detect_starved_queued_followup(&mut app));
-        assert!(app.queued_followup_starved_since.is_none());
-
-        // Queued but a turn is in flight: the queue drains at turn end.
-        app.queued_messages.push("poke".to_string());
-        app.is_processing = true;
-        app.queued_followup_starved_since =
-            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
-        assert!(!detect_starved_queued_followup(&mut app));
-        assert!(
-            app.queued_followup_starved_since.is_none(),
-            "timer must reset once the state is healthy again"
-        );
-
-        // Dispatch already armed: the event loop will send on the next pass.
-        app.is_processing = false;
-        app.pending_queued_dispatch = true;
-        app.queued_followup_starved_since =
-            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
-        assert!(!detect_starved_queued_followup(&mut app));
-        assert!(app.queued_followup_starved_since.is_none());
-    }
-}
+#[path = "remote_stall_guard_tests.rs"]
+mod stall_guard_tests;

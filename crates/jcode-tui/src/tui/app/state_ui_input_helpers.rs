@@ -120,6 +120,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "Show/toggle dimmed technical details on tool rows with an intent",
     ),
     RegisteredCommand::public(
+        "/latex",
+        "Toggle LaTeX images (on/off/status/none/unicode/image)",
+    ),
+    RegisteredCommand::public(
         "/thinking-display",
         "Show/hide the model's thinking text (off/full/current)",
     ),
@@ -327,6 +331,7 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn set_input_for_test(&mut self, input: impl Into<String>) {
+        self.wake_idle_hibernation();
         self.input = input.into();
         self.cursor_pos = self.input.len();
     }
@@ -841,15 +846,7 @@ impl App {
 
         if prefix.starts_with("/effort ") {
             let efforts = [
-                "none",
-                "minimal",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-                "swarm",
-                "swarm-deep",
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "swarm",
             ];
             return self.rank_suggestions(
                 input,
@@ -1464,7 +1461,7 @@ impl App {
     /// the active guided flow phase. Defaults to the starter suggestion cards.
     pub fn onboarding_welcome_kind(&self) -> crate::tui::OnboardingWelcomeKind {
         use crate::tui::OnboardingWelcomeKind;
-        use crate::tui::app::onboarding_flow::{OnboardingPhase, SummaryPill, TelemetryLevel};
+        use crate::tui::app::onboarding_flow::{OnboardingPhase, SummaryPill};
         match self.onboarding_phase() {
             Some(OnboardingPhase::Login { import }) => {
                 let prompt = import.as_ref().map(|review| {
@@ -1488,10 +1485,9 @@ impl App {
                             SummaryPill::ImportLess => crate::tui::ImportSummaryPill::ImportLess,
                             SummaryPill::Telemetry => crate::tui::ImportSummaryPill::Telemetry,
                         },
-                        telemetry: review.telemetry.map(|level| match level {
-                            TelemetryLevel::Everything => crate::tui::TelemetryChoice::Everything,
-                            TelemetryLevel::NoContent => crate::tui::TelemetryChoice::NoContent,
-                            TelemetryLevel::Nothing => crate::tui::TelemetryChoice::Nothing,
+                        telemetry: review.telemetry.map(|t| crate::tui::TelemetryPage {
+                            cursor: t.cursor,
+                            checked: t.checked,
                         }),
                         telemetry_env_forced_off: crate::telemetry::opt_out_forced_by_env(),
                         checked_count: review.checked_count(),
@@ -1789,6 +1785,7 @@ impl App {
                 | "/compact"
                 | "/compact mode"
                 | "/alignment"
+                | "/latex"
                 | "/compact-notifications"
                 | "/show-agentgrep-output"
                 | "/reasoning"
@@ -1803,42 +1800,5 @@ impl App {
 }
 
 #[cfg(test)]
-mod command_registry_tests {
-    use super::*;
-
-    /// Every slash command must be registered exactly once. Duplicate entries
-    /// mean two different handlers claim the same name, so which one runs
-    /// depends on dispatch order rather than on the registry the palette and
-    /// `/help` show the user.
-    #[test]
-    fn registered_commands_have_no_duplicate_names() {
-        let mut seen = std::collections::HashSet::new();
-        let duplicates: Vec<&str> = REGISTERED_COMMANDS
-            .iter()
-            .filter(|command| !seen.insert(command.name))
-            .map(|command| command.name)
-            .collect();
-        assert!(
-            duplicates.is_empty(),
-            "duplicate slash command registrations: {:?}",
-            duplicates
-        );
-    }
-
-    /// Aliases users can actually type must be discoverable through the
-    /// registry, otherwise autocomplete silently omits working commands.
-    #[test]
-    fn known_aliases_are_registered() {
-        let names: std::collections::HashSet<&str> =
-            REGISTERED_COMMANDS.iter().map(|c| c.name).collect();
-        for alias in [
-            "/keybindings",
-            "/commit-and-push",
-            "/resume-all",
-            "/hotkeys",
-            "/keys",
-        ] {
-            assert!(names.contains(alias), "{alias} is not registered");
-        }
-    }
-}
+#[path = "command_registry_tests.rs"]
+mod command_registry_tests;

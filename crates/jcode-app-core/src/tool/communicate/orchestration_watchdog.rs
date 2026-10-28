@@ -72,10 +72,7 @@ pub(super) async fn run_swarm_plan_in_background(
         + chrono::Duration::minutes(params.timeout_minutes.unwrap_or(60).max(1) as i64);
     // Keep the display name free of the "·" separator used by the background
     // notification markdown header, or downstream parsing mis-splits the label.
-    let display_name = format!(
-        "run_plan ({} nodes, {} mode)",
-        initial_summary.item_count, initial_summary.mode
-    );
+    let display_name = format!("run_plan ({} nodes)", initial_summary.item_count);
 
     let bg_ctx = ctx.clone();
     let info = crate::background::global()
@@ -170,14 +167,13 @@ pub(super) async fn run_swarm_plan_in_background(
     let output = format!(
         "🐝 Swarm plan running in background.\n\n\
          Task ID: {}\n\
-         Plan: {} node(s), {} mode\n\
+         Plan: {} node(s)\n\
          Output file: {}\n\n\
          {}\n\
          Check progress: use the `bg` tool with action=\"status\" and task_id=\"{}\", or `swarm plan_status`.\n\
          Note: a server reload stops this driver (workers keep running); rerun `swarm run_plan` to resume driving the same plan.",
         info.task_id,
         initial_summary.item_count,
-        initial_summary.mode,
         info.output_file.display(),
         delivery_note,
         info.task_id,

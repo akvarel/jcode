@@ -4,6 +4,73 @@ use super::openai_stream_diagnostics::{
 };
 use super::*;
 
+/// Usage of the account these credentials authenticate as, plus its label for
+/// logs. Unbound sessions keep the credentials they loaded, so the global
+/// active login can be a different account with different quota.
+pub(super) fn serving_account_usage(
+    credentials: &CodexCredentials,
+) -> (Option<String>, jcode_base::usage::OpenAIUsageData) {
+    let label = jcode_base::auth::codex::list_accounts()
+        .ok()
+        .and_then(|accounts| {
+            jcode_base::auth::codex::account_label_for_credentials(&accounts, credentials)
+        });
+    let usage = match label.as_deref() {
+        Some(label) => jcode_base::usage::get_openai_usage_for_label_sync(label),
+        // Not a saved login (legacy single-account file): the active usage is it.
+        None => jcode_base::usage::get_openai_usage_sync(),
+    };
+    (label, usage)
+}
+
+/// `account=<label> <usage fields>` for limit diagnostics.
+pub(super) fn serving_account_diag(credentials: &CodexCredentials) -> (String, bool) {
+    let (label, usage) = serving_account_usage(credentials);
+    (
+        format!(
+            "account={} {}",
+            label.as_deref().unwrap_or("unknown"),
+            usage.diagnostic_fields()
+        ),
+        usage.exhausted(),
+    )
+}
+
+// Bind metadata to the immutable request, not the provider's concurrently mutable
+// preference. Both primary parser events and its pending queue pass here.
+fn bind_requested_service_tier(event: &mut StreamEvent, request_tier: &Option<String>) {
+    if let StreamEvent::ServiceTier { requested, .. } = event {
+        *requested = request_tier.clone();
+    }
+}
+
+#[test]
+fn service_tier_metadata_uses_serialized_request_not_later_preference() {
+    let request = serde_json::json!({"service_tier": "priority"});
+    let requested = request
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut event = StreamEvent::ServiceTier {
+        tier: "default".into(),
+        requested: None,
+    };
+    bind_requested_service_tier(&mut event, &requested);
+    assert!(
+        matches!(event, StreamEvent::ServiceTier { requested: Some(ref tier), .. } if tier == "priority")
+    );
+    // An omitted request field must stay omitted, even if a preference has
+    // changed to Ultrafast while the network request was in flight.
+    bind_requested_service_tier(&mut event, &None);
+    assert!(matches!(
+        event,
+        StreamEvent::ServiceTier {
+            requested: None,
+            ..
+        }
+    ));
+}
+
 #[path = "openai_usage_recording.rs"]
 mod openai_usage_recording;
 use openai_usage_recording::OAuthUsageRecorder;
@@ -22,6 +89,18 @@ pub(super) async fn openai_access_token(
     account_label: Option<String>,
     credentials: &Arc<RwLock<CodexCredentials>>,
 ) -> anyhow::Result<String> {
+    if let Some(label) = account_label.as_deref() {
+        let is_oauth = {
+            let tokens = credentials.read().await;
+            !tokens.refresh_token.is_empty() || tokens.id_token.is_some()
+        };
+        if is_oauth {
+            // Cloud handoff/login can replace the file while this daemon keeps
+            // its provider alive. Never send or refresh the old cached copy.
+            let mut tokens = credentials.write().await;
+            *tokens = jcode_base::auth::codex::load_credentials_for_account(label)?;
+        }
+    }
     let (access_token, refresh_token, needs_refresh, is_oauth) = {
         let tokens = credentials.read().await;
         if tokens.access_token.is_empty() {
@@ -136,6 +215,64 @@ fn ws_stall_diagnostics(
 }
 
 /// Stream the response from OpenAI API
+#[allow(clippy::too_many_arguments)]
+fn response_http_request(
+    client: &Client,
+    url: &str,
+    access_token: &str,
+    is_chatgpt_mode: bool,
+    account_id: Option<&str>,
+    cache_key: Option<&str>,
+    model: Option<&str>,
+    service_tier: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut builder = client
+        .post(url)
+        .header("Authorization", format!("Bearer {access_token}"));
+    if let Some((name, value)) =
+        openai_websocket_prewarm::routing_header(is_chatgpt_mode, model, service_tier)
+    {
+        builder = builder.header(name, value);
+    }
+    if is_chatgpt_mode {
+        builder = builder.header("originator", ORIGINATOR);
+        if let Some(key) = cache_key {
+            builder = builder.header("session-id", key);
+        }
+        if let Some(account_id) = account_id {
+            builder = builder.header("chatgpt-account-id", account_id);
+        }
+    }
+    if let Some(built) = builder.try_clone().and_then(|builder| builder.build().ok()) {
+        log_openai_stream_lifecycle(
+            jcode_base::logging::LogLevel::Info,
+            "https_request_routing_headers",
+            routing_header_log_fields(built.headers()),
+        );
+    }
+    builder
+}
+
+fn routing_header_log_fields(headers: &reqwest::header::HeaderMap) -> Vec<(&'static str, String)> {
+    [
+        ("service_tier_header", "OpenAI-Service-Tier"),
+        ("codex_routing_hint", "x-codex-routing-hint"),
+    ]
+    .into_iter()
+    .map(|(field, header)| {
+        (
+            field,
+            headers
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_owned(),
+        )
+    })
+    .collect()
+}
+
+/// Stream the response from OpenAI API
 pub(super) async fn stream_response(
     client: Client,
     credentials: Arc<RwLock<CodexCredentials>>,
@@ -145,6 +282,10 @@ pub(super) async fn stream_response(
     tx: mpsc::Sender<Result<StreamEvent>>,
 ) -> Result<(), OpenAIStreamFailure> {
     use jcode_message_types::ConnectionPhase;
+    let requested_tier = request
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let request_model = openai_request_model(&request);
     let stream_started_at = Instant::now();
     log_openai_stream_lifecycle(
@@ -155,10 +296,9 @@ pub(super) async fn stream_response(
             ("transport", "https".to_string()),
         ],
     );
-    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
+    let (usage_diag, usage_exhausted) = serving_account_diag(&*credentials.read().await);
     jcode_base::logging::info(&format!(
-        "OpenAI limit diag: starting fresh HTTPS request usage=({})",
-        usage_snapshot.diagnostic_fields()
+        "OpenAI limit diag: starting fresh HTTPS request usage=({usage_diag})"
     ));
     emit_status_detail(&tx, initial_status_detail).await;
     emit_connection_phase(&tx, ConnectionPhase::Authenticating).await;
@@ -184,28 +324,31 @@ pub(super) async fn stream_response(
     let account_id = creds.account_id.clone();
     drop(creds);
 
-    let mut builder = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json");
-
-    if is_chatgpt_mode {
-        builder = builder.header("originator", ORIGINATOR);
-        if let Some(account_id) = account_id.as_ref() {
-            builder = builder.header("chatgpt-account-id", account_id);
-        }
-    }
+    let builder = response_http_request(
+        &client,
+        &url,
+        &access_token,
+        is_chatgpt_mode,
+        account_id.as_deref(),
+        request.get("prompt_cache_key").and_then(Value::as_str),
+        request.get("model").and_then(Value::as_str),
+        request.get("service_tier").and_then(Value::as_str),
+    );
 
     emit_connection_phase(&tx, ConnectionPhase::SendingRequest).await;
     let connect_start = std::time::Instant::now();
     let idle_timeout = effective_https_idle_timeout(&request);
+    let builder = jcode_provider_core::request_compression::json_body(
+        builder,
+        &url,
+        &request,
+        jcode_base::provider::request_compression_mode(),
+    )
+    .map_err(OpenAIStreamFailure::Other)?;
 
     let response = while_consumer_open(
         &tx,
-        jcode_provider_core::transport::send_with_initial_response_timeout(
-            builder.json(&request),
-            idle_timeout,
-        ),
+        jcode_provider_core::transport::send_with_initial_response_timeout(builder, idle_timeout),
     )
     .await;
     let Some(response) = response else {
@@ -236,10 +379,9 @@ pub(super) async fn stream_response(
         "https_connected",
         connected_fields,
     );
-    if response.status().is_success() && usage_snapshot.exhausted() {
+    if response.status().is_success() && usage_exhausted {
         jcode_base::logging::warn(&format!(
-            "OpenAI limit diag: fresh HTTPS request accepted while local usage indicates exhausted usage=({})",
-            usage_snapshot.diagnostic_fields()
+            "OpenAI limit diag: fresh HTTPS request accepted while the serving account's usage indicates exhausted usage=({usage_diag})"
         ));
     }
 
@@ -394,7 +536,8 @@ pub(super) async fn stream_response(
             }
         };
         match result {
-            Ok(event) => {
+            Ok(mut event) => {
+                bind_requested_service_tier(&mut event, &requested_tier);
                 progress.record_event(&event);
                 if matches!(event, StreamEvent::MessageEnd { .. }) {
                     saw_message_end = true;
@@ -584,7 +727,13 @@ async fn continue_persistent_ws_locked(
         }
     };
 
-    if state.identity != openai_websocket_prewarm::prewarm_identity(&*credentials.read().await) {
+    if state.identity
+        != openai_websocket_prewarm::prewarm_identity(
+            &*credentials.read().await,
+            request.get("model").and_then(Value::as_str),
+            request.get("service_tier").and_then(Value::as_str),
+        )
+    {
         *guard = None;
         log_openai_stream_lifecycle(
             jcode_base::logging::LogLevel::Info,
@@ -592,6 +741,19 @@ async fn continue_persistent_ws_locked(
             vec![
                 ("model", request_model.clone()),
                 ("reason", "handshake_identity_changed".to_string()),
+            ],
+        );
+        return PersistentWsResult::NotAvailable;
+    }
+
+    if state.cache_key.as_deref() != request.get("prompt_cache_key").and_then(Value::as_str) {
+        *guard = None;
+        log_openai_stream_lifecycle(
+            jcode_base::logging::LogLevel::Info,
+            "persistent_state_reset",
+            vec![
+                ("model", request_model.clone()),
+                ("reason", "cache_session_changed".to_string()),
             ],
         );
         return PersistentWsResult::NotAvailable;
@@ -719,17 +881,21 @@ async fn continue_persistent_ws_locked(
     // rs_...". The full input still needs reasoning items for fresh requests,
     // but deltas must only contain genuinely new client-side input/tool
     // callbacks.
-    let (incremental_items, skipped_reasoning_items) = if state.message_count == 0 {
+    let (incremental_items, skipped_output_items) = if state.message_count == 0 {
         // A generate:false warmup has no model output in its context. Preserve
         // all history (including encrypted reasoning) for its first generation.
         (input.to_vec(), 0)
     } else {
-        persistent_ws_incremental_items(input, state.last_input_item_count)
+        persistent_ws_incremental_items(
+            input,
+            state.last_input_item_count,
+            &state.last_response_output,
+        )
     };
-    if skipped_reasoning_items > 0 {
+    if skipped_output_items > 0 {
         jcode_base::logging::info(&format!(
-            "Skipped {} reasoning item(s) in persistent WS continuation delta to avoid duplicate rs_* replay",
-            skipped_reasoning_items
+            "Skipped {} prior response output item(s) in persistent WS continuation delta",
+            skipped_output_items
         ));
     }
     if incremental_items.is_empty() {
@@ -746,16 +912,23 @@ async fn continue_persistent_ws_locked(
         return PersistentWsResult::NotAvailable;
     }
 
+    let requested_tier = request
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let incremental_stats = summarize_ws_input(&incremental_items);
+    if state.message_count > 0 && incremental_stats.function_call_items > 0 {
+        log_ws_replayed_calls(&incremental_items, &state.last_response_output);
+    }
     let previous_response_id = state.last_response_id.clone();
     let request_prompt_cache_key_hash = request
         .get("prompt_cache_key")
         .map(jcode_provider_core::fingerprint::stable_hash_json);
-    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
+    let (usage_diag, usage_exhausted) = serving_account_diag(&*credentials.read().await);
     jcode_base::logging::info(&format!(
         "OpenAI limit diag: attempting persistent WS reuse previous_response_id_present={} usage=({}) state=({})",
         !previous_response_id.is_empty(),
-        usage_snapshot.diagnostic_fields(),
+        usage_diag,
         state.diag_snapshot().log_fields()
     ));
     jcode_base::logging::info(&format!(
@@ -964,7 +1137,13 @@ async fn continue_persistent_ws_locked(
     // change in another fork. Revalidate at the send boundary and keep the
     // read guard until the frame is flushed, not throughout generation.
     let send_credentials = credentials.read().await;
-    if state.identity != openai_websocket_prewarm::prewarm_identity(&send_credentials) {
+    if state.identity
+        != openai_websocket_prewarm::prewarm_identity(
+            &send_credentials,
+            request.get("model").and_then(Value::as_str),
+            request.get("service_tier").and_then(Value::as_str),
+        )
+    {
         *guard = None;
         return PersistentWsResult::NotAvailable;
     }
@@ -997,6 +1176,7 @@ async fn continue_persistent_ws_locked(
     let mut consumer_dropped = false;
     let mut pending: VecDeque<StreamEvent> = VecDeque::new();
     let mut new_response_id: Option<String> = None;
+    let mut response_output = Vec::new();
     let stream_started = Instant::now();
     let mut last_api_activity_at = stream_started;
     let mut saw_api_activity = false;
@@ -1082,6 +1262,8 @@ async fn continue_persistent_ws_locked(
                     is_websocket_first_activity_payload(&text)
                 };
 
+                observe_ws_response_output(&text, &mut response_output);
+
                 // Extract response_id from response.created event
                 if new_response_id.is_none()
                     && let Ok(val) = serde_json::from_str::<Value>(&text)
@@ -1098,17 +1280,16 @@ async fn continue_persistent_ws_locked(
                         id,
                         incremental_stats.log_fields(),
                     ));
-                    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
-                    if usage_snapshot.exhausted() {
+                    if usage_exhausted {
                         jcode_base::logging::warn(&format!(
-                            "OpenAI limit diag: persistent WS reuse accepted request while local usage indicates exhausted usage=({}) state=({})",
-                            usage_snapshot.diagnostic_fields(),
+                            "OpenAI limit diag: persistent WS reuse accepted request while the serving account's usage indicates exhausted usage=({}) state=({})",
+                            usage_diag,
                             state.diag_snapshot().log_fields()
                         ));
                     }
                 }
 
-                if let Some(event) = parse_openai_response_event(
+                if let Some(mut event) = parse_openai_response_event(
                     &text,
                     &mut saw_text_delta,
                     &mut saw_thinking_delta,
@@ -1116,6 +1297,7 @@ async fn continue_persistent_ws_locked(
                     &mut completed_tool_items,
                     &mut pending,
                 ) {
+                    bind_requested_service_tier(&mut event, &requested_tier);
                     if is_stream_activity_event(&event) {
                         made_api_activity = true;
                     }
@@ -1145,7 +1327,8 @@ async fn continue_persistent_ws_locked(
                         break;
                     }
                 }
-                while let Some(event) = pending.pop_front() {
+                while let Some(mut event) = pending.pop_front() {
+                    bind_requested_service_tier(&mut event, &requested_tier);
                     if let StreamEvent::Error { ref message, .. } = event {
                         let lower = message.to_lowercase();
                         if is_retryable_error(&lower)
@@ -1240,6 +1423,7 @@ async fn continue_persistent_ws_locked(
         state.last_response_id = resp_id;
         state.last_input_item_count = input_item_count;
         state.last_input_item_hashes = input_item_hashes;
+        state.last_response_output = response_output;
         state.message_count += 1;
         state.last_activity_at = Instant::now();
         state.last_response_completed_at = Instant::now();
@@ -1321,6 +1505,10 @@ async fn stream_response_websocket_authenticated(
     access_token: String,
 ) -> Result<(), OpenAIStreamFailure> {
     use jcode_message_types::ConnectionPhase;
+    let requested_tier = request
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let request_model = request
         .get("model")
         .and_then(|m| m.as_str())
@@ -1339,10 +1527,9 @@ async fn stream_response_websocket_authenticated(
         ],
     );
 
-    let usage_snapshot = jcode_base::usage::get_openai_usage_sync();
+    let (usage_diag, usage_exhausted) = serving_account_diag(&*credentials.read().await);
     jcode_base::logging::info(&format!(
-        "OpenAI limit diag: opening fresh persistent WS request usage=({})",
-        usage_snapshot.diagnostic_fields()
+        "OpenAI limit diag: opening fresh persistent WS request usage=({usage_diag})"
     ));
     emit_status_detail(&tx, "opening websocket").await;
     let creds = credentials.read().await;
@@ -1355,9 +1542,24 @@ async fn stream_response_websocket_authenticated(
     }
     let mut usage_recorder = OAuthUsageRecorder::capture(&creds, &request);
     let catalog_scope = OpenAIProvider::catalog_scope_for(&creds);
-    let ws_request = openai_websocket_prewarm::websocket_request(&creds, &access_token)
-        .map_err(OpenAIStreamFailure::Other)?;
-    let mut identity = openai_websocket_prewarm::prewarm_identity(&creds);
+    let ws_request = openai_websocket_prewarm::websocket_request(
+        &creds,
+        &access_token,
+        request.get("prompt_cache_key").and_then(Value::as_str),
+        request.get("model").and_then(Value::as_str),
+        request.get("service_tier").and_then(Value::as_str),
+    )
+    .map_err(OpenAIStreamFailure::Other)?;
+    let mut identity = openai_websocket_prewarm::prewarm_identity(
+        &creds,
+        request.get("model").and_then(Value::as_str),
+        request.get("service_tier").and_then(Value::as_str),
+    );
+    log_openai_stream_lifecycle(
+        jcode_base::logging::LogLevel::Info,
+        "fresh_ws_request_routing_headers",
+        routing_header_log_fields(ws_request.headers()),
+    );
     identity.0 = access_token;
     drop(creds);
 
@@ -1366,7 +1568,7 @@ async fn stream_response_websocket_authenticated(
 
     let connect_result = tokio::time::timeout(
         Duration::from_secs(WEBSOCKET_CONNECT_TIMEOUT_SECS),
-        connect_async(ws_request),
+        connect_ws(ws_request),
     )
     .await
     .map_err(|_| {
@@ -1422,6 +1624,10 @@ async fn stream_response_websocket_authenticated(
             .map(Vec::as_slice)
             .unwrap_or(&[]),
     );
+    let cache_key = request
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mut request_event = request;
     if !request_event.is_object() {
         return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
@@ -1481,6 +1687,7 @@ async fn stream_response_websocket_authenticated(
     let mut last_api_activity_at = ws_started_at;
     let mut pending: VecDeque<StreamEvent> = VecDeque::new();
     let mut response_id: Option<String> = None;
+    let mut response_output = Vec::new();
     let connected_at = Instant::now();
     let mut logged_first_server_event = false;
     let ws_completion_timeout_secs = effective_ws_completion_timeout_secs(&request_event);
@@ -1559,6 +1766,8 @@ async fn stream_response_websocket_authenticated(
                         )));
                     }
 
+                    observe_ws_response_output(&text, &mut response_output);
+
                     // Extract response_id from response.created event
                     if response_id.is_none()
                         && let Ok(val) = serde_json::from_str::<Value>(&text)
@@ -1575,10 +1784,9 @@ async fn stream_response_websocket_authenticated(
                             id,
                             request_input_stats.log_fields(),
                         ));
-                        if usage_snapshot.exhausted() {
+                        if usage_exhausted {
                             jcode_base::logging::warn(&format!(
-                                "OpenAI limit diag: fresh WS request accepted while local usage indicates exhausted usage=({})",
-                                usage_snapshot.diagnostic_fields()
+                                "OpenAI limit diag: fresh WS request accepted while the serving account's usage indicates exhausted usage=({usage_diag})"
                             ));
                         }
                     }
@@ -1588,7 +1796,7 @@ async fn stream_response_websocket_authenticated(
                     } else {
                         is_websocket_first_activity_payload(&text)
                     };
-                    if let Some(event) = parse_openai_response_event(
+                    if let Some(mut event) = parse_openai_response_event(
                         &text,
                         &mut saw_text_delta,
                         &mut saw_thinking_delta,
@@ -1596,6 +1804,7 @@ async fn stream_response_websocket_authenticated(
                         &mut completed_tool_items,
                         &mut pending,
                     ) {
+                        bind_requested_service_tier(&mut event, &requested_tier);
                         if is_stream_activity_event(&event) {
                             made_api_activity = true;
                         }
@@ -1639,7 +1848,8 @@ async fn stream_response_websocket_authenticated(
                             return Ok(());
                         }
                     }
-                    while let Some(event) = pending.pop_front() {
+                    while let Some(mut event) = pending.pop_front() {
+                        bind_requested_service_tier(&mut event, &requested_tier);
                         if is_stream_activity_event(&event) {
                             made_api_activity = true;
                         }
@@ -1745,6 +1955,7 @@ async fn stream_response_websocket_authenticated(
             ],
         );
         *guard = Some(PersistentWsState {
+            cache_key,
             ws_stream,
             identity,
             last_response_id: resp_id,
@@ -1754,6 +1965,7 @@ async fn stream_response_websocket_authenticated(
             message_count: 1,
             last_input_item_count: input_item_count,
             last_input_item_hashes: input_item_hashes,
+            last_response_output: response_output,
         });
         drop(guard);
         spawn_persistent_ws_keepalive(
@@ -1893,147 +2105,5 @@ pub(super) fn is_retryable_error(error_str: &str) -> bool {
 }
 
 #[cfg(test)]
-mod stream_runtime_tests {
-    use super::*;
-
-    fn dummy_credentials() -> Arc<RwLock<CodexCredentials>> {
-        Arc::new(RwLock::new(CodexCredentials {
-            access_token: "at_old".into(),
-            refresh_token: "rt_old".into(),
-            id_token: None,
-            account_id: Some("acct_dummy".into()),
-            expires_at: Some(1),
-        }))
-    }
-
-    fn rotated_tokens() -> oauth::OAuthTokens {
-        oauth::OAuthTokens {
-            access_token: "at_new".into(),
-            refresh_token: "rt_new".into(),
-            expires_at: 42,
-            id_token: None,
-            scopes: Vec::new(),
-        }
-    }
-
-    /// Issue #1757: once rotation has started, a cancelled caller must not
-    /// leave the consumed refresh token in memory.
-    #[tokio::test]
-    async fn refresh_commit_survives_caller_cancellation() {
-        let credentials = dummy_credentials();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let caller_credentials = Arc::clone(&credentials);
-        let caller = tokio::spawn(async move {
-            refresh_and_commit_openai_tokens(&caller_credentials, async move {
-                started_tx.send(()).unwrap();
-                release_rx.await.unwrap();
-                Ok(rotated_tokens())
-            })
-            .await
-        });
-        started_rx.await.unwrap();
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        release_tx.send(()).unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while credentials.read().await.refresh_token != "rt_new" {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("rotated tokens must be committed in memory after caller cancellation");
-        let creds = credentials.read().await;
-        assert_eq!(creds.access_token, "at_new");
-        assert_eq!(creds.account_id.as_deref(), Some("acct_dummy"));
-        assert_eq!(creds.expires_at, Some(42));
-    }
-
-    #[tokio::test]
-    async fn refresh_failure_leaves_in_memory_credentials_untouched() {
-        let credentials = dummy_credentials();
-        let err = refresh_and_commit_openai_tokens(&credentials, async {
-            anyhow::bail!("OpenAI token refresh timed out after 30s waiting for response headers")
-        })
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("timed out"));
-        let creds = credentials.read().await;
-        assert_eq!(creds.access_token, "at_old");
-        assert_eq!(creds.refresh_token, "rt_old");
-    }
-
-    #[test]
-    fn unauthorized_triggers_token_refresh() {
-        assert!(should_refresh_token(StatusCode::UNAUTHORIZED, ""));
-    }
-
-    #[test]
-    fn forbidden_triggers_refresh_only_for_token_bodies() {
-        assert!(should_refresh_token(
-            StatusCode::FORBIDDEN,
-            "access token expired"
-        ));
-        assert!(!should_refresh_token(
-            StatusCode::FORBIDDEN,
-            "region not allowed"
-        ));
-    }
-
-    #[test]
-    fn refreshed_token_marker_is_retryable() {
-        // After a 401/403 we force-refresh the OpenAI token and surface this
-        // marker so the retry loop reconnects with the new credentials.
-        assert!(is_retryable_error(
-            "openai token refreshed, retrying: 401 unauthorized"
-        ));
-    }
-
-    #[test]
-    fn missing_or_failed_refresh_is_not_retryable() {
-        assert!(!is_retryable_error(
-            "openai rejected the access token and no refresh token is available; run /login to re-authenticate: 401"
-        ));
-        assert!(!is_retryable_error(
-            "openai token refresh failed; run /login to re-authenticate: network error"
-        ));
-    }
-
-    #[test]
-    fn tls_transient_errors_are_retryable() {
-        // Regression for issue #338: transient TLS faults must be retried on
-        // the OpenAI path, matching every other provider. Callers pass the
-        // error string already lowercased.
-        assert!(is_retryable_error(
-            "stream error: io error: received fatal alert: badrecordmac"
-        ));
-        assert!(is_retryable_error("received fatal alert: badrecordmac"));
-        assert!(is_retryable_error("decryption failed or bad record mac"));
-        assert!(is_retryable_error("tls handshake eof"));
-        assert!(is_retryable_error("connection aborted"));
-        assert!(is_retryable_error("temporary failure in name resolution"));
-        assert!(is_retryable_error("no route to host"));
-        assert!(is_retryable_error("network is unreachable"));
-        // A send-level cause that callers now surface via the full anyhow
-        // chain ({:#}) instead of the masked top-level context alone.
-        assert!(is_retryable_error(
-            "failed to send request to openai api: error sending request: received fatal alert: badrecordmac"
-        ));
-    }
-
-    #[test]
-    fn rate_limit_is_retryable() {
-        // Regression for issue #338 (gap #2): 429s should be retried, unifying
-        // behavior with Anthropic/Copilot.
-        assert!(is_retryable_error("429 too many requests"));
-        assert!(is_retryable_error("rate limit exceeded"));
-        assert!(is_retryable_error("rate_limit_exceeded"));
-    }
-
-    #[test]
-    fn auth_errors_remain_non_retryable() {
-        assert!(!is_retryable_error("401 unauthorized"));
-        assert!(!is_retryable_error("invalid api key"));
-    }
-}
+#[path = "openai_stream_runtime/stream_runtime_tests.rs"]
+mod stream_runtime_tests;

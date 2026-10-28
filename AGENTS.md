@@ -4,6 +4,16 @@
 
 - Jcode Desktop is in a separate repository.
 
+## TUI style
+
+- UI chrome must not wrap: startup headers, account rows, status labels, and
+  other compact UI rows should fit their available terminal-cell width or
+  truncate with an ellipsis. Count Unicode display cells, not characters.
+  Preserve one logical row per visual row, including at narrow widths.
+  Chat prose and other intentionally multiline content may wrap normally.
+- Reuse the info widget's limit-bar renderer for usage indicators instead of
+  introducing a different bar glyph, color, or used/remaining convention.
+
 ## Development Workflow
 
 - **Use the user's Git identity** - Create commits with the configured
@@ -28,23 +38,19 @@
 ## Fork Strategy (akvarel/jcode)
 
 This is a **fork** of [1jehuang/jcode](https://github.com/1jehuang/jcode) maintained as
-`akvarel/jcode`. Our fork carries custom commits on `master` (never rebased onto upstream
-— updated via rebase of `feature/external-memory-enrichment`).
+`akvarel/jcode`. Integrate stable upstream releases on versioned `update/jcode-*`
+branches using a merge that preserves fork and upstream ancestry. Never force-push
+or write a protected branch as part of an ordinary update request.
 
 ### CI/CD
 
-**All upstream CI workflows are removed** (`ci.yml`, `release.yml`, `freebsd-smoke.yml`,
-`windows-smoke.yml`, `require-issue.yml` and helper scripts) — see commit `1f93d52c`.
+The release-publishing workflow remains removed. Retain existing CI and run
+`scripts/check_guardrails.sh` locally before installing. This fork does not publish
+releases to Homebrew, AUR, or GitHub Releases as part of local updates.
 
-Reasoning:
-- We do **not** publish releases to Homebrew, AUR, GitHub Releases, or any public channel.
-- jcode is **built locally** via `~/.jcode/scripts/update-jcode-fork.sh` and used directly.
-- The upstream CI matrix (10+ platforms, signing, packaging) is pure overhead for us.
-- Quality guardrails (clippy, fmt, audits) are run **manually** via `scripts/check_guardrails.sh`.
-
-Retained upstream workflows:
-- `discord-release.yml` — Discord release announcements (still useful if we tag a release).
-- `ios-testflight.yml` — iOS TestFlight build/upload (Apple signing pipeline, platform-specific).
+Build and install with `scripts/install_release.sh --fast` from a clean commit.
+The legacy `~/.jcode/scripts/update-jcode-fork.sh` is not the update procedure:
+it performs protected-branch/force-push operations and uses obsolete install paths.
 
 ### Upstream alignment (2026-09 review)
 
@@ -71,9 +77,11 @@ competing fork code:
 
 ### Updating from upstream
 
-See `~/.jcode/scripts/update-jcode-fork.sh` — fetches upstream, rebases the
-current `update/external-memory-enrichment-v<X.Y.Z>` branch onto the latest
-release tag (branch is versioned per upstream release), rebuilds binary.
+Follow the integration evidence in `docs/FORK_UPDATE_V0.97.0.md` and subsequent
+versioned update records. Verify the latest stable release, preserve custom
+behavior with regressions, and update the ohAgent submodule on a task branch.
+Use `JCODE_SKIP_SERVER_RELOAD=1` when installation must not interrupt active work,
+then activate through the supported graceful reload path at a safe boundary.
 
 ### Submodule in ohAgent
 

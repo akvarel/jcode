@@ -17,6 +17,10 @@ use tokio::sync::RwLock;
 
 mod search;
 
+#[cfg(test)]
+#[path = "mcp_tests.rs"]
+mod upstream_tests;
+
 /// Discovery is a local catalog lookup and must never inherit a wedged MCP
 /// lifecycle lock. Actual server connections and tool calls have their own,
 /// longer timeouts.
@@ -61,6 +65,10 @@ impl McpSearchTool {
 
 #[async_trait]
 impl Tool for McpSearchTool {
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "mcp_search"
     }
@@ -221,12 +229,16 @@ impl McpCallTool {
 
 #[async_trait]
 impl Tool for McpCallTool {
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "mcp_call"
     }
 
     fn description(&self) -> &str {
-        "Call an MCP server tool discovered with mcp_search."
+        "Internal compatibility alias for mcp action=call."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -238,7 +250,7 @@ impl Tool for McpCallTool {
                 "arguments": {
                     "type": "object",
                     "additionalProperties": true,
-                    "description": "Arguments matching the input schema returned by mcp_search."
+                    "description": "Arguments matching the input schema returned by MCP search."
                 }
             },
             "required": ["server", "tool", "arguments"]
@@ -400,7 +412,7 @@ fn connection_config(
         }
         return configured.ok_or_else(|| anyhow::anyhow!("'command' or 'url' is required for connect action (server is not in the MCP config)"));
     }
-    if params.url.is_some() {
+    if let Some(url) = params.url.as_deref() {
         if params.args.is_some() || params.env.is_some() {
             anyhow::bail!("'args' and 'env' are only supported for stdio MCP servers");
         }
@@ -408,7 +420,7 @@ fn connection_config(
         if !matches!(transport, "http" | "streamable-http" | "sse") {
             anyhow::bail!("Remote 'transport' must be 'http', 'streamable-http', or 'sse'");
         }
-        validate_remote_url(params.url.as_deref().expect("remote URL"))?;
+        validate_remote_url(url)?;
     } else {
         if params
             .command
@@ -481,7 +493,7 @@ impl Tool for McpManagementTool {
     }
 
     fn description(&self) -> &str {
-        "Manage MCP (Model Context Protocol) servers, including HTTP/SSE connections and local OAuth status/logout. Interactive login requires the explicit CLI command `jcode mcp login <configured-server>`."
+        "Search and call MCP (Model Context Protocol) tools, or manage servers. Search returns tool names and input schemas. Interactive OAuth login is CLI-only: `jcode mcp login <configured-server>`."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -491,13 +503,16 @@ impl Tool for McpManagementTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["list", "connect", "disconnect", "reload", "status", "logout"],
+                    "enum": ["search", "call", "list", "connect", "disconnect", "reload", "status", "logout"],
                     "description": "Action."
                 },
                 "server": {
                     "type": "string",
-                    "description": "Server name."
+                    "description": "Server name. Optional exact filter for search, required for call."
                 },
+                "query": {"type": "string", "description": "Search: optional name or description keywords."},
+                "tool": {"type": "string", "description": "Call: required raw tool name returned by search."},
+                "arguments": {"type": "object", "additionalProperties": true, "description": "Call: arguments matching the discovered input schema."},
                 "command": {
                     "type": "string",
                     "description": "Stdio server command. Mutually exclusive with url."
@@ -532,6 +547,33 @@ impl Tool for McpManagementTool {
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        // Reuse the internal surfaces, including their identity, SDK override,
+        // output-budget and per-tool policy checks. Do not route back through
+        // Registry::execute: this call already owns the in-flight marker.
+        let surface = match input.get("action").and_then(Value::as_str) {
+            Some("search") => Some("mcp_search"),
+            Some("call") => Some("mcp_call"),
+            _ => None,
+        };
+        if let Some(surface) = surface {
+            super::ensure_mcp_action_allowed(&ctx.session_id, surface)?;
+            return if surface == "mcp_search" {
+                McpSearchTool {
+                    manager: self.manager.clone(),
+                    registry: self.registry.clone(),
+                }
+                .execute(input, ctx)
+                .await
+            } else {
+                McpCallTool {
+                    manager: self.manager.clone(),
+                    registry: self.registry.clone(),
+                }
+                .execute(input, ctx)
+                .await
+            };
+        }
+        super::ensure_mcp_action_allowed(&ctx.session_id, "mcp")?;
         let params: McpToolInput = serde_json::from_value(input)?;
         let started = std::time::Instant::now();
         let action = params.action.clone();
@@ -557,7 +599,7 @@ impl Tool for McpManagementTool {
                 "Interactive MCP OAuth login is CLI-only. Run `jcode mcp login <configured-server>` in a terminal (add --no-browser to print the authorization URL). No browser was opened."
             ),
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'list', 'connect', 'disconnect', 'reload', 'status', or 'logout'.",
+                "Unknown action: {}. Use 'search', 'call', 'list', 'connect', 'disconnect', 'reload', 'status', or 'logout'.",
                 params.action
             ))),
         };
@@ -683,7 +725,7 @@ impl McpManagementTool {
         }
 
         // Names only: full descriptions for every tool of every server cost
-        // tens of thousands of tokens. `mcp_search` returns descriptions and
+        // tens of thousands of tokens. `mcp action=search` returns descriptions and
         // schemas for the tools the agent actually needs.
         let mut output = String::new();
         output.push_str(&format!(
@@ -726,7 +768,7 @@ impl McpManagementTool {
         }
         if !servers.is_empty() {
             output.push_str(
-                "Use mcp_search with a server or query for descriptions and input schemas.\n\n",
+                "Use mcp action=search with a server or query for descriptions and input schemas.\n\n",
             );
         }
 
@@ -820,7 +862,7 @@ impl McpManagementTool {
                     // The schema is part of the result on purpose: on providers
                     // without native deferred loading the cached tool list never
                     // changes, so this transcript entry is the only place the
-                    // model learns how to call the new tool (via `mcp_call`).
+                    // model learns how to call the new tool (via `mcp action=call`).
                     output.push_str(&format!(
                         "  - {}: {}\n    tool: {}  input_schema: {}\n",
                         name,
@@ -834,7 +876,7 @@ impl McpManagementTool {
                 references.truncate(MAX_SEARCH_TOOL_REFERENCES);
                 output.push_str(&format!(
                     "\nCall these tools directly by name if they appear in your tool list; \
-                     otherwise use mcp_call with server=\"{}\", tool=<tool>, and arguments \
+                     otherwise use mcp action=call with server=\"{}\", tool=<tool>, and arguments \
                      matching input_schema.\n",
                     server_name
                 ));
@@ -1038,343 +1080,5 @@ impl McpManagementTool {
         }
 
         Ok(ToolOutput::new(output).with_title("MCP: Reloaded"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tool::Tool;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn create_test_tool() -> McpManagementTool {
-        // Use an explicit empty config so tests are hermetic: McpManager::new()
-        // would load the developer's real ~/.jcode/mcp.json, and list output
-        // now includes configured-but-not-connected servers (issue #436).
-        let manager = Arc::new(RwLock::new(McpManager::with_config(
-            crate::mcp::McpConfig::default(),
-        )));
-        McpManagementTool::new(manager)
-    }
-
-    fn create_test_context() -> ToolContext {
-        ToolContext {
-            session_id: "test-session".to_string(),
-            message_id: "test-message".to_string(),
-            tool_call_id: "test-tool-call".to_string(),
-            working_dir: None,
-            stdin_request_tx: None,
-            graceful_shutdown_signal: None,
-            execution_mode: crate::tool::ToolExecutionMode::Direct,
-        }
-    }
-
-    struct LocalMcpConfigGuard {
-        path: PathBuf,
-        backup: Option<String>,
-        created_dir: bool,
-    }
-
-    impl LocalMcpConfigGuard {
-        fn new(content: &str) -> std::io::Result<Self> {
-            let path = PathBuf::from(".jcode/mcp.json");
-            let dir = path
-                .parent()
-                .ok_or_else(|| std::io::Error::other("missing parent"))?;
-            let created_dir = if !dir.exists() {
-                fs::create_dir_all(dir)?;
-                true
-            } else {
-                false
-            };
-            let backup = if path.exists() {
-                Some(fs::read_to_string(&path)?)
-            } else {
-                None
-            };
-            fs::write(&path, content)?;
-            Ok(Self {
-                path,
-                backup,
-                created_dir,
-            })
-        }
-    }
-
-    impl Drop for LocalMcpConfigGuard {
-        fn drop(&mut self) {
-            match &self.backup {
-                Some(content) => {
-                    let _ = fs::write(&self.path, content);
-                }
-                None => {
-                    let _ = fs::remove_file(&self.path);
-                    if self.created_dir
-                        && let Some(dir) = self.path.parent()
-                    {
-                        let _ = fs::remove_dir(dir);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_tool_name() {
-        let tool = create_test_tool();
-        assert_eq!(tool.name(), "mcp");
-    }
-
-    #[test]
-    fn test_tool_description() {
-        let tool = create_test_tool();
-        assert!(tool.description().contains("MCP"));
-        assert!(tool.description().contains("Model Context Protocol"));
-    }
-
-    #[test]
-    fn test_parameters_schema() {
-        let tool = create_test_tool();
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["action"].is_object());
-        assert!(schema["properties"]["server"].is_object());
-        assert!(schema["properties"]["command"].is_object());
-    }
-
-    #[test]
-    fn mcp_search_tool_references_equal_paginated_match_names() {
-        // The regression: upstream adds `tool_references` metadata while the
-        // fork keeps ranked pagination. The metadata must be exactly the names
-        // of the page returned, not the whole catalog.
-        let catalog = vec![
-            (
-                "srv".to_string(),
-                crate::mcp::McpToolDef {
-                    name: "alpha".to_string(),
-                    description: Some("alpha search tool".to_string()),
-                    input_schema: json!({"type": "object"}),
-                },
-                "srv_alpha".to_string(),
-            ),
-            (
-                "srv".to_string(),
-                crate::mcp::McpToolDef {
-                    name: "beta".to_string(),
-                    description: Some("beta search tool".to_string()),
-                    input_schema: json!({"type": "object"}),
-                },
-                "srv_beta".to_string(),
-            ),
-            (
-                "srv".to_string(),
-                crate::mcp::McpToolDef {
-                    name: "gamma".to_string(),
-                    description: Some("gamma search tool".to_string()),
-                    input_schema: json!({"type": "object"}),
-                },
-                "srv_gamma".to_string(),
-            ),
-        ];
-        let page = search::search_tools(
-            catalog,
-            search::SearchOptions {
-                server: None,
-                query: Some("search".to_string()),
-                limit: 2,
-                offset: 0,
-                include_schema: false,
-            },
-        );
-        assert_eq!(page.total, 3, "total counts every match before pagination");
-        assert_eq!(page.matches.len(), 2, "limit bounds the returned page");
-
-        let output = mcp_search_output(&page).expect("search output renders");
-        let expected: Vec<&str> = page.matches.iter().map(|m| m.name.as_str()).collect();
-        let metadata = output.metadata.as_ref().expect("tool_references metadata");
-        let references = metadata["tool_references"]
-            .as_array()
-            .expect("tool_references is an array")
-            .iter()
-            .map(|value| value.as_str().expect("reference is a string"))
-            .collect::<Vec<_>>();
-        assert_eq!(references, expected);
-        assert_eq!(references.len(), page.matches.len());
-    }
-
-    #[test]
-    fn mcp_call_allows_dynamic_argument_keys_in_provider_schemas() {
-        let tool = McpCallTool::new(Arc::clone(create_test_tool().manager()));
-        let schema = tool.parameters_schema();
-        assert_eq!(
-            schema["properties"]["arguments"]["additionalProperties"],
-            true
-        );
-
-        for spec in [
-            &jcode_schema_dialect::registry::OPENROUTER,
-            &jcode_schema_dialect::registry::OPENAI,
-            &jcode_schema_dialect::registry::ANTHROPIC,
-        ] {
-            let normalized = jcode_schema_dialect::dialect::apply(&schema, spec);
-            let arguments = &normalized["properties"]["arguments"];
-            assert_eq!(arguments["type"], "object", "{}", spec.id);
-            assert_eq!(arguments["additionalProperties"], true, "{}", spec.id);
-            if spec.transforms.require_properties_on_objects {
-                // Empty declared properties must not close the dynamic payload (#1214).
-                assert_eq!(arguments["properties"], json!({}), "{}", spec.id);
-            }
-            assert_eq!(normalized["required"], schema["required"], "{}", spec.id);
-        }
-    }
-
-    #[test]
-    fn mcp_call_dynamic_arguments_remain_ineligible_for_openai_strict_mode() {
-        let tool = McpCallTool::new(Arc::clone(create_test_tool().manager()));
-        let compatible =
-            jcode_provider_core::openai_schema::openai_compatible_schema(&tool.parameters_schema());
-        assert!(!jcode_provider_core::openai_schema::schema_supports_strict(
-            &compatible
-        ));
-        assert_eq!(
-            compatible["properties"]["arguments"]["additionalProperties"],
-            true
-        );
-    }
-
-    #[tokio::test]
-    async fn test_list_empty() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "list"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("No MCP servers connected"));
-    }
-
-    #[tokio::test]
-    async fn mcp_search_times_out_when_manager_lifecycle_lock_is_stuck() {
-        let manager = Arc::new(RwLock::new(McpManager::with_config(
-            crate::mcp::McpConfig::default(),
-        )));
-        let tool = McpSearchTool::new(manager.clone());
-        let held_write_lock = manager.write().await;
-
-        let started = tokio::time::Instant::now();
-        let error = tool
-            .execute(json!({"query": "drive"}), create_test_context())
-            .await
-            .expect_err("discovery must fail fast instead of waiting forever");
-        let elapsed = started.elapsed();
-
-        drop(held_write_lock);
-        assert!(
-            error.to_string().contains("did not respond within 500ms"),
-            "unexpected error: {error:#}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "mcp_search took too long to fail: {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_list_shows_disabled_configured_server() {
-        // Issue #436: disabled servers stay visible in the list with their
-        // state, so users can see and enable them on demand.
-        let mut config = crate::mcp::McpConfig::default();
-        config.servers.insert(
-            "off-server".to_string(),
-            McpServerConfig {
-                command: "some-bin".to_string(),
-                args: vec![],
-                env: HashMap::new(),
-                shared: true,
-                transport: None,
-                url: None,
-                headers: HashMap::new(),
-                enabled: Some(false),
-                disabled: None,
-                timeout_secs: None,
-            },
-        );
-        let manager = Arc::new(RwLock::new(McpManager::with_config(config)));
-        let tool = McpManagementTool::new(manager);
-        let ctx = create_test_context();
-
-        let result = tool.execute(json!({"action": "list"}), ctx).await.unwrap();
-        assert!(
-            result.output.contains("off-server"),
-            "disabled server must be listed: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("disabled in config"),
-            "disabled state must be visible: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn test_connect_missing_server() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "connect", "command": "/bin/test"});
-
-        let result = tool.execute(input, ctx).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("server"));
-    }
-
-    #[tokio::test]
-    async fn test_connect_missing_command() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "connect", "server": "test"});
-
-        let result = tool.execute(input, ctx).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("command"));
-    }
-
-    #[tokio::test]
-    async fn test_disconnect_not_connected() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "disconnect", "server": "nonexistent"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("not connected"));
-    }
-
-    #[tokio::test]
-    async fn test_unknown_action() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "invalid_action"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("Unknown action"));
-    }
-
-    #[tokio::test]
-    async fn test_reload_empty_config() {
-        let _guard =
-            LocalMcpConfigGuard::new("{\"servers\":{}}").expect("create temporary .jcode/mcp.json");
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "reload"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        // With config merging, global config may have servers.
-        // If both are empty: "No servers found in config"
-        // If global has servers: "Reloaded MCP config" (may show connection failures)
-        assert!(
-            result.output.contains("No servers")
-                || result.output.contains("Empty config")
-                || result.output.contains("Connected servers: 0")
-                || result.output.contains("Reloaded MCP config")
-        );
     }
 }

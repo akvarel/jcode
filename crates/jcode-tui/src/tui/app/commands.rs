@@ -1,3 +1,7 @@
+#[path = "commands_release_prompts.rs"]
+mod release_prompts;
+pub(super) use release_prompts::*;
+
 pub(super) use super::commands_improve::{
     build_improve_prompt, build_improve_resume_prompt, build_refactor_prompt,
     build_refactor_resume_prompt, format_improve_status, format_refactor_status,
@@ -1688,6 +1692,16 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if super::commands_cloud::parse_cloud_command(trimmed).is_some() {
         let session_id = active_session_id(app);
+        if matches!(
+            super::commands_cloud::parse_cloud_command(trimmed),
+            Some(super::commands_cloud::CloudCommand::Move { .. })
+        ) && let Err(error) = app.session.save_prepared()
+        {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Could not save this session before moving it: {error}. Nothing moved."
+            )));
+            return true;
+        }
         super::commands_cloud::handle_cloud_command(app, trimmed, &session_id);
         return true;
     }
@@ -2223,44 +2237,6 @@ pub(super) fn build_commit_push_prompt() -> String {
     prompt
 }
 
-fn build_release_prompt(before_bump_instruction: &str, release_instruction: &str) -> String {
-    let mut prompt = build_commit_push_prompt();
-    prompt.push(' ');
-    prompt.push_str("Then cut a release. Find the last release tag (git describe --tags --abbrev=0 or gh release list) and review everything that changed since it to pick the semver bump: patch for fixes and small internal changes, minor for new features, major only for breaking changes. ");
-    if !before_bump_instruction.is_empty() {
-        prompt.push_str(before_bump_instruction);
-        prompt.push(' ');
-    }
-    prompt.push_str("Bump the version in the root Cargo.toml, refresh Cargo.lock (for example with cargo check), and, if the repo has a changelog/ directory, write a user-facing changelog entry changelog/v<version>.json following changelog/README.md (translate commits into user-visible effects, skip internal-only changes, update changelog/index.json). Commit the version bump together with the changelog entry as one release-metadata commit, and push. ");
-    prompt.push_str(release_instruction);
-    prompt.push_str(" Do not force-push or move existing tags. Finally, report the new version, the commits created, the tag push, and the release status.");
-    prompt
-}
-
-pub(super) fn build_fast_release_prompt() -> String {
-    build_release_prompt(
-        "Before editing Cargo.toml or the changelog for the version bump, run scripts/quick-release.sh --prepare-fast v<version>. It must refresh the warm target/selfdev cache for the Linux x86_64 binary while the existing Cargo version is unchanged and record the prepared commit.",
-        "Then run scripts/quick-release.sh --fast-local v<version>. It must wrap the prepared selfdev binary with the release identity, publish that Linux asset and the GitHub release immediately, and let CI replace it with the portable Linux artifact while adding macOS, Windows, FreeBSD, signatures, and final checksums. Do not run the separate local macOS cross-build or wait for release optimization. If preparation is stale or the release-metadata commit contains code changes, stop instead of publishing a binary that differs from the tag.",
-    )
-}
-
-pub(super) fn build_fast_macos_release_prompt() -> String {
-    build_release_prompt(
-        "Before editing Cargo.toml or the changelog for the version bump, run scripts/quick-release.sh --prepare-fast-macos v<version>. It must cross-build and record the macOS arm64 binary with the future release identity while the release metadata is still unchanged.",
-        "Then run scripts/quick-release.sh --fast-macos-local v<version>. It must validate and publish the prepared macOS arm64 asset and GitHub release immediately, while CI replaces it with the signoff artifact and adds macOS Intel, Linux, Windows, FreeBSD, signatures, and final checksums. If preparation is stale or the release-metadata commit contains code changes, stop instead of publishing a binary that differs from the tag.",
-    )
-}
-
-pub(super) fn build_remote_release_prompt() -> String {
-    let jcode_release = build_release_prompt(
-        "",
-        "Then run scripts/quick-release.sh --remote v<version> to push the tag immediately without any local build. Let the release workflow build, sign, checksum, and publish every platform, and leave publication gated on those remote checks.",
-    );
-    format!(
-        "First identify the repository in the current working directory from its git remote, release documentation, package manifests, existing tags, and CI workflows. Only use the following Jcode-specific procedure when this is the Jcode self-development repository and scripts/quick-release.sh exists: {jcode_release} Otherwise, use the repository's own established release conventions. Inspect its release documentation, workflows, scripts, manifests, tag format, and recent releases before changing anything. Make logical commits for current work without disturbing unrelated changes and push them normally. Determine the next version from this repository's versioning scheme and user-visible changes, update only the version files and changelog formats it actually uses, validate the metadata, commit and push it, then trigger the repository's documented remote release mechanism. Prefer a tag-triggered or workflow-dispatch CI release that performs builds and publication remotely. Do not assume the project uses Cargo, changelog JSON, v-prefixed tags, or scripts/quick-release.sh. Do not build release artifacts locally unless this repository explicitly requires it and no remote release path exists. Never force-push, move an existing tag, bypass remote release gates, or invent a release process. Report the detected release convention, version, commits, tag or workflow invocation, and remote release status."
-    )
-}
-
 pub(super) fn build_triage_prompt(focus: &str) -> String {
     let mut prompt = String::from(
         "Triage the open GitHub issues for the repository in the current working directory, then autonomously fix the ones that are safe to fix. \
@@ -2562,6 +2538,14 @@ fn handle_selfdev_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+/// `/initiatives` is an explicit request to see the page, so it reopens a side
+/// panel the user closed. Agent-driven panel updates stay hidden.
+fn show_in_side_panel(app: &mut App, snapshot: crate::side_panel::SidePanelSnapshot) {
+    app.side_panel_user_hidden = false;
+    app.side_panel_explicit_hidden = false;
+    app.set_side_panel_snapshot(snapshot);
+}
+
 pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
     let Some(trimmed) = trimmed
         .strip_prefix("/initiatives")
@@ -2578,7 +2562,7 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             true,
         ) {
             Ok(snapshot) => {
-                app.set_side_panel_snapshot(snapshot);
+                show_in_side_panel(app, snapshot);
                 let count = crate::goal::list_relevant_goals(active_working_dir(app).as_deref())
                     .map(|goals| goals.len())
                     .unwrap_or(0);
@@ -2604,7 +2588,7 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             true,
         ) {
             Ok(Some(result)) => {
-                app.set_side_panel_snapshot(result.snapshot);
+                show_in_side_panel(app, result.snapshot);
                 let mut msg = format!("Resumed initiative {}.", result.goal.title);
                 if let Some(next_step) = result.goal.next_steps.first() {
                     msg.push_str(&format!(" Next step: {}", next_step));
@@ -2638,7 +2622,7 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             true,
         ) {
             Ok(Some(result)) => {
-                app.set_side_panel_snapshot(result.snapshot);
+                show_in_side_panel(app, result.snapshot);
                 app.push_display_message(DisplayMessage::system(format!(
                     "Opened initiative {} in the side panel.",
                     result.goal.title
@@ -3054,6 +3038,59 @@ fn handle_show_agentgrep_output_command(app: &mut App, trimmed: &str) -> bool {
         ))),
     }
 
+    true
+}
+
+pub(super) fn handle_latex_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/latex") else {
+        return false;
+    };
+    let arg = rest.trim();
+
+    let current = crate::config::config().display.latex_rendering;
+    if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
+        app.push_display_message(DisplayMessage::system(format!(
+            "LaTeX rendering: {} (use /latex [on|off|none|unicode|image|status])\n\n  none    - keep raw $...$ source\n  unicode - terminal-friendly text math\n  image   - typeset PNG per formula (needs latex+dvipng or pdflatex+pdftocairo)",
+            current.as_str()
+        )));
+        return true;
+    }
+
+    let mode = match arg.to_ascii_lowercase().as_str() {
+        "on" => Some(crate::config::LatexRenderingMode::Image),
+        "off" => Some(crate::config::LatexRenderingMode::Unicode),
+        _ => crate::config::LatexRenderingMode::parse(arg),
+    };
+    let Some(mode) = mode else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /latex [on|off|none|unicode|image|status]".to_string(),
+        ));
+        return true;
+    };
+
+    match crate::config::Config::set_latex_rendering(mode) {
+        Ok(()) => {
+            let effective = crate::config::config().display.latex_rendering;
+            app.set_status_notice(format!("LaTeX rendering: {}", effective.as_str()));
+            let override_note = if effective != mode {
+                " JCODE_LATEX_RENDERING overrides the saved mode."
+            } else {
+                ""
+            };
+            app.push_display_message(DisplayMessage::system(format!(
+                "Saved LaTeX rendering: {}. Effective mode: {}.{}",
+                mode.as_str(),
+                effective.as_str(),
+                override_note
+            )))
+        }
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Failed to set LaTeX rendering to {}: {}. Nothing changed; the session keeps {}.",
+            mode.as_str(),
+            error,
+            crate::config::config().display.latex_rendering.as_str()
+        ))),
+    }
     true
 }
 
@@ -3924,8 +3961,8 @@ pub(super) fn handle_feedback_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
-/// `/telemetry [everything|no-prompts|nothing]` - show or change the same
-/// three-way telemetry level offered by the onboarding "Telemetry settings"
+/// `/telemetry [all|none|<category> on|off]` - show or change the same
+/// per-category telemetry choices offered by the onboarding "Telemetry settings"
 /// page, so the promise made there ("change this later with /telemetry") holds.
 pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
     let Some(rest) = trimmed.strip_prefix("/telemetry") else {
@@ -3941,39 +3978,64 @@ pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
         return false;
     }
 
-    use crate::tui::app::onboarding_flow::TelemetryLevel;
-    let arg = rest.trim().to_ascii_lowercase();
-    let level = match arg.as_str() {
-        "" => {
-            let current = TelemetryLevel::current();
-            let detail = match current {
-                TelemetryLevel::Everything => {
-                    "Sending usage stats, provider account email, crash reports, prompts, and transcripts. Thank you."
-                }
-                TelemetryLevel::NoContent => {
-                    "Sending usage stats, provider account email, and crash reports. No prompts or transcripts."
-                }
-                TelemetryLevel::Nothing => "Sending nothing.",
-            };
-            app.push_display_message(DisplayMessage::system(format!(
-                "{detail}\nChange it with /telemetry everything | no-prompts | nothing."
-            )));
-            app.set_status_notice(current.status_label());
-            return true;
-        }
-        "everything" | "all" => TelemetryLevel::Everything,
-        "no-prompts" | "no-content" | "usage" => TelemetryLevel::NoContent,
-        "nothing" | "off" | "none" => TelemetryLevel::Nothing,
-        other => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Unknown telemetry level \"{other}\". Use everything, no-prompts, or nothing."
-            )));
-            return true;
-        }
+    use crate::telemetry::TelemetryCategory;
+    use crate::tui::app::onboarding_flow::status_label_for;
+    let args: Vec<String> = rest
+        .split_whitespace()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
+    let mut checked = crate::telemetry::category_settings();
+    let parse_on = |v: &str| match v {
+        "on" | "yes" | "true" | "1" => Some(true),
+        "off" | "no" | "false" | "0" => Some(false),
+        _ => None,
     };
-    level.persist();
-    app.push_display_message(DisplayMessage::system(level.status_label().to_string()));
-    app.set_status_notice(level.status_label());
+    let usage = "Usage: /telemetry [all|none] or /telemetry <category> on|off. Categories: content, usage, crashes, features, cost, accounts.";
+    match args.as_slice() {
+        [] => {
+            let mut text = String::from("Telemetry settings:\n");
+            for (i, category) in TelemetryCategory::ALL.into_iter().enumerate() {
+                text.push_str(&format!(
+                    "  [{}] {} ({}): {}\n",
+                    if checked[i] { "x" } else { " " },
+                    category.label(),
+                    category.key(),
+                    category.caption()
+                ));
+            }
+            if crate::telemetry::opt_out_forced_by_env() {
+                text.push_str("Your environment disables all telemetry (JCODE_NO_TELEMETRY / DO_NOT_TRACK).\n");
+            }
+            text.push_str(usage);
+            app.push_display_message(DisplayMessage::system(text));
+            app.set_status_notice(status_label_for(checked));
+            return true;
+        }
+        [all] if matches!(all.as_str(), "all" | "everything" | "on") => checked = [true; 6],
+        [none] if matches!(none.as_str(), "none" | "nothing" | "off") => checked = [false; 6],
+        [all, value] if all == "all" && parse_on(value).is_some() => {
+            checked = [parse_on(value).unwrap_or(false); 6]
+        }
+        [key, value] => match (TelemetryCategory::from_key(key), parse_on(value)) {
+            (Some(category), Some(on)) => {
+                if let Some(i) = TelemetryCategory::ALL.iter().position(|c| *c == category) {
+                    checked[i] = on;
+                }
+            }
+            _ => {
+                app.push_display_message(DisplayMessage::error(usage.to_string()));
+                return true;
+            }
+        },
+        _ => {
+            app.push_display_message(DisplayMessage::error(usage.to_string()));
+            return true;
+        }
+    }
+    crate::telemetry::set_category_settings(checked);
+    let label = status_label_for(checked);
+    app.push_display_message(DisplayMessage::system(label.clone()));
+    app.set_status_notice(label);
     true
 }
 

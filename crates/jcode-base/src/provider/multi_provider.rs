@@ -29,6 +29,17 @@ impl MultiProvider {
                 || !saved_account_can_serve_model(provider, label, model)
                 || models::provider_unavailability_detail_for_account_label(provider, Some(label))
                     .is_some()
+                // The runtime cooldown expires after minutes, but a quota
+                // window can stay spent for days. Skip straight past logins
+                // whose last known usage is still exhausted.
+                || crate::usage::account_known_exhausted(
+                    if provider == "claude" {
+                        crate::usage::MultiAccountProviderKind::Anthropic
+                    } else {
+                        crate::usage::MultiAccountProviderKind::OpenAI
+                    },
+                    label,
+                )
             {
                 return false;
             }
@@ -238,12 +249,26 @@ impl MultiProvider {
                 {
                     return Some(*preserved);
                 }
+                // Shared router rule: an explicitly configured default is the
+                // user's own choice and wins; otherwise newest generation.
                 if let Some(configured) = configured_model.as_deref()
                     && let Some(preferred) = group
                         .iter()
                         .find(|candidate| candidate_matches_configured_model(candidate, configured))
                 {
                     return Some(*preferred);
+                }
+                if let Some(best) = group
+                    .iter()
+                    .filter(|candidate| {
+                        jcode_provider_core::model_generation_rank(candidate_model(candidate))
+                            != usize::MAX
+                    })
+                    .min_by_key(|candidate| {
+                        jcode_provider_core::model_generation_rank(candidate_model(candidate))
+                    })
+                {
+                    return Some(*best);
                 }
                 let models: Vec<&str> = group
                     .iter()
@@ -293,7 +318,7 @@ impl MultiProvider {
             // the caller's cancellable countdown has accepted this exact route.
             return Err(anyhow!(prompt.to_error_message()));
         }
-        if let Some(current) = self.selected_account_for_provider(provider) {
+        if let Some(current) = current {
             let key = Self::provider_key(provider);
             let pool = crate::auth::account_pool::AccountPool::load();
             if saved_account_labels(key).contains(&current)
@@ -407,16 +432,20 @@ fn saved_account_can_serve_model(provider: &str, label: &str, model: &str) -> bo
 
 fn saved_account_labels(provider: &str) -> Vec<String> {
     match provider {
-        "openai" => crate::auth::codex::list_accounts()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|a| a.label)
-            .collect(),
-        "claude" => crate::auth::claude::list_accounts()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|a| a.label)
-            .collect(),
+        "openai" => match crate::auth::codex::list_accounts() {
+            Ok(accounts) => accounts.into_iter().map(|account| account.label).collect(),
+            Err(error) => {
+                crate::logging::warn(&format!("Cannot list saved openai accounts: {error}"));
+                Vec::new()
+            }
+        },
+        "claude" => match crate::auth::claude::list_accounts() {
+            Ok(accounts) => accounts.into_iter().map(|account| account.label).collect(),
+            Err(error) => {
+                crate::logging::warn(&format!("Cannot list saved claude accounts: {error}"));
+                Vec::new()
+            }
+        },
         _ => Vec::new(),
     }
 }

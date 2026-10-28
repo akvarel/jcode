@@ -53,7 +53,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
     let cmd_desc = if cfg!(windows) {
         "The Windows command to execute via cmd.exe. Use cmd.exe syntax and quoting, not Bash syntax."
     } else {
-        "The bash command to execute. Put large temp files under `$JCODE_SCRATCH_DIR`, not `/tmp`."
+        "rg skips hidden/ignored files; use --hidden --no-ignore. Temp files: $JCODE_SCRATCH_DIR."
     };
     serde_json::json!({
         "type": "object",

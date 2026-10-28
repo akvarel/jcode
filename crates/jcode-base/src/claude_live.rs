@@ -326,6 +326,7 @@ mod tests {
     use std::process::{Child, Command, Stdio};
 
     fn spawn_sleep() -> Child {
+        let _guard = crate::storage::lock_test_env();
         Command::new("sleep")
             .arg("60")
             .stdin(Stdio::null())

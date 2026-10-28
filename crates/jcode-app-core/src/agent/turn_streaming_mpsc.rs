@@ -1,76 +1,7 @@
 use super::response_recovery::{MalformedToolCallInfo, TextToolRecovery};
 use super::*;
 
-/// Largest byte index `<= index` that is a UTF-8 char boundary in `text`.
-/// Equivalent to the unstable `str::floor_char_boundary`, reimplemented so the
-/// incremental marker scan can clamp its scan-window start onto a valid
-/// boundary without re-scanning the whole accumulated response.
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    if index >= text.len() {
-        return text.len();
-    }
-    let mut boundary = index;
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
-/// The wrapped-tool-call markers emitted by some models inside plain text.
-const WRAP_TOOL_MARKERS: [&str; 2] = ["to=functions.", "+#+#"];
-
-/// Report whatever usage a provider stream reported before it failed.
-///
-/// The normal `usage_report` is emitted after the stream completes. A stream
-/// that errors (or is retried after compaction) still consumed the tokens the
-/// provider already reported, so count them. `[input, output, cache_read,
-/// cache_creation]`; a no-op when nothing was reported.
-fn record_partial_stream_usage(
-    session_id: &str,
-    provider: &str,
-    model: &str,
-    [input, output, cache_read, cache_creation]: [Option<u64>; 4],
-) {
-    if input.is_none() && output.is_none() && cache_read.is_none() && cache_creation.is_none() {
-        return;
-    }
-    crate::telemetry::record_provider_usage(
-        Some(session_id),
-        provider,
-        model,
-        crate::telemetry::UsageSource::Agent,
-        crate::telemetry::ProviderUsage {
-            input_tokens: input.unwrap_or(0),
-            output_tokens: output.unwrap_or(0),
-            cache_read_input_tokens: cache_read,
-            cache_creation_input_tokens: cache_creation,
-        },
-    );
-}
-
-/// Find the first wrapped-tool-call marker in `accumulated`, scanning only the
-/// newly appended `delta` plus a short overlap from the previous tail (so a
-/// marker straddling the append boundary is still found).
-///
-/// This avoids re-scanning the entire accumulated response on every streamed
-/// delta, which was O(response) per token and O(response^2) over a full answer.
-fn find_wrap_marker_incremental(accumulated: &str, appended_len: usize) -> Option<usize> {
-    let max_marker_len = WRAP_TOOL_MARKERS
-        .iter()
-        .map(|marker| marker.len())
-        .max()
-        .unwrap_or(0);
-    let scan_start = accumulated
-        .len()
-        .saturating_sub(appended_len + max_marker_len.saturating_sub(1));
-    let scan_start = floor_char_boundary(accumulated, scan_start);
-    let window = &accumulated[scan_start..];
-    WRAP_TOOL_MARKERS
-        .iter()
-        .filter_map(|marker| window.find(marker))
-        .min()
-        .map(|rel_idx| scan_start + rel_idx)
-}
+use super::streaming::{StreamUsageRecorder, find_wrap_marker_incremental};
 
 fn reload_interrupted_tool_result(tc: &ToolCall, elapsed_secs: f64) -> (String, bool) {
     if tc.name == "selfdev" {
@@ -128,6 +59,7 @@ impl Agent {
         &mut self,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
+        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
         self.ensure_session_lease()?;
         self.set_log_context();
         let usage_turn_id = self.model_usage_turn_id();
@@ -307,16 +239,30 @@ impl Agent {
             // `ModelChanged` and resync the UI/context-limit.
             let model_at_request_start = provider.model().to_string();
             let credential_at_request_start = provider.active_resolved_credential();
+            let oauth_account_label_at_request_start = provider.serving_oauth_account_label();
             let oauth_email_at_request_start =
                 crate::server::provider_oauth_email(provider.as_ref());
             let resume_session_id = self.provider_session_id.clone();
             self.last_status_detail = None;
+            // Hash the whole system prompt, not only the static block.
+            // Providers place the dynamic block ahead of the transcript (in
+            // the system param or right after the latest user prompt), so a
+            // change there is a harness-caused miss and must be attributed.
+            let system_signature_text = if split_prompt.dynamic_part.is_empty() {
+                std::borrow::Cow::Borrowed(split_prompt.static_part.as_str())
+            } else {
+                std::borrow::Cow::Owned(format!(
+                    "{}\n\n{}",
+                    split_prompt.static_part, split_prompt.dynamic_part
+                ))
+            };
             let kv_request = kv_cache_request_event(
                 &cache_signature_messages,
                 &tools,
-                &split_prompt.static_part,
+                &system_signature_text,
                 &ephemeral_signature_messages,
             );
+            drop(system_signature_text);
             self.begin_kv_cache_monitor_request(&kv_request, &model_at_request_start);
             let _ = event_tx.send(kv_request);
             // These vectors are only needed to build the cache telemetry event.
@@ -326,6 +272,7 @@ impl Agent {
             drop(ephemeral_signature_messages);
             let mut keepalive = stream_keepalive_ticker();
             let mut stream = {
+                provider.set_session_id(&self.session.id);
                 let mut complete_future = std::pin::pin!(provider.complete_split(
                     send_messages,
                     &tools,
@@ -366,17 +313,7 @@ impl Agent {
                                                 Self::MAX_CONTEXT_LIMIT_RETRIES
                                             ));
                                         }
-                                        let _ = event_tx.send(ServerEvent::Compaction {
-                                            trigger: "auto_recovery".to_string(),
-                                            pre_tokens: None,
-                                            post_tokens: None,
-                                            tokens_saved: None,
-                                            duration_ms: None,
-                                            messages_dropped: None,
-                                            messages_compacted: None,
-                                            summary_chars: None,
-                                            active_messages: None,
-                                        });
+                                        let _ = event_tx.send(self.take_recovery_compaction_event());
                                         continue;
                                     }
                                     return Err(e);
@@ -434,6 +371,7 @@ impl Agent {
             let mut usage_output: Option<u64> = None;
             let mut usage_cache_read: Option<u64> = None;
             let mut usage_cache_creation: Option<u64> = None;
+            let mut usage_recorder = StreamUsageRecorder::new(&self.session.id);
             let mut saw_message_end = false;
             let mut stop_reason: Option<String> = None;
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
@@ -458,7 +396,7 @@ impl Agent {
                 jcode_message_types::provider_native::ProviderNativeItems::default();
             let mut provider_native_tracker =
                 jcode_message_types::provider_native::ProviderNativeTracker::default();
-            let mut openai_native_compaction: Option<(String, usize, Option<u64>)> = None;
+            let mut openai_native_compaction: Option<(String, usize, Option<u64>, String)> = None;
             let mut tool_id_to_name: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
@@ -515,17 +453,7 @@ impl Agent {
                     Ok(event) => event,
                     Err(e) => {
                         self.record_failed_account_route(&e.to_string());
-                        record_partial_stream_usage(
-                            &self.session.id,
-                            provider.name(),
-                            &model_at_request_start,
-                            [
-                                usage_input,
-                                usage_output,
-                                usage_cache_read,
-                                usage_cache_creation,
-                            ],
-                        );
+                        usage_recorder.finish();
                         let err_str = e.to_string();
                         if self.try_auto_compact_after_context_limit(&err_str) {
                             log_agent_provider_stream_lifecycle(
@@ -561,17 +489,7 @@ impl Agent {
                                 ));
                             }
                             retry_after_compaction = true;
-                            let _ = event_tx.send(ServerEvent::Compaction {
-                                trigger: "auto_recovery".to_string(),
-                                pre_tokens: None,
-                                post_tokens: None,
-                                tokens_saved: None,
-                                duration_ms: None,
-                                messages_dropped: None,
-                                messages_compacted: None,
-                                summary_chars: None,
-                                active_messages: None,
-                            });
+                            let _ = event_tx.send(self.take_recovery_compaction_event());
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -934,6 +852,16 @@ impl Agent {
                         if cache_creation_input_tokens.is_some() {
                             usage_cache_creation = cache_creation_input_tokens;
                         }
+                        usage_recorder.observe(
+                            provider.name(),
+                            &provider.model(),
+                            [
+                                usage_input,
+                                usage_output,
+                                usage_cache_read,
+                                usage_cache_creation,
+                            ],
+                        );
                         if let Some(input) = usage_input {
                             self.update_compaction_usage_from_stream(
                                 input,
@@ -955,6 +883,9 @@ impl Agent {
                     StreamEvent::StatusDetail { detail } => {
                         self.last_status_detail = Some(detail.clone());
                         let _ = event_tx.send(ServerEvent::StatusDetail { detail });
+                    }
+                    StreamEvent::ServiceTier { tier, requested } => {
+                        let _ = event_tx.send(ServerEvent::ServiceTierReported { requested, tier });
                     }
                     StreamEvent::RetryRollback { attempt, max } => {
                         // A transient transport fault hit mid-stream after partial
@@ -1063,15 +994,16 @@ impl Agent {
                         }
                     }
                     StreamEvent::Compaction {
+                        trigger,
                         pre_tokens,
                         openai_encrypted_content,
-                        ..
                     } => {
                         if let Some(encrypted_content) = openai_encrypted_content {
                             openai_native_compaction.get_or_insert((
                                 encrypted_content,
                                 self.session.messages.len(),
                                 pre_tokens,
+                                trigger,
                             ));
                         }
                     }
@@ -1103,7 +1035,13 @@ impl Agent {
                             Err(e) => NativeToolResult::error(request_id, e.to_string()),
                         };
                         if let Some(sender) = self.provider.native_result_sender() {
-                            let _ = sender.send(native_result).await;
+                            // The provider can end its stream before the tool completes.
+                            // Keep the completed tool result in history, but expose the delivery failure.
+                            if let Err(error) = sender.send(native_result).await {
+                                logging::warn(&format!(
+                                    "Could not deliver native tool result to provider: {error}"
+                                ));
+                            }
                         }
                     }
                     StreamEvent::UpstreamProvider { provider } => {
@@ -1114,17 +1052,7 @@ impl Agent {
                         message,
                         retry_after_secs,
                     } => {
-                        record_partial_stream_usage(
-                            &self.session.id,
-                            provider.name(),
-                            &model_at_request_start,
-                            [
-                                usage_input,
-                                usage_output,
-                                usage_cache_read,
-                                usage_cache_creation,
-                            ],
-                        );
+                        usage_recorder.finish();
                         if self.try_auto_compact_after_context_limit(&message) {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
@@ -1159,17 +1087,7 @@ impl Agent {
                                 ));
                             }
                             retry_after_compaction = true;
-                            let _ = event_tx.send(ServerEvent::Compaction {
-                                trigger: "auto_recovery".to_string(),
-                                pre_tokens: None,
-                                post_tokens: None,
-                                tokens_saved: None,
-                                duration_ms: None,
-                                messages_dropped: None,
-                                messages_compacted: None,
-                                summary_chars: None,
-                                active_messages: None,
-                            });
+                            let _ = event_tx.send(self.take_recovery_compaction_event());
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -1193,6 +1111,7 @@ impl Agent {
                 }
             }
 
+            usage_recorder.finish();
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(
                     logging::LogLevel::Info,
@@ -1243,18 +1162,6 @@ impl Agent {
                     usage_cache_read,
                     usage_cache_creation,
                 );
-                crate::telemetry::record_provider_usage(
-                    Some(&self.session.id),
-                    provider.name(),
-                    &model_at_request_start,
-                    crate::telemetry::UsageSource::Agent,
-                    crate::telemetry::ProviderUsage {
-                        input_tokens: usage_input.unwrap_or(0),
-                        output_tokens: usage_output.unwrap_or(0),
-                        cache_read_input_tokens: usage_cache_read,
-                        cache_creation_input_tokens: usage_cache_creation,
-                    },
-                );
 
                 let input = usage_input.unwrap_or(0);
                 let output = usage_output.unwrap_or(0);
@@ -1279,6 +1186,14 @@ impl Agent {
                     cache_read_input: usage_cache_read,
                     cache_creation_input: usage_cache_creation,
                 });
+                // Native compaction is applied and announced below, after
+                // usage. Attribute this response's cache refresh now using
+                // evidence from the completed stream, not the later event or
+                // a heuristic based on a smaller prompt. RetryRollback clears
+                // this item, so discarded attempts cannot explain a real miss.
+                if openai_native_compaction.is_some() {
+                    self.kv_cache_monitor.note_provider_compaction();
+                }
                 if let Some(miss) = self.finish_kv_cache_monitor_request(
                     usage_input.unwrap_or(0),
                     usage_cache_read,
@@ -1322,9 +1237,11 @@ impl Agent {
             let oauth_email_after_stream =
                 crate::server::provider_oauth_email(self.provider.as_ref());
             let credential_after_stream = self.provider.active_resolved_credential();
+            let oauth_account_label_after_stream = self.provider.serving_oauth_account_label();
             if model_after_stream != model_at_request_start
                 || credential_after_stream != credential_at_request_start
                 || oauth_email_after_stream != oauth_email_at_request_start
+                || oauth_account_label_after_stream != oauth_account_label_at_request_start
             {
                 let _ = event_tx.send(ServerEvent::ModelChanged {
                     id: 0,
@@ -1334,6 +1251,7 @@ impl Agent {
                     error: None,
                     resolved_credential: credential_after_stream,
                     provider_oauth_email: oauth_email_after_stream,
+                    provider_oauth_account_label: oauth_account_label_after_stream,
                     reasoning_effort: self.provider.reasoning_effort(),
                 });
             }
@@ -1414,10 +1332,11 @@ impl Agent {
                 None
             };
 
-            if let Some((encrypted_content, compacted_count, native_pre_tokens)) =
+            if let Some((encrypted_content, compacted_count, native_pre_tokens, native_trigger)) =
                 openai_native_compaction.take()
             {
-                self.apply_openai_native_compaction(encrypted_content, compacted_count)?;
+                let (estimated_pre_tokens, estimated_post_tokens) =
+                    self.apply_openai_native_compaction(encrypted_content, compacted_count)?;
                 // Native OpenAI compaction is applied after the provider stream,
                 // so `messages_for_provider()` did not have an event to emit at
                 // the top of this iteration. Notify clients now, before any
@@ -1425,14 +1344,18 @@ impl Agent {
                 // The FIFO event ordering lets the TUI invalidate its old
                 // append-only baseline before seeing the compacted signature.
                 //
-                // Only a provider-supplied pre-compaction count is trustworthy
-                // here. The response's own input usage is not the pre-compaction
-                // context size, so omit the value rather than mislabel it (#1178).
+                // Prefer a provider-supplied pre-compaction count. Otherwise use
+                // jcode's own context estimate, never the response's input usage,
+                // which is not the pre-compaction context size (#1178).
+                let pre_tokens = native_pre_tokens.or(estimated_pre_tokens);
+                let post_tokens = estimated_post_tokens;
                 let _ = event_tx.send(ServerEvent::Compaction {
-                    trigger: "openai_native".to_string(),
-                    pre_tokens: native_pre_tokens,
-                    post_tokens: None,
-                    tokens_saved: None,
+                    trigger: native_trigger,
+                    pre_tokens,
+                    post_tokens,
+                    tokens_saved: pre_tokens
+                        .zip(post_tokens)
+                        .map(|(pre, post)| pre.saturating_sub(post)),
                     duration_ms: None,
                     messages_dropped: None,
                     messages_compacted: Some(compacted_count),

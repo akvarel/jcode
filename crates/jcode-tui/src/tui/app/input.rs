@@ -1,5 +1,9 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+#[path = "input/shell_commands.rs"]
+mod shell_commands;
+use shell_commands::*;
+
 use super::{
     App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, commands,
     ctrl_bracket_fallback_to_esc, is_context_limit_error, is_request_payload_too_large_error,
@@ -86,99 +90,6 @@ fn merge_turn_reminders(a: Option<String>, b: Option<String>) -> Option<String> 
 
 pub(super) fn extract_input_shell_command(input: &str) -> Option<&str> {
     input.trim().strip_prefix('!').map(str::trim)
-}
-
-fn build_input_shell_command(command: &str) -> std::process::Command {
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("cmd.exe");
-        cmd.arg("/C").arg(command);
-        cmd
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut cmd = std::process::Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd
-    }
-}
-
-fn combine_shell_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
-    let mut output = String::new();
-
-    if !stdout.is_empty() {
-        output.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str("[stderr]\n");
-        output.push_str(&stderr);
-    }
-
-    let truncated = if output.len() > INPUT_SHELL_MAX_OUTPUT_LEN {
-        output = truncate_str(&output, INPUT_SHELL_MAX_OUTPUT_LEN).to_string();
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str("… output truncated");
-        true
-    } else {
-        false
-    };
-
-    (output, truncated)
-}
-
-fn spawn_input_shell_command(session_id: String, command: String, cwd: Option<String>) {
-    std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let mut cmd = build_input_shell_command(&command);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if let Some(dir) = cwd.as_ref() {
-            cmd.current_dir(dir);
-        }
-
-        let event = match cmd.output() {
-            Ok(output) => {
-                let (combined_output, truncated) =
-                    combine_shell_output(&output.stdout, &output.stderr);
-                InputShellCompleted {
-                    session_id,
-                    result: crate::message::InputShellResult {
-                        command,
-                        cwd,
-                        output: combined_output,
-                        exit_code: output.status.code(),
-                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                        truncated,
-                        failed_to_start: false,
-                    },
-                }
-            }
-            Err(error) => InputShellCompleted {
-                session_id,
-                result: crate::message::InputShellResult {
-                    command,
-                    cwd,
-                    output: format!("Failed to run command: {}", error),
-                    exit_code: None,
-                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    truncated: false,
-                    failed_to_start: true,
-                },
-            },
-        };
-
-        Bus::global().publish(BusEvent::InputShellCompleted(event));
-    });
 }
 
 pub(super) struct PreparedInput {
@@ -1368,7 +1279,7 @@ pub(super) fn clear_input_for_escape(app: &mut App) {
     }
 }
 
-pub(super) fn expand_paste_placeholders(app: &mut App, input: &str) -> String {
+pub(super) fn expand_paste_placeholders(app: &App, input: &str) -> String {
     expand_paste_placeholders_with(&app.pasted_contents, input)
 }
 
@@ -1462,6 +1373,7 @@ fn expand_paste_placeholders_with(pasted_contents: &[String], input: &str) -> St
 /// as soon as one starts a turn; the rest wait for that turn to end.
 pub(super) fn run_queued_commands_local(app: &mut App) {
     while !app.is_processing
+        && !app.cloud_handoff_blocks_work()
         && !app.pending_turn
         && !app.should_quit
         && !app.queued_commands.is_empty()
@@ -1524,6 +1436,14 @@ pub(super) fn retrieve_pending_message_for_edit(app: &mut App) -> bool {
 }
 
 pub(super) fn send_action(app: &App, alternate_shortcut: bool) -> SendAction {
+    // Route through the submission guard rather than consuming this draft
+    // into an interleave slot that turn completion would clear.
+    if app.cloud_handoff_blocks_work() {
+        return SendAction::Submit;
+    }
+    if app.pending_login.is_some() {
+        return SendAction::Submit;
+    }
     if !app.is_processing {
         return SendAction::Submit;
     }
@@ -2079,6 +1999,9 @@ pub(super) fn is_next_prompt_new_session_hotkey(code: KeyCode, modifiers: KeyMod
 }
 
 fn input_routes_to_new_session(app: &App) -> bool {
+    if app.pending_login.is_some() {
+        return false;
+    }
     if !app.route_next_prompt_to_new_session || app.input.is_empty() {
         return false;
     }
@@ -2115,6 +2038,10 @@ fn route_prompt_to_new_session_local(app: &mut App) -> bool {
 }
 
 pub(super) fn handle_alternate_enter(app: &mut App) {
+    if app.pending_login.is_some() {
+        app.submit_input();
+        return;
+    }
     if try_queue_command(app) {
         return;
     }
@@ -2349,6 +2276,15 @@ pub(super) fn handle_alt_key(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('a') if app.input.is_empty() => {
             app.copy_chat_viewport_context_to_clipboard();
+            true
+        }
+        KeyCode::Char('e') => {
+            let expanded = crate::tui::ui::viewport::toggle_prompt_history_expanded();
+            app.set_status_notice(if expanded {
+                "Prompt history: showing more previous prompts (Alt+E to collapse)"
+            } else {
+                "Prompt history: collapsed"
+            });
             true
         }
         _ => false,
@@ -2680,7 +2616,12 @@ pub(super) fn handle_visible_copy_shortcut(
         // Some terminals report Alt+Shift+E as Alt+lowercase `e` with no
         // explicit SHIFT modifier. Keep the relaxed fallback scoped to the
         // expand badge so plain Alt+letter copy shortcuts do not become active.
-        if c.eq_ignore_ascii_case(&'e') && handle_expand_edit_badge_shortcut(app, c) {
+        // Plain Alt+E toggles the expanded prompt history, so only treat it as
+        // the expand badge when that badge is actually on screen.
+        if c.eq_ignore_ascii_case(&'e')
+            && crate::tui::ui::visible_expand_edit_badge()
+            && handle_expand_edit_badge_shortcut(app, c)
+        {
             return true;
         }
         return false;
@@ -2851,11 +2792,7 @@ pub(super) fn handle_modal_key(
         return Ok(true);
     }
 
-    if app.handle_inline_interactive_preview_key(&code, modifiers)? {
-        return Ok(true);
-    }
-
-    Ok(false)
+    app.handle_inline_interactive_preview_key(&code, modifiers)
 }
 
 pub(super) fn handle_scroll_overlay_key(app: &mut App, code: KeyCode) -> Result<bool> {
@@ -2937,6 +2874,10 @@ pub(super) fn handle_global_control_shortcuts(
 }
 
 pub(super) fn handle_enter(app: &mut App) -> bool {
+    if app.pending_login.is_some() {
+        app.submit_input();
+        return true;
+    }
     promote_dropped_images(app);
     if app.activate_picker_from_preview() {
         return true;
@@ -3139,8 +3080,11 @@ impl App {
             if matches!(
                 event.kind,
                 crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-            ) {
-                let _ = self.handle_key_press_event(event);
+            ) && let Err(error) = self.handle_key_press_event(event)
+            {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Could not handle key input: {error}"
+                )));
             }
             return;
         }
@@ -3169,12 +3113,16 @@ impl App {
         if matches!(
             event.kind,
             crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-        ) {
-            let _ = self.handle_key_press_event(event);
+        ) && let Err(error) = self.handle_key_press_event(event)
+        {
+            self.push_display_message(DisplayMessage::error(format!(
+                "Could not handle key input: {error}"
+            )));
         }
     }
 
     pub(super) fn handle_key_press_event(&mut self, event: KeyEvent) -> Result<()> {
+        self.wake_idle_hibernation();
         // Pick up config.toml keybinding edits before this key is matched.
         // The idle tick refreshes too, but it can run as slowly as the 5s
         // deep-idle cadence, which would leave the first keystroke after an
@@ -3252,14 +3200,8 @@ impl App {
             return Ok(());
         }
 
-        if self.pending_provider_failover.is_some() && !self.is_processing {
-            if code == KeyCode::Esc {
-                self.cancel_pending_provider_failover("Provider auto-switch canceled");
-                return Ok(());
-            }
-            if !is_scroll_only_key(self, code, modifiers) {
-                self.cancel_pending_provider_failover("Provider auto-switch canceled");
-            }
+        if self.handle_key_during_provider_failover(code) {
+            return Ok(());
         }
 
         // Accept an armed post-error fallback offer: switch to the next best
@@ -3434,6 +3376,7 @@ impl App {
     }
 
     pub(super) fn should_redraw_after_resize(&mut self) -> bool {
+        self.wake_idle_hibernation();
         let now = std::time::Instant::now();
         match self.last_resize_redraw {
             Some(last) if now.duration_since(last) < Self::RESIZE_REDRAW_MIN_INTERVAL => {
@@ -3587,6 +3530,7 @@ impl App {
     /// Queue a message to be sent later
     /// Handle bracketed paste: store text content (image URLs are still detected inline)
     pub(super) fn handle_paste(&mut self, text: String) {
+        self.wake_idle_hibernation();
         handle_paste(self, text);
     }
 
@@ -3952,6 +3896,20 @@ impl App {
 
     /// Submit input - just sets up message and flags, processing happens in next loop iteration
     pub(super) fn submit_input(&mut self) {
+        let command = expand_paste_placeholders(self, &self.input)
+            .trim()
+            .to_string();
+        if !super::commands_cloud::check_cloud_handoff_input(self, &command) {
+            return;
+        }
+        if self.cloud_handoff_blocks_work()
+            && super::commands_cloud::parse_cloud_command(self.input.trim()).is_none()
+        {
+            self.set_status_notice(
+                "Cloud handoff pending. Use /cloud cancel before submitting more work.",
+            );
+            return;
+        }
         // Connected SSH input is dispatched through the wire client, never the
         // local submit fallback (which reads skills and persists prompts).
         if crate::tui::is_ssh_remote() {
@@ -4077,6 +4035,12 @@ impl App {
 
             if let Some(skill) = skill {
                 self.active_skill = Some(skill_name.clone());
+                if !self.is_remote {
+                    self.append_turn_system_reminder(Some(format!(
+                        "# Active Skill\n\n{}",
+                        skill.get_prompt().trim()
+                    )));
+                }
                 self.push_display_message(DisplayMessage {
                     role: "system".to_string(),
                     content: format!("Activated skill: {} - {}", skill.name, skill.description),
@@ -4156,29 +4120,32 @@ impl App {
                     .join(", ")
             ));
         }
+        let model_input = crate::prompt::with_swarm_user_message_reminder(
+            &input,
+            self.provider.reasoning_effort().as_deref(),
+        );
         if images.is_empty() {
-            self.current_turn_system_reminder = mission_turn_reminder(&self.session.id);
-            self.add_provider_message(Message::user(&input));
+            self.add_provider_message(Message::user(&model_input));
             self.session.add_message(
                 Role::User,
                 vec![ContentBlock::Text {
-                    text: input.clone(),
+                    text: model_input.clone(),
                     cache_control: None,
                 }],
             );
         } else {
-            self.current_turn_system_reminder = mission_turn_reminder(&self.session.id);
-            self.add_provider_message(Message::user_with_images(&input, images.clone()));
+            self.add_provider_message(Message::user_with_images(&model_input, images.clone()));
             let mut blocks: Vec<ContentBlock> = images
                 .into_iter()
                 .map(|(media_type, data)| ContentBlock::Image { media_type, data })
                 .collect();
             blocks.push(ContentBlock::Text {
-                text: input.clone(),
+                text: model_input.clone(),
                 cache_control: None,
             });
             self.session.add_message(Role::User, blocks);
         }
+        self.append_turn_system_reminder(mission_turn_reminder(&self.session.id));
         crate::telemetry::record_turn();
         self.session_save_pending = true;
 
@@ -4225,7 +4192,9 @@ impl App {
         terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
     ) {
-        while !self.queued_messages.is_empty() || !self.hidden_queued_system_messages.is_empty() {
+        while !self.cloud_handoff_blocks_work()
+            && (!self.queued_messages.is_empty() || !self.hidden_queued_system_messages.is_empty())
+        {
             // Combine all currently queued messages into one, treating [SYSTEM: ...]
             // startup continuations as system reminders rather than user turns.
             let queued_messages = std::mem::take(&mut self.queued_messages);
@@ -4248,10 +4217,14 @@ impl App {
                 }
             }
 
-            self.current_turn_system_reminder =
+            let turn_reminder =
                 merge_turn_reminders(reminder, mission_turn_reminder(&self.session.id));
 
             if has_combined {
+                let combined = crate::prompt::with_swarm_user_message_reminder(
+                    &combined,
+                    self.provider.reasoning_effort().as_deref(),
+                );
                 self.add_provider_message(Message::user(&combined));
                 self.session.add_message(
                     Role::User,
@@ -4261,6 +4234,7 @@ impl App {
                     }],
                 );
             }
+            self.append_turn_system_reminder(turn_reminder);
             self.session_save_pending = true;
             self.clear_streaming_render_state();
             self.stream_buffer.clear();
@@ -4323,7 +4297,6 @@ impl App {
                     }
                 }
             }
-            self.current_turn_system_reminder = None;
             // Loop will check if more messages were queued during this turn
         }
     }

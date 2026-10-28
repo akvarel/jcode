@@ -35,8 +35,6 @@ serde_json = { version = "1", features = ["raw_value"] }
 # CLI
 
 # File operations
-glob = "0.3"
-ignore = "0.4"
 similar = "2"            # diffing for edits
 
 # Utilities
@@ -127,6 +125,9 @@ pdf = ["dep:jcode-pdf"]
 test-support = ["jcode-base/test-support"]
 
 [dev-dependencies]
+# Paused-time browser tests must compile when this package is tested alone,
+# without inheriting test-util from another workspace package's dev-dependencies.
+tokio = { version = "1", features = ["test-util"] }
 # Used by async streaming tests (ambient/runner_tests, server/client_actions_tests).
 async-stream = "0.3"
 # Enables jcode-base's test-support helpers (storage::lock_test_env,

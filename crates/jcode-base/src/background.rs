@@ -8,7 +8,9 @@ use crate::bus::{
     BackgroundTaskStatus, Bus, BusEvent,
 };
 use anyhow::Result;
+mod status_io;
 use chrono::{DateTime, Utc};
+use status_io::persist_status;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,9 +175,7 @@ impl BackgroundTaskManager {
     }
 
     async fn write_status_file(&self, path: &std::path::Path, status: &TaskStatusFile) {
-        if let Ok(json) = serde_json::to_string_pretty(status) {
-            let _ = fs::write(path, json).await;
-        }
+        persist_status(path, status);
     }
 
     async fn finalize_detached_status_if_needed(
@@ -363,6 +363,7 @@ impl BackgroundTaskManager {
         F: FnOnce(PathBuf) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<TaskResult>> + Send,
     {
+        let runtime_activity = crate::runtime_activity::global().enter().await;
         let (notify, wake) = normalize_delivery(notify, wake);
         let task_id = Self::generate_task_id();
         let output_path = self.output_dir.join(format!("{}.output", task_id));
@@ -391,9 +392,7 @@ impl BackgroundTaskManager {
             event_history: Vec::new(),
             stall_wake_seconds: None,
         };
-        if let Ok(json) = serde_json::to_string_pretty(&initial_status) {
-            let _ = std::fs::write(&status_path, json);
-        }
+        persist_status(&status_path, &initial_status);
         self.register_watch(&task_id, session_id, Some(std::process::id()));
         Self::publish_task_started_activity(
             &task_id,
@@ -418,6 +417,7 @@ impl BackgroundTaskManager {
 
         // Spawn the background task
         let handle = tokio::spawn(async move {
+            let _runtime_activity = runtime_activity;
             let result = execute_fn(output_path_clone.clone()).await;
 
             let duration_secs = started_at.elapsed().as_secs_f64();
@@ -473,9 +473,7 @@ impl BackgroundTaskManager {
                 &mut final_status,
                 terminal_event_record(status.clone(), exit_code, error.as_deref()),
             );
-            if let Ok(json) = serde_json::to_string_pretty(&final_status) {
-                let _ = tokio::fs::write(&status_path_clone, json).await;
-            }
+            persist_status(&status_path_clone, &final_status);
 
             // Drop this task from the live map now that its terminal status is
             // persisted. Order matters: pruning only after the status-file
@@ -571,6 +569,8 @@ impl BackgroundTaskManager {
         wake: bool,
         handle: JoinHandle<Result<jcode_tool_types::ToolOutput>>,
     ) -> BackgroundTaskInfo {
+        // Reserve before the foreground caller can release its turn/tool guard.
+        let runtime_activity = crate::runtime_activity::global().enter().await;
         let (notify, wake) = normalize_delivery(notify, wake);
         let task_id = Self::generate_task_id();
         let output_path = self.output_dir.join(format!("{}.output", task_id));
@@ -603,9 +603,7 @@ impl BackgroundTaskManager {
             event_history: Vec::new(),
             stall_wake_seconds: None,
         };
-        if let Ok(json) = serde_json::to_string_pretty(&initial_status) {
-            let _ = std::fs::write(&status_path, json);
-        }
+        persist_status(&status_path, &initial_status);
         self.register_watch(&task_id, session_id, Some(std::process::id()));
         Self::publish_task_started_activity(
             &task_id,
@@ -629,6 +627,7 @@ impl BackgroundTaskManager {
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         let wrapper_handle = tokio::spawn(async move {
+            let _runtime_activity = runtime_activity;
             let tool_result = handle.await;
             let duration_secs = started_at.elapsed().as_secs_f64();
 
@@ -694,9 +693,7 @@ impl BackgroundTaskManager {
                 &mut final_status,
                 terminal_event_record(status.clone(), exit_code, error.as_deref()),
             );
-            if let Ok(json) = serde_json::to_string_pretty(&final_status) {
-                let _ = tokio::fs::write(&status_path_clone, json).await;
-            }
+            persist_status(&status_path_clone, &final_status);
 
             // Prune the live-map entry only after the terminal status file is
             // persisted (and after registration below, so instant completions
@@ -1292,9 +1289,7 @@ impl BackgroundTaskManager {
                 &mut final_status,
                 terminal_event_record(event_status, event_exit_code, event_error.as_deref()),
             );
-            if let Ok(json) = serde_json::to_string_pretty(&final_status) {
-                let _ = fs::write(&task.status_path, json).await;
-            }
+            persist_status(&task.status_path, &final_status);
 
             Ok(true)
         } else {
@@ -1547,39 +1542,74 @@ impl BackgroundTaskManager {
         &self,
         session_id: &str,
     ) -> Vec<TaskStatusFile> {
-        let mut matches = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&self.output_dir) else {
-            return matches;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(status) = serde_json::from_str::<TaskStatusFile>(&content) else {
-                continue;
-            };
-
-            if status.session_id != session_id
-                || status.status != BackgroundTaskStatus::Running
-                || !status.detached
-            {
-                continue;
-            }
-
-            let Some(pid) = status.pid else {
-                continue;
-            };
-
-            if crate::platform::is_process_running(pid) {
-                matches.push(status);
-            }
+        // The task directory accumulates thousands of status files and every
+        // History bootstrap asks this question, so a reconnect storm re-read,
+        // re-parsed, and re-stat'ed all of them per client. Keep one index of
+        // running detached tasks, rebuilt only when the directory changes
+        // (its mtime moves when a status file is created, renamed, or removed;
+        // status files are replaced atomically) or after a short TTL.
+        struct Index {
+            dir_mtime: Option<std::time::SystemTime>,
+            built_at: Instant,
+            running: Vec<TaskStatusFile>,
         }
+        static INDEX: std::sync::LazyLock<std::sync::Mutex<Option<Index>>> =
+            std::sync::LazyLock::new(Default::default);
+        // New tasks create a status file (moving the dir mtime), and tasks that
+        // finished are dropped below by the pid liveness filter, so the TTL
+        // only bounds exotic in-place edits. Keep it long enough that the index
+        // prewarmed at server start covers a whole reconnect storm.
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let dir_mtime = std::fs::metadata(&self.output_dir)
+            .and_then(|meta| meta.modified())
+            .ok();
+        let mut guard = INDEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fresh = guard.as_ref().is_some_and(|index| {
+            index.dir_mtime.is_some()
+                && index.dir_mtime == dir_mtime
+                && index.built_at.elapsed() < TTL
+        });
+        if !fresh {
+            let mut running = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&self.output_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(status) = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|content| serde_json::from_str::<TaskStatusFile>(&content).ok())
+                    else {
+                        continue;
+                    };
+                    if status.status == BackgroundTaskStatus::Running && status.detached {
+                        running.push(status);
+                    }
+                }
+            }
+            *guard = Some(Index {
+                dir_mtime,
+                built_at: Instant::now(),
+                running,
+            });
+        }
+        let mut matches: Vec<TaskStatusFile> = guard
+            .as_ref()
+            .map(|index| {
+                index
+                    .running
+                    .iter()
+                    .filter(|status| status.session_id == session_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(guard);
+        matches.retain(|status| status.pid.is_some_and(crate::platform::is_process_running));
 
         matches.sort_by(|a, b| a.task_id.cmp(&b.task_id));
         matches

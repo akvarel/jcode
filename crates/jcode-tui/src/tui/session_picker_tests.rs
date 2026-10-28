@@ -100,6 +100,106 @@ fn make_session_with_flags(
 }
 
 #[test]
+fn standalone_resume_renders_before_list_load_finishes() {
+    let mut picker = SessionPicker::loading();
+    let (_sender, receiver) = std::sync::mpsc::channel::<SessionListUpdate>();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("loading frame");
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(picker.loading_message.is_some());
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Loading sessions"));
+}
+
+#[test]
+fn standalone_resume_refresh_preserves_cached_selection_and_search() {
+    let mut picker = SessionPicker::loading();
+    let first = make_session("first", "first", false, SessionStatus::Closed);
+    let second = make_session("second", "second", false, SessionStatus::Closed);
+    assert!(
+        !picker
+            .apply_session_list_update(SessionListUpdate::Cached((
+                Vec::new(),
+                vec![first.clone(), second.clone()],
+            )))
+            .expect("cached list")
+    );
+    assert!(picker.loading_message.is_none());
+    let index = picker
+        .find_item_index_for_session_id("second")
+        .expect("second item");
+    picker.list_state.select(Some(index));
+    picker.search_query = "test".to_string();
+    picker.search_active = true;
+    picker.filter_mode_user_chosen = true;
+    assert!(
+        picker
+            .apply_session_list_update(SessionListUpdate::Fresh(Ok((
+                Vec::new(),
+                vec![second, first],
+            ))))
+            .expect("fresh list")
+    );
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("second")
+    );
+    assert_eq!(picker.search_query, "test");
+    assert!(picker.search_active);
+    assert!(picker.filter_mode_user_chosen);
+}
+
+#[test]
+fn standalone_resume_load_error_preserves_existing_list() {
+    let mut picker = SessionPicker::loading();
+    picker
+        .apply_session_list_update(SessionListUpdate::Cached((
+            Vec::new(),
+            vec![make_session(
+                "cached",
+                "cached",
+                false,
+                SessionStatus::Closed,
+            )],
+        )))
+        .expect("cached list");
+    let err = picker
+        .apply_session_list_update(SessionListUpdate::Fresh(Err(anyhow::anyhow!(
+            "scan failed"
+        ))))
+        .expect_err("report loader failure");
+    assert_eq!(err.to_string(), "scan failed");
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("cached")
+    );
+}
+
+#[test]
+fn standalone_resume_empty_refresh_finishes_loading() {
+    let mut picker = SessionPicker::loading();
+    assert!(
+        picker
+            .apply_session_list_update(SessionListUpdate::Fresh(Ok((Vec::new(), Vec::new(),))))
+            .expect("empty list")
+    );
+    assert!(picker.loading_message.is_none());
+    assert!(picker.selected_session().is_none());
+}
+
+#[test]
 #[ignore = "developer benchmark: profiles real /resume through first rendered picker frame"]
 fn benchmark_real_resume_first_render_reports_timings() {
     invalidate_session_list_cache();
@@ -866,116 +966,7 @@ fn test_filter_mode_keyboard_shortcuts_cycle_both_directions() {
     assert_eq!(picker.filter_mode, SessionFilterMode::All);
 }
 
-fn live_presence(session_id: &str, streaming: bool) -> crate::session::SessionPresence {
-    crate::session::SessionPresence {
-        session_id: session_id.to_string(),
-        pid: std::process::id(),
-        streaming,
-        streaming_since: streaming
-            .then(|| std::time::SystemTime::now() - std::time::Duration::from_secs(90)),
-        internal: false,
-    }
-}
-
-#[test]
-fn test_active_filter_shows_only_live_sessions_ready_before_working() {
-    let live_working = make_session("session_working", "alpha", false, SessionStatus::Active);
-    let live_ready = make_session("session_ready", "beta", false, SessionStatus::Active);
-    let dead = make_session("session_dead", "dead", false, SessionStatus::Closed);
-
-    let mut picker = SessionPicker::new(vec![live_working, live_ready, dead]);
-    picker.activate_active_filter();
-    picker.set_live_presence_for_test(vec![
-        live_presence("session_working", true),
-        live_presence("session_ready", false),
-    ]);
-
-    let visible: Vec<&str> = picker
-        .visible_session_iter()
-        .map(|session| session.id.as_str())
-        .collect();
-    // Only live sessions appear; the ready one is triaged above the working one.
-    assert_eq!(visible, vec!["session_ready", "session_working"]);
-
-    let ready = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_ready")
-        .expect("ready visible");
-    let working = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_working")
-        .expect("working visible");
-    assert!(!picker.session_is_streaming(ready));
-    assert!(picker.session_is_streaming(working));
-    assert!(picker.session_streaming_duration(working).is_some());
-}
-
-#[test]
-fn test_active_rows_render_working_and_ready_badges() {
-    let live_working = make_session("session_working", "alpha", false, SessionStatus::Active);
-    let live_ready = make_session("session_ready", "beta", false, SessionStatus::Closed);
-    let mut picker = SessionPicker::new(vec![live_working, live_ready]);
-    picker.activate_active_filter();
-    picker.set_live_presence_for_test(vec![
-        live_presence("session_working", true),
-        live_presence("session_ready", false),
-    ]);
-
-    let working = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_working")
-        .cloned()
-        .expect("working visible");
-    let ready = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_ready")
-        .cloned()
-        .expect("ready visible");
-
-    let working_lines = picker.render_session_item_lines(&working, false);
-    let working_text = working_lines
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        working_text.contains("working 1m"),
-        "expected working badge with duration, got: {working_text}"
-    );
-
-    let first_frame = picker
-        .render_session_item_lines_at_frame(&working, false, 0)
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let second_frame = picker
-        .render_session_item_lines_at_frame(&working, false, 1)
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(first_frame.contains('⠋'));
-    assert!(second_frame.contains('⠙'));
-    assert_ne!(first_frame, second_frame, "running glyph should animate");
-    assert!(picker.has_visible_running_sessions());
-
-    let ready_lines = picker.render_session_item_lines(&ready, false);
-    let ready_text = ready_lines
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        ready_text.contains("ready"),
-        "expected ready badge, got: {ready_text}"
-    );
-    // Live presence overrides the stale persisted "closed" status.
-    assert!(
-        !ready_text.contains("closed"),
-        "live session must not render as closed: {ready_text}"
-    );
-}
+include!("session_picker_tests/live_presence.rs");
 
 fn make_claude_session(session_id: &str) -> SessionInfo {
     let mut session = make_session(
@@ -1064,30 +1055,6 @@ fn live_claude_row_is_labeled_and_closed_claude_cannot_take_over() {
         .handle_overlay_key(KeyCode::Char('T'), KeyModifiers::empty())
         .unwrap();
     assert!(!picker.claude_takeover_confirmation_active_for_test());
-}
-
-#[test]
-fn test_current_session_row_is_labeled() {
-    let session = make_session("session_self", "self", false, SessionStatus::Active);
-    let mut picker = SessionPicker::new(vec![session.clone()]);
-    picker.set_current_session_id(Some("session_self".to_string()));
-
-    let lines = picker.render_session_item_lines(&session, false);
-    let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-    assert!(
-        text.contains("current"),
-        "expected current label, got: {text}"
-    );
-}
-
-#[test]
-fn test_maybe_refresh_live_presence_throttles_and_detects_changes() {
-    let session = make_session("session_live", "live", false, SessionStatus::Active);
-    let mut picker = SessionPicker::new(vec![session]);
-    picker.activate_active_filter();
-    // Freshly injected snapshot: refresh is throttled, nothing changes.
-    picker.set_live_presence_for_test(vec![live_presence("session_live", true)]);
-    assert!(!picker.maybe_refresh_live_presence());
 }
 
 #[test]
@@ -1290,6 +1257,20 @@ fn onboarding_banner_is_action_only() {
     picker.activate_onboarding_banner(vec![Line::from("welcome")]);
 
     assert_eq!(picker.visible_session_count(), 0);
+    assert!(picker.onboarding_review_recent_project_highlighted());
+}
+
+#[test]
+fn onboarding_banner_space_submits_like_enter() {
+    let mut picker = SessionPicker::new(Vec::new());
+    picker.activate_onboarding_banner(vec![Line::from("welcome")]);
+    let action = picker
+        .handle_overlay_key(KeyCode::Char(' '), KeyModifiers::empty())
+        .expect("space");
+    assert!(matches!(
+        action,
+        OverlayAction::Selected(PickerResult::ReviewRecentProject)
+    ));
     assert!(picker.onboarding_review_recent_project_highlighted());
 }
 
@@ -1884,6 +1865,18 @@ fn test_preview_is_left_aligned_independently_of_chat_markdown_context() {
 
 #[test]
 fn test_preview_structured_messages_stay_left_aligned() {
+    // The todo tool card is only shown inline when todos are not pinned.
+    let _env_lock = crate::storage::lock_test_env();
+    crate::env::set_var("JCODE_PIN_TODOS", "0");
+    crate::config::invalidate_config_cache();
+    struct RestorePin;
+    impl Drop for RestorePin {
+        fn drop(&mut self) {
+            crate::env::remove_var("JCODE_PIN_TODOS");
+            crate::config::invalidate_config_cache();
+        }
+    }
+    let _restore = RestorePin;
     let todos = serde_json::json!([{
         "id": "alignment", "content": "Verify structured preview alignment",
         "status": "completed", "priority": "high", "confidence": "verified"
@@ -1936,7 +1929,8 @@ fn test_preview_structured_messages_stay_left_aligned() {
                 "Verify structured preview alignment",
                 "Reviewing the weak points",
                 "Check structured preview alignment",
-                "All alignment checks passed",
+                // Successful background notices render as one compact line.
+                "Background task alignment-task",
             ] {
                 let line = cache
                     .wrapped_lines
@@ -2050,7 +2044,7 @@ fn test_preview_sticky_prompt_header_survives_async_preview_load() {
     // Simulate an in-flight background load for the selected session: empty
     // preview + a pending load whose id matches. Keep the sender alive so the
     // receiver reports `Empty` (still loading) rather than `Disconnected`.
-    let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<PreviewMessage>>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Option<LoadedSessionPreview>>();
     picker.pending_preview_load = Some(PendingSessionPreviewLoad {
         session_id: "async_sticky".to_string(),
         receiver: rx,
@@ -2744,4 +2738,68 @@ fn test_resume_project_scope_is_off_by_default() {
         assert_eq!(picker.filter_mode, SessionFilterMode::All);
         assert_eq!(picker.visible_sessions.len(), 2);
     }
+}
+
+#[test]
+fn preview_renders_pinned_todos_global_prompt_numbers_and_hides_todo_tool_cards() {
+    let _env_lock = crate::storage::lock_test_env();
+    crate::env::set_var("JCODE_PIN_TODOS", "1");
+    crate::config::invalidate_config_cache();
+
+    let mut session = make_session_with_many_turns("pinned_preview", 60);
+    session.messages_preview.push(PreviewMessage {
+        role: "tool".to_string(),
+        content: "DUPLICATE_TODO_TOOL_CARD".to_string(),
+        tool_calls: Vec::new(),
+        tool_data: Some(crate::message::ToolCall {
+            id: "todo-tool".to_string(),
+            name: "todo".to_string(),
+            input: serde_json::json!({"todos": []}),
+            intent: None,
+            thought_signature: None,
+        }),
+        timestamp: None,
+    });
+    let mut picker = SessionPicker::new(vec![session]);
+    picker.preview_extras.insert(
+        "pinned_preview".to_string(),
+        PreviewExtras {
+            hidden_prompts: 100,
+            todos_payload: Some(
+                serde_json::json!({
+                    "todos": [{
+                        "id": "1",
+                        "content": "PINNED_PREVIEW_TASK",
+                        "status": "in_progress",
+                        "priority": "high"
+                    }]
+                })
+                .to_string(),
+            ),
+        },
+    );
+
+    let text = buffer_text(&mut picker, 120, 30);
+    crate::env::remove_var("JCODE_PIN_TODOS");
+    crate::config::invalidate_config_cache();
+
+    assert!(text.contains("PINNED_PREVIEW_TASK"), "{text}");
+    assert!(!text.contains("DUPLICATE_TODO_TOOL_CARD"), "{text}");
+    // 60 visible prompts after 100 hidden ones: the last is numbered 160.
+    assert!(text.contains("160›"), "{text}");
+    // Pinned todos sit at the top of the preview content, under the sticky prompt.
+    let rows: Vec<String> = text
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(120)
+        .map(|chunk| chunk.iter().collect())
+        .collect();
+    let todo_row = rows
+        .iter()
+        .position(|row| row.contains("PINNED_PREVIEW_TASK"))
+        .expect("todo row");
+    assert!(
+        todo_row <= 4,
+        "todo band should be pinned at top, row {todo_row}:\n{text}"
+    );
 }
