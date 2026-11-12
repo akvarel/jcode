@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn service_tier_metadata_uses_serialized_request_not_later_preference() {
+    let request = serde_json::json!({"service_tier": "priority"});
+    let requested = request
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut event = StreamEvent::ServiceTier {
+        tier: "default".into(),
+        requested: None,
+    };
+    bind_requested_service_tier(&mut event, &requested);
+    assert!(
+        matches!(event, StreamEvent::ServiceTier { requested: Some(ref tier), .. } if tier == "priority")
+    );
+    // An omitted request field must stay omitted, even if a preference has
+    // changed to Ultrafast while the network request was in flight.
+    bind_requested_service_tier(&mut event, &None);
+    assert!(matches!(
+        event,
+        StreamEvent::ServiceTier {
+            requested: None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn service_tier_headers_follow_serialized_tier_on_both_transports() {
     let client = Client::new();
     for mode in 0..3 {

@@ -383,6 +383,8 @@ impl Provider for OpenAIProvider {
 
         tokio::spawn(async move {
             let stream_task = async move {
+                let mut last_error = None;
+                let mut force_https_for_request = false;
                 // Attempt persistent WebSocket continuation first
                 if use_websocket_transport {
                     // Track output: a continuation that streams partial output
@@ -407,18 +409,15 @@ impl Provider for OpenAIProvider {
                     };
                     drop(attempt_tx);
                     let saw_output = attempt_guard.finish().await;
+                    continuation_result.log(&model_for_transport);
 
                     match continuation_result {
                         PersistentWsResult::TerminalError => return,
+                        PersistentWsResult::FallbackToHttps(error) => {
+                            force_https_for_request = true;
+                            last_error = Some(anyhow::anyhow!(error));
+                        }
                         PersistentWsResult::Success => {
-                            log_openai_stream_lifecycle(
-                                jcode_base::logging::LogLevel::Info,
-                                "persistent_reuse_success",
-                                vec![
-                                    ("model", model_for_transport.clone()),
-                                    ("transport", "websocket".to_string()),
-                                ],
-                            );
                             record_websocket_success(
                                 &websocket_cooldowns,
                                 &websocket_failure_streaks,
@@ -428,28 +427,11 @@ impl Provider for OpenAIProvider {
                             return;
                         }
                         PersistentWsResult::NotAvailable => {
-                            log_openai_stream_lifecycle(
-                                jcode_base::logging::LogLevel::Info,
-                                "persistent_reuse_unavailable",
-                                vec![
-                                    ("model", model_for_transport.clone()),
-                                    ("transport", "websocket".to_string()),
-                                ],
-                            );
                             jcode_base::logging::info(
                                 "No persistent WS connection available; using fresh connection",
                             );
                         }
                         PersistentWsResult::Failed(err) => {
-                            log_openai_stream_lifecycle(
-                                jcode_base::logging::LogLevel::Warn,
-                                "persistent_reuse_failed",
-                                vec![
-                                    ("model", model_for_transport.clone()),
-                                    ("transport", "websocket".to_string()),
-                                    ("error", err.clone()),
-                                ],
-                            );
                             jcode_base::logging::warn(&format!(
                                 "Persistent WS continuation failed: {}; using fresh connection",
                                 err
@@ -471,8 +453,6 @@ impl Provider for OpenAIProvider {
                 }
 
                 // Normal path: fresh connection with full input (with retry logic)
-                let mut last_error = None;
-                let mut force_https_for_request = false;
                 let mut skip_backoff_once = false;
                 let mut next_retry_delay = None;
 

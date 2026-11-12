@@ -426,3 +426,185 @@ async fn fresh_ws_terminal_error_ends_stream_with_socket_open() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("usage limit"), "{errors:?}");
 }
+
+// Reproduce the incident's bare, pre-acceptance error through the public stream.
+// Recovery must use full HTTP input, not repeat a rejected WS continuation or
+// execute tools again. This is a loopback protocol check, not live acceptance.
+async fn accept_responses_fixture_socket(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let mut prefix = [0; 32];
+        let n = loop {
+            let n = tcp.peek(&mut prefix).await.unwrap();
+            if n == 0 || n >= 15 {
+                break n;
+            }
+            tokio::task::yield_now().await;
+        };
+        if !prefix[..n].starts_with(b"GET /v1/models ") {
+            return tcp;
+        }
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(tcp.read_u8().await.unwrap());
+        }
+        tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
+    }
+}
+
+async fn bare_invalid_request_public_case(
+    persistent: bool,
+    http_rejects: bool,
+    response_started: bool,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _env_lock = jcode_base::storage::lock_test_env();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
+    let _compression = EnvVarGuard::set("JCODE_REQUEST_COMPRESSION", "off");
+    let messages = vec![
+        ChatMessage::user("original"),
+        assistant_tool_use("call_callback_fixture", "read", serde_json::json!({"file_path":"fixture.txt"})),
+        ChatMessage::tool_result("call_callback_fixture", "already executed result", false),
+    ];
+    let full_input = build_responses_input(&messages);
+    let expected_input = full_input.clone();
+    let mut server = tokio::spawn(async move {
+        let tcp = accept_responses_fixture_socket(&listener).await;
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let first: Value = serde_json::from_str(
+            ws.next().await.unwrap().unwrap().to_text().unwrap(),
+        ).unwrap();
+        assert_eq!(first.get("previous_response_id").is_some(), persistent);
+        if response_started {
+            ws.send(WsMessage::Text(
+                serde_json::json!({"type":"response.created","response":{"id":"resp_accepted"}}).to_string(),
+            )).await.unwrap();
+        }
+        ws.send(WsMessage::Text(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request"}}"#.into(),
+        )).await.unwrap();
+        while ws.next().await.is_some_and(|frame| frame.is_ok()) {}
+
+        if response_started {
+            assert!(tokio::time::timeout(Duration::from_millis(150), accept_responses_fixture_socket(&listener)).await.is_err(), "accepted responses must not be replayed for an opaque invalid request");
+            return;
+        }
+
+        let mut tcp = accept_responses_fixture_socket(&listener).await;
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 4096];
+            let n = tcp.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "HTTP request closed before headers");
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        assert!(headers.starts_with("POST /v1/responses HTTP/1.1"), "{headers}");
+        let length: usize = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+        }).unwrap();
+        while bytes.len() < header_end + length {
+            let mut chunk = [0; 4096];
+            let n = tcp.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "HTTP request closed before body");
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        let replay: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+        assert!(replay.get("previous_response_id").is_none());
+        assert_eq!(replay["input"], serde_json::json!(expected_input));
+        assert_eq!(replay["model"], first["model"]);
+        assert_eq!(replay["tools"], first["tools"]);
+        assert_eq!(replay["instructions"], first["instructions"]);
+        let (status, content_type, body) = if http_rejects {
+            ("400 Bad Request", "application/json", r#"{"error":{"type":"invalid_request_error","message":"Invalid request"}}"#.to_string())
+        } else {
+            let events = [
+                serde_json::json!({"type":"response.created","response":{"id":"resp_recovered"}}),
+                serde_json::json!({"type":"response.output_text.delta","delta":"recovered"}),
+                serde_json::json!({"type":"response.completed","response":{"id":"resp_recovered","status":"completed","output":[]}}),
+            ];
+            ("200 OK", "text/event-stream", events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>())
+        };
+        tcp.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        tcp.shutdown().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(150), accept_responses_fixture_socket(&listener)).await.is_err(), "must not loop on rejected HTTP input");
+    });
+    let provider = OpenAIProvider::new(prewarm_test_credentials());
+    *provider.credentials.write().await = prewarm_test_credentials();
+    provider.set_model("gpt-5.6-sol").unwrap();
+    provider.set_transport("websocket").unwrap();
+    if persistent {
+        let (ws_stream, _) = connect_ws(format!("ws://{addr}/v1/responses")).await.unwrap();
+        *provider.persistent_ws.lock().await = Some(PersistentWsState {
+            ws_stream,
+            identity: openai_websocket_prewarm::prewarm_identity(&prewarm_test_credentials(), None, None),
+            cache_key: Some(provider.cache_routing_key()),
+            last_response_id: "resp_stale".into(),
+            connected_at: Instant::now(),
+            last_activity_at: Instant::now(),
+            last_response_completed_at: Instant::now(),
+            message_count: 1,
+            last_input_item_count: 1,
+            last_response_output: Vec::new(),
+            last_input_item_hashes: persistent_ws_input_item_hashes(&full_input[..1]),
+        });
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = provider.complete(&messages, &[], "fixture", None).await.unwrap();
+        let mut text = String::new();
+        let mut errors = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
+                Ok(StreamEvent::Error { message, .. }) => errors.push(message),
+                Err(error) => errors.push(error.to_string()),
+                _ => {}
+            }
+        }
+        if http_rejects || response_started {
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(text.is_empty());
+        } else {
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(text, "recovered");
+        }
+        assert!(provider.persistent_ws.lock().await.is_none());
+        (&mut server).await.unwrap();
+    }).await;
+    server.abort();
+    assert!(outcome.is_ok(), "bare invalid request did not finish bounded recovery");
+}
+
+#[tokio::test]
+async fn persistent_bare_invalid_request_recovers_via_http() {
+    bare_invalid_request_public_case(true, false, false).await;
+}
+
+#[tokio::test]
+async fn fresh_bare_invalid_request_recovers_via_http() {
+    bare_invalid_request_public_case(false, false, false).await;
+}
+
+#[tokio::test]
+async fn bare_invalid_request_http_rejection_is_not_retried() {
+    bare_invalid_request_public_case(true, true, false).await;
+}
+
+#[tokio::test]
+async fn persistent_bare_invalid_request_after_acceptance_is_terminal() {
+    bare_invalid_request_public_case(true, false, true).await;
+}
+
+#[tokio::test]
+async fn fresh_bare_invalid_request_after_acceptance_is_terminal() {
+    bare_invalid_request_public_case(false, false, true).await;
+}

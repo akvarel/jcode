@@ -46,6 +46,51 @@ work. A warmup miss is not treated as a failure. There is no guaranteed speedup
 from the version header alone, and sending fewer bytes does not make earlier
 context free of token charges.
 
+## Opaque request rejection recovery
+
+A WebSocket can return the bare error `invalid_request_error: Invalid request`
+before `response.created` or any response activity, even on a fresh connection.
+Jcode discards that failed socket and falls back to HTTP with the full normalized
+input, without `previous_response_id`. This does not execute tools again or
+change the model, tools, instructions, account, or persistent transport setting.
+For a rejected continuation, the fallback skips another WebSocket attempt.
+
+This recovery is deliberately narrow: it only handles an `error` frame with
+`type: invalid_request_error`, exactly `message: Invalid request`, and no specific
+error code, parameter, or associated response. Once response activity has begun,
+the same error remains terminal. Schema, authentication, usage-limit, and other
+specific validation errors retain their existing behavior. A non-retryable HTTP
+400 is surfaced once rather than looping on the same rejected input.
+
+Lifecycle logs identify continuation recovery with
+`persistent_reuse_fallback_to_https` and reason `unaccepted_invalid_request`.
+Fresh-socket recovery uses the existing `fallback_to_https` lifecycle event.
+The remote cause of a bare rejection is not inferred from the error message.
+
+Run the focused loopback and classifier regressions with:
+
+```bash
+cargo test -p jcode-provider-openai-runtime bare_invalid_request -- --test-threads=1
+```
+
+These tests exercise the public provider stream over local WebSocket and HTTP
+servers. They do not claim live OpenAI incident reproduction or activation in an
+already running daemon.
+
+Validation on 2026-11-12: the three initial public-stream regressions failed
+before the fix and passed afterward. All six recovery/classification regressions
+pass, including both post-acceptance non-replay cases. The relocated service-tier
+metadata regression also passes.
+
+The broader command
+`cargo test -p jcode-provider-openai-runtime -p jcode-provider-openai -- --test-threads=1`
+passes all 51 request tests. Runtime results are 198 passed, seven failed, and
+three ignored. Running the same command against unchanged `712eb30ff` gives 192
+passed, the identical seven failures, and three ignored. Those existing failures
+cover account-store fixture permissions (four tests), service-tier discovery,
+strict tool-schema normalization, and prewarm nested-runtime handling. They are
+not suppressed or rebaselined by this recovery change.
+
 ## Controls and diagnostics
 
 ```toml

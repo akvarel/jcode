@@ -44,33 +44,6 @@ fn bind_requested_service_tier(event: &mut StreamEvent, request_tier: &Option<St
     }
 }
 
-#[test]
-fn service_tier_metadata_uses_serialized_request_not_later_preference() {
-    let request = serde_json::json!({"service_tier": "priority"});
-    let requested = request
-        .get("service_tier")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let mut event = StreamEvent::ServiceTier {
-        tier: "default".into(),
-        requested: None,
-    };
-    bind_requested_service_tier(&mut event, &requested);
-    assert!(
-        matches!(event, StreamEvent::ServiceTier { requested: Some(ref tier), .. } if tier == "priority")
-    );
-    // An omitted request field must stay omitted, even if a preference has
-    // changed to Ultrafast while the network request was in flight.
-    bind_requested_service_tier(&mut event, &None);
-    assert!(matches!(
-        event,
-        StreamEvent::ServiceTier {
-            requested: None,
-            ..
-        }
-    ));
-}
-
 #[path = "openai_usage_recording.rs"]
 mod openai_usage_recording;
 use openai_usage_recording::OAuthUsageRecorder;
@@ -649,14 +622,10 @@ pub(super) fn is_ws_upgrade_required(err: &WsError) -> bool {
     }
 }
 
-/// Result of trying to continue on a persistent WebSocket connection
-pub(super) enum PersistentWsResult {
-    Success,
-    /// A terminal API error was forwarded to the consumer. Do not replay it.
-    TerminalError,
-    NotAvailable,
-    Failed(String),
-}
+#[path = "openai_ws_rejection.rs"]
+mod openai_ws_rejection;
+pub(super) use openai_ws_rejection::PersistentWsResult;
+use openai_ws_rejection::is_unaccepted_ws_invalid_request;
 
 /// Try to continue a conversation on an existing persistent WebSocket connection
 /// using `previous_response_id` to send only incremental input.
@@ -687,7 +656,9 @@ pub(super) async fn try_persistent_ws_continuation(
     // and can later erase a replacement connection belonging to another turn.
     if matches!(
         result,
-        PersistentWsResult::Failed(_) | PersistentWsResult::TerminalError
+        PersistentWsResult::Failed(_)
+            | PersistentWsResult::TerminalError
+            | PersistentWsResult::FallbackToHttps(_)
     ) {
         log_openai_stream_lifecycle(
             jcode_base::logging::LogLevel::Warn,
@@ -1255,6 +1226,14 @@ async fn continue_persistent_ws_locked(
                 if is_websocket_fallback_notice(&text) {
                     return PersistentWsResult::Failed("server requested fallback".to_string());
                 }
+                if is_unaccepted_ws_invalid_request(
+                    &text,
+                    new_response_id.is_some() || saw_api_activity,
+                ) {
+                    return PersistentWsResult::FallbackToHttps(
+                        "WebSocket rejected an unaccepted request: invalid_request_error: Invalid request".to_string(),
+                    );
+                }
 
                 let mut made_api_activity = if saw_api_activity {
                     is_websocket_activity_payload(&text)
@@ -1763,6 +1742,14 @@ async fn stream_response_websocket_authenticated(
                         return Err(OpenAIStreamFailure::FallbackToHttps(anyhow::anyhow!(
                             "{} reported by websocket stream",
                             WEBSOCKET_FALLBACK_NOTICE
+                        )));
+                    }
+                    if is_unaccepted_ws_invalid_request(
+                        &text,
+                        response_id.is_some() || saw_api_activity,
+                    ) {
+                        return Err(OpenAIStreamFailure::FallbackToHttps(anyhow::anyhow!(
+                            "WebSocket rejected an unaccepted request: invalid_request_error: Invalid request"
                         )));
                     }
 
