@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn rotation_cycles_after_current_and_skips_excluded() {
-        let pool = AccountPool {
+        let mut pool = AccountPool {
             members: vec![],
             excluded: vec!["openai:openai-fox".into()],
             ..Default::default()
@@ -746,6 +746,10 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
+        // Saved subscription metadata must not change this same-tier fixture.
+        for label in &labels {
+            pool.set_priority(&account_key("openai", Some(label)), 0);
+        }
         assert_eq!(
             pool.rotation("openai", Some("openai-panda"), &labels),
             ["openai-wolf", "openai-otter"]

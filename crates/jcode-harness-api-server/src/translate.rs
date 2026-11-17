@@ -1517,8 +1517,8 @@ impl BridgeState {
                 vec![]
             }
             "turn_event" => {
-                if !self.turn_fence.accepts(&event["identity"])
-                    && !(event["event"]["type"] == "interrupted"
+                if !(self.turn_fence.accepts(&event["identity"])
+                    || event["event"]["type"] == "interrupted"
                         && self.turn_fence.is_latest(&event["identity"]))
                 {
                     return vec![];

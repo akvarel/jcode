@@ -549,8 +549,9 @@ fn schema_advertises_intent_and_todos() {
     // their actionable guidance without requiring the legacy long rubric.
     for required_concept in [
         "Understand the user's intent better",
-        "Try to avoid asking the user",
-        "Make sure the todo is up to date",
+        "Build a requirement inventory",
+        "Do not ask the user",
+        "Update the todo",
     ] {
         assert!(
             crate::todo::TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE.contains(required_concept),
@@ -568,8 +569,9 @@ fn schema_advertises_intent_and_todos() {
     );
     for required_concept in [
         "Your feedback loop isn't good enough",
-        "Think about what feedback loops you need",
-        "Make sure the todo is up to date",
+        "Think about a loop that reports back on each requirement",
+        "Add checks for non-testable requirements",
+        "Update the todo",
     ] {
         assert!(
             crate::todo::TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE.contains(required_concept),

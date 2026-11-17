@@ -5,6 +5,7 @@ use std::time::Instant;
 
 #[derive(Default)]
 struct RemoteAccounts {
+    enabled: bool,
     generation: u64,
     received: Option<Instant>,
     anthropic: Vec<jcode_protocol::AccountUsageSnapshot>,
@@ -12,6 +13,9 @@ struct RemoteAccounts {
 }
 
 static REMOTE: OnceLock<Mutex<RemoteAccounts>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) use tests::TestRemoteUsageGuard;
 
 fn try_remote_lock(
     mutex: &Mutex<RemoteAccounts>,
@@ -31,6 +35,7 @@ pub fn clear_remote_account_usage() -> u64 {
     if let Ok(mut state) = REMOTE.get_or_init(Mutex::default).lock() {
         let generation = state.generation.wrapping_add(1);
         *state = RemoteAccounts {
+            enabled: true,
             generation,
             ..Default::default()
         };
@@ -74,6 +79,7 @@ pub(super) fn set_remote_account_usage_with_age(
 ) {
     if let Ok(mut state) = REMOTE.get_or_init(Mutex::default).lock() {
         *state = RemoteAccounts {
+            enabled: true,
             generation: state.generation.wrapping_add(1),
             received: Instant::now().checked_sub(age),
             anthropic,
@@ -105,6 +111,7 @@ impl RemoteAccounts {
         if self.generation != generation || self.received.is_some() {
             return false;
         }
+        self.enabled = true;
         self.received = Instant::now().checked_sub(age);
         self.anthropic = anthropic;
         self.openai = openai;
@@ -144,7 +151,9 @@ pub(super) fn cached(
     let Ok(state) = remote.try_lock() else {
         return Some(None);
     };
-    Some(state.lookup(provider, label, Instant::now()))
+    state
+        .enabled
+        .then(|| state.lookup(provider, label, Instant::now()))
 }
 
 impl RemoteAccounts {
@@ -205,6 +214,36 @@ pub fn remote_account_banked_resets(
 mod tests {
     use super::*;
 
+    /// Restore the exact prior mode after a test that enables daemon-only reads.
+    pub(crate) struct TestRemoteUsageGuard(RemoteAccounts);
+
+    impl TestRemoteUsageGuard {
+        pub(crate) fn new() -> Self {
+            Self(std::mem::take(
+                &mut *REMOTE.get_or_init(Mutex::default).lock().unwrap(),
+            ))
+        }
+    }
+
+    impl Drop for TestRemoteUsageGuard {
+        fn drop(&mut self) {
+            *REMOTE.get_or_init(Mutex::default).lock().unwrap() = std::mem::take(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn inspecting_generation_does_not_enable_remote_mode() {
+        let _guard = crate::storage::lock_test_env();
+        let _restore = TestRemoteUsageGuard::new();
+        remote_account_usage_generation();
+        assert!(cached(MultiAccountProviderKind::OpenAI, "local").is_none());
+        clear_remote_account_usage();
+        assert!(matches!(
+            cached(MultiAccountProviderKind::OpenAI, "local"),
+            Some(None)
+        ));
+    }
+
     #[test]
     fn delayed_snapshot_cannot_overwrite_live_or_reconnected_usage() {
         let mut state = RemoteAccounts {
@@ -227,6 +266,8 @@ mod tests {
 
     #[test]
     fn connection_reset_is_not_an_empty_authoritative_response() {
+        let _guard = crate::storage::lock_test_env();
+        let _restore = TestRemoteUsageGuard::new();
         clear_remote_account_usage();
         assert!(!remote_account_usage_received());
         assert!(matches!(

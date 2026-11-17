@@ -3031,7 +3031,7 @@ mod bedrock_placeholder_default_tests {
         let routes = vec![
             route(bedrock::BedrockProvider::PLACEHOLDER_DEFAULT_MODEL, true),
             route("anthropic.claude-sonnet-4-20250514-v1:0", true),
-            route("us.anthropic.claude-opus-6-v1", true),
+            route("us.anthropic.claude-opus-5-v1", true),
             route("amazon.nova-pro-v1:0", true),
         ];
         assert_eq!(
@@ -3092,7 +3092,7 @@ mod bedrock_placeholder_default_tests {
                 "models": [
                     "anthropic.claude-3-5-sonnet-20241022-v2:0",
                     "anthropic.claude-sonnet-4-20250514-v1:0",
-                    "anthropic.claude-opus-6-v1:0",
+                    "anthropic.claude-opus-5-v1:0",
                 ],
                 "inference_profiles": [],
                 "region": null,

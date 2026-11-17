@@ -69,9 +69,9 @@ pub(in crate::tui::app) fn handle_server_event(
             let paced_replay = matches!(&*event, ServerEvent::Done { .. })
                 && app.deferred_stream_done_identity.as_ref() == Some(&identity)
                 && app.remote_turn_fence.is_latest(&identity);
-            if !app.remote_turn_fence.accepts(&identity)
-                && !paced_replay
-                && !(matches!(&*event, ServerEvent::Interrupted)
+            if !(app.remote_turn_fence.accepts(&identity)
+                || paced_replay
+                || matches!(&*event, ServerEvent::Interrupted)
                     && app.remote_turn_fence.is_latest(&identity))
             {
                 return false;

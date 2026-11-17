@@ -57,14 +57,6 @@ impl Provider for AccountRoutingStreamProvider {
 
 struct AccountRoutingFixtureCleanup;
 
-struct RemoteQuotaCleanup;
-
-impl Drop for RemoteQuotaCleanup {
-    fn drop(&mut self) {
-        crate::usage::clear_remote_account_usage();
-    }
-}
-
 fn exhausted_account_snapshot(label: &str) -> jcode_protocol::AccountUsageSnapshot {
     serde_json::from_value(serde_json::json!({
         "label": label,
@@ -81,7 +73,7 @@ fn account_router_skips_known_exhausted_alternates_without_runtime_errors() {
         let runtime = enter_test_runtime();
         let _guard = runtime.enter();
         let (provider, _, _cleanup) = account_routing_fixture(&[]);
-        let _quota_cleanup = RemoteQuotaCleanup;
+        let _quota_cleanup = crate::usage::TestRemoteUsageGuard::new();
         crate::usage::set_remote_account_usage(
             vec![],
             vec![exhausted_account_snapshot("openai-fox")],
@@ -101,7 +93,7 @@ fn bound_account_router_checks_known_quota_before_sending_in_both_modes() {
             for split in [false, true] {
                 let (provider, attempts, _cleanup) = account_routing_fixture(&[]);
                 bind_fixture_account(&provider, &attempts, "openai-otter", &[]);
-                let _quota_cleanup = RemoteQuotaCleanup;
+                let _quota_cleanup = crate::usage::TestRemoteUsageGuard::new();
                 crate::usage::set_remote_account_usage(
                     vec![],
                     vec![exhausted_account_snapshot("openai-otter")],

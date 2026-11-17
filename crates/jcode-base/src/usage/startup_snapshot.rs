@@ -240,7 +240,7 @@ fn read_snapshot(socket: &Path, path: &Path) -> Option<(Snapshot, Duration)> {
 fn discard_expired_windows(accounts: &mut [AccountUsageSnapshot], now_ms: u64) {
     for account in accounts {
         account.additional_windows.retain(|window| {
-            !window
+            window
                 .resets_at
                 .as_deref()
                 .and_then(|reset| match chrono::DateTime::parse_from_rfc3339(reset) {
@@ -252,7 +252,7 @@ fn discard_expired_windows(accounts: &mut [AccountUsageSnapshot], now_ms: u64) {
                         None
                     }
                 })
-                .is_some_and(|reset| i128::from(reset.timestamp_millis()) <= i128::from(now_ms))
+                .is_none_or(|reset| i128::from(reset.timestamp_millis()) > i128::from(now_ms))
         });
         let expired = account
             .resets_at

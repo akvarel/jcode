@@ -519,7 +519,7 @@ fn validate_membership(fields: &serde_json::Map<String, Value>) -> Result<()> {
                 {
                     bail!("phase must be a positive integer");
                 }
-            } else if !value.as_str().is_some_and(|lane| !lane.trim().is_empty()) {
+            } else if value.as_str().is_none_or(|lane| lane.trim().is_empty()) {
                 bail!("lane must be a nonempty string");
             }
         }

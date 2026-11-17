@@ -2,6 +2,24 @@
 use super::*;
 
 #[test]
+fn bedrock_current_flagship_can_advance_to_a_newer_catalog_route() {
+    let routes = vec![ModelRoute {
+        model: "us.anthropic.claude-opus-6-v1".into(),
+        provider: "AWS Bedrock".into(),
+        api_method: "bedrock".into(),
+        available: true,
+        detail: String::new(),
+        usage: None,
+        cheapness: None,
+    }];
+    assert_eq!(
+        bedrock_promoted_default(bedrock::BedrockProvider::PLACEHOLDER_DEFAULT_MODEL, &routes)
+            .as_deref(),
+        Some("us.anthropic.claude-opus-6-v1")
+    );
+}
+
+#[test]
 fn catalog_refresh_reaches_every_runtime_slot_and_compatible_profile() {
     #[derive(Clone, Default)]
     struct CatalogProbe {

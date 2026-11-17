@@ -733,12 +733,12 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
     // the body now; no separate retained/collapsing trace section exists.
     let reasoning_prepared = Arc::new(empty_prepared_messages());
     let has_streaming = app.is_processing() && !app.streaming_text().is_empty();
-    let stream_prefix_blank = has_streaming
-        && !(crate::config::config().display.compact_thinking
-            && super::messages::starts_with_reasoning(app.streaming_text()))
-        && (!body_prepared.wrapped_lines.is_empty()
-            || !batch_progress_prepared.wrapped_lines.is_empty()
-            || !reasoning_prepared.wrapped_lines.is_empty());
+    let stream_prefix_blank = !(!has_streaming
+        || crate::config::config().display.compact_thinking
+            && super::messages::starts_with_reasoning(app.streaming_text())
+        || body_prepared.wrapped_lines.is_empty()
+            && batch_progress_prepared.wrapped_lines.is_empty()
+            && reasoning_prepared.wrapped_lines.is_empty());
     let streaming_prepared = if has_streaming {
         Arc::new(prepare_streaming_cached(app, width, stream_prefix_blank))
     } else {

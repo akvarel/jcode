@@ -494,9 +494,9 @@ pub(super) async fn dispatch_due_remote_retry(
     app: &mut App,
     remote: &mut RemoteConnection,
 ) -> bool {
-    if !app
+    if app
         .rate_limit_reset
-        .is_some_and(|deadline| Instant::now() >= deadline)
+        .is_none_or(|deadline| Instant::now() < deadline)
     {
         return false;
     }

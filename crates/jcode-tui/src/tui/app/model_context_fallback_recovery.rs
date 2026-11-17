@@ -266,10 +266,10 @@ impl App {
                 });
                 // One line for the cause, one line for the switch. Nothing else.
                 // Callers that already printed the provider error skip the cause.
-                if !self
+                if self
                     .display_messages
                     .last()
-                    .is_some_and(|message| message.role == "error")
+                    .is_none_or(|message| message.role != "error")
                 {
                     self.push_display_message(DisplayMessage::error(format!(
                         "{}: {}",
