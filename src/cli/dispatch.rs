@@ -21,56 +21,9 @@ use super::{
 };
 use provider_init::ProviderChoice;
 
-#[cfg(any(target_os = "linux", test))]
-fn is_file_controlled_debug_client() -> bool {
-    std::env::var_os("JCODE_DEBUG_CMD_PATH").is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn is_orphan_adopter_name(name: &str) -> bool {
-    matches!(name.trim(), "init" | "systemd")
-}
-
-#[cfg(target_os = "linux")]
-fn parent_is_orphan_adopter(parent_pid: libc::pid_t) -> bool {
-    if parent_pid <= 1 {
-        return true;
-    }
-    std::fs::read_to_string(format!("/proc/{parent_pid}/comm"))
-        .is_ok_and(|name| is_orphan_adopter_name(&name))
-}
-
-/// Tie file-controlled debug clients to the process that launched them.
-///
-/// These clients are automation helpers, not user-owned terminals. Without a
-/// parent-death signal they are reparented to init when a verification script
-/// or debug server exits, retaining a full TUI and session history indefinitely.
-#[cfg(target_os = "linux")]
-fn arm_debug_client_parent_death_signal() {
-    if !is_file_controlled_debug_client() {
-        return;
-    }
-
-    // Capture the parent first, then check it again after prctl. This closes the
-    // race where the launcher exits immediately before the signal is armed.
-    // Safety: getppid has no preconditions and does not dereference pointers.
-    let parent_pid = unsafe { libc::getppid() };
-    // Safety: PR_SET_PDEATHSIG accepts a signal number as its scalar argument.
-    let armed = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } == 0;
-    // Safety: getppid has no preconditions and does not dereference pointers.
-    let current_parent_pid = unsafe { libc::getppid() };
-    if armed
-        && (parent_is_orphan_adopter(parent_pid)
-            || current_parent_pid != parent_pid
-            || parent_is_orphan_adopter(current_parent_pid))
-    {
-        std::process::exit(0);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn arm_debug_client_parent_death_signal() {}
-
+#[path = "dispatch_debug_parent.rs"]
+mod debug_parent;
+use debug_parent::*;
 pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     arm_debug_client_parent_death_signal();
     if args.ssh.is_some() {
@@ -277,6 +230,10 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                     println!("Jcode server is running.");
                 }
             }
+            ServerCommand::ExecWorker => {
+                crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
+                crate::tool::remote_exec::run_worker_stdio().await?;
+            }
             ServerCommand::Keepalive => {
                 run_server_keepalive(
                     &args.provider,
@@ -327,6 +284,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             flow_id,
             cancel,
             no_validate,
+            device_code,
             google,
             api_base,
             api_key,
@@ -342,6 +300,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 flow_id,
                 cancel,
                 no_validate,
+                device_code,
                 openai_compatible_api_base: api_base,
                 openai_compatible_api_key: api_key,
                 openai_compatible_api_key_env: api_key_env,
@@ -364,6 +323,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             super::args::AccountCommand::Manage => account::run_manage()?,
             super::args::AccountCommand::Logout => account::run_logout().await?,
         },
+        Some(Command::Mobile { action }) => account::run_mobile(action).await?,
         Some(Command::Repl) => {
             let (provider, registry) =
                 provider_init::init_provider_and_registry(&args.provider, args.model.as_deref())
@@ -371,8 +331,8 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             let mut agent = agent::Agent::new(provider, registry);
             agent.repl().await?;
         }
-        Some(Command::Update) => {
-            hot_exec::run_update()?;
+        Some(Command::Update { channel }) => {
+            hot_exec::run_update(channel.as_deref())?;
         }
         Some(Command::Version { json }) => {
             commands::run_version_command(json)?;
@@ -486,8 +446,29 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         }) => {
             commands::run_transcript_command(text, map_transcript_mode(mode), session).await?;
         }
-        Some(Command::Companion { status, no_voice }) => {
-            commands::run_companion_command(status, no_voice).await?;
+        Some(Command::Companion {
+            status,
+            no_voice,
+            no_voice_waveform,
+            no_voice_notifications,
+            no_open,
+            no_spawn_terminal,
+            no_lid,
+            no_browser_updates,
+        }) => {
+            commands::run_companion_command(
+                status,
+                commands::CompanionFlags {
+                    no_voice,
+                    no_voice_waveform,
+                    no_voice_notifications,
+                    no_open,
+                    no_spawn_terminal,
+                    no_lid,
+                    no_browser_updates,
+                },
+            )
+            .await?;
         }
         Some(Command::Dictate { r#type }) => {
             commands::run_dictate_command(r#type).await?;
@@ -666,31 +647,11 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
 /// Anthropic Messages runtime with the profile's base URL and auth, while
 /// `AnthropicApi` would pin an Anthropic API-key credential the profile may
 /// not have (e.g. `auth = "none"`).
-fn provider_choice_for_named_profile(profile_name: &str) -> ProviderChoice {
-    // Same source as `apply_named_provider_profile_env`, which already
-    // validated that the profile exists.
-    match crate::config::Config::load_strict() {
-        Ok(config) => provider_choice_for_named_profile_in(profile_name, &config),
-        Err(_) => provider_choice_for_named_profile_in(profile_name, crate::config::config()),
-    }
-}
-
-fn provider_choice_for_named_profile_in(
-    profile_name: &str,
-    config: &crate::config::Config,
-) -> ProviderChoice {
-    match config.providers.get(profile_name) {
-        Some(profile)
-            if matches!(
-                profile.provider_type,
-                crate::config::NamedProviderType::AnthropicCompatible
-            ) =>
-        {
-            ProviderChoice::Auto
-        }
-        _ => ProviderChoice::OpenaiCompatible,
-    }
-}
+#[path = "dispatch/named_profiles.rs"]
+mod named_profiles;
+use named_profiles::provider_choice_for_named_profile;
+#[cfg(test)]
+use named_profiles::provider_choice_for_named_profile_in;
 
 fn auth_doctor_provider_arg<'a>(
     positional_provider: Option<&'a str>,

@@ -1,26 +1,39 @@
 use super::*;
 use crate::bus::{BackgroundTaskProgressSource, BackgroundTaskStatus};
 use crate::tool::StdinInputRequest;
-use crate::tool::bash::{BashTool, parse_heuristic_progress};
+use crate::tool::bash::{
+    BashTool, ProgressLineUpdate, parse_heuristic_progress, parse_progress_line,
+};
 use serde_json::json;
 use tokio::sync::mpsc;
+
+type SessionEnvLaunchGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+static SESSION_ENV_LAUNCH_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SessionEnvLaunchGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub(super) async fn wait_for_session_env_launch_gate(session_id: &str) {
+    let gate = SESSION_ENV_LAUNCH_GATES.lock().unwrap().remove(session_id);
+    if let Some((reached, release)) = gate {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}
+
+#[path = "bash_tests/session_environment.rs"]
+mod session_environment;
 
 #[cfg(not(windows))]
 #[test]
 fn bash_definition_prefers_repository_search_tools() {
     let definition = BashTool::new().to_definition();
     assert_eq!(definition.name, "bash");
-    assert!(
-        definition
-            .description
-            .contains("prefer agentgrep or rg over grep -r")
-    );
-    let command_help = definition.input_schema["properties"]["command"]["description"]
-        .as_str()
-        .expect("command description");
-    assert!(command_help.contains("skips hidden/ignored files"));
-    assert!(command_help.contains("--hidden --no-ignore"));
-    assert!(command_help.contains("$JCODE_SCRATCH_DIR"));
+    assert!(definition.description.contains("Prefer agentgrep/rg"));
+    assert!(definition.description.contains("hidden/ignored"));
+    assert!(definition.description.contains("--hidden --no-ignore"));
 }
 
 #[test]
@@ -95,10 +108,13 @@ async fn bash_executes_with_null_optional_arguments() {
 
 #[test]
 fn repository_commands_export_a_logged_cargo_function() {
-    let repo =
-        crate::build::find_repo_in_ancestors(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("test runs inside the jcode repository");
-    let wrapped = wrap_repo_cargo_commands("cargo test -p demo && echo done", Some(&repo))
+    let fixture = tempfile::tempdir().expect("repo fixture");
+    let repo = fixture.path();
+    std::fs::create_dir(repo.join(".git")).expect("git marker");
+    std::fs::create_dir(repo.join("scripts")).expect("scripts directory");
+    std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"jcode\"\n").expect("manifest");
+    std::fs::write(repo.join("scripts/dev_cargo.sh"), "#!/bin/sh\n").expect("wrapper");
+    let wrapped = wrap_repo_cargo_commands("cargo test -p demo && echo done", Some(repo))
         .expect("jcode repository has dev_cargo.sh");
 
     assert!(wrapped.contains("export JCODE_DEV_CARGO_SCRIPT="));
@@ -154,6 +170,110 @@ fn make_ctx(stdin_tx: Option<mpsc::UnboundedSender<StdinInputRequest>>) -> ToolC
     }
 }
 
+#[test]
+fn cloud_environment_hydrates_commands_without_transcript_values() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir(repo.join("subdir")).unwrap();
+    let original_home = std::env::var_os("JCODE_HOME");
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(original_home);
+    crate::env::set_var("JCODE_HOME", &state);
+    let name = "CLOUD_TEST_RESOURCE_TOKEN";
+    let secret = "opaque-sentinel-do-not-return";
+    let original_value = std::env::var_os(name);
+    crate::cloud_environment::save_environment(&repo, name, secret).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for persistent in [false, true] {
+            let mut ctx = make_ctx(None);
+            ctx.working_dir = Some(repo.join("subdir"));
+            if persistent {
+                ctx.execution_mode = crate::tool::ToolExecutionMode::AgentTurn;
+                ctx.graceful_shutdown_signal = Some(jcode_agent_runtime::InterruptSignal::new());
+            }
+            let result = BashTool::new().execute(json!({
+                "command": "test \"${CLOUD_TEST_RESOURCE_TOKEN:+present}\" = present && printf resource-ready"
+            }), ctx).await.unwrap();
+            assert_eq!(result.output.lines().next(), Some("resource-ready"));
+            assert!(!result.output.contains(secret));
+        }
+        let mut ctx = make_ctx(None);
+        ctx.working_dir = Some(repo.join("subdir"));
+        let result = BashTool::new().execute(json!({
+            "command": "test \"${CLOUD_TEST_RESOURCE_TOKEN:+present}\" = present && printf resource-ready",
+            "run_in_background": true,
+            "notify": false,
+            "wake": false
+        }), ctx).await.unwrap();
+        let id = result.metadata.as_ref().unwrap()["task_id"].as_str().unwrap();
+        let mut completed = false;
+        for _ in 0..100 {
+            if let Some(status) = crate::background::global().status(id).await
+                && status.status != BackgroundTaskStatus::Running
+            {
+                assert_eq!(status.status, BackgroundTaskStatus::Completed);
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(completed, "background command did not finish");
+        let output = crate::background::global().output(id).await.unwrap();
+        assert!(output.contains("resource-ready"));
+        assert!(!output.contains(secret));
+    });
+    assert_eq!(
+        std::env::var_os(name),
+        original_value,
+        "daemon environment must not change"
+    );
+}
+
+#[tokio::test]
+async fn background_handoff_names_reason_task_and_productive_wait_without_bg_tutorial() {
+    let result = BashTool::new()
+        .execute(
+            json!({"command": "printf done", "run_in_background": true, "wake": true}),
+            make_ctx(None),
+        )
+        .await
+        .expect("background command should start");
+    assert!(
+        result
+            .output
+            .contains("Command started in background as requested.")
+    );
+    assert!(result.output.contains(BACKGROUND_WAIT_GUIDANCE));
+    assert!(
+        result
+            .output
+            .contains("The agent will be woken when the task completes.")
+    );
+    assert!(!result.output.contains("action=\"wait\""));
+    assert!(!result.output.contains("To check progress"));
+    let metadata = result.metadata.expect("background metadata");
+    let id = metadata["task_id"].as_str().expect("task id");
+    assert!(result.output.contains(&format!("Task ID: {id}")));
+    crate::background::global()
+        .wait(id, Duration::from_secs(5), false)
+        .await;
+}
+
 fn make_agent_ctx(signal: jcode_agent_runtime::InterruptSignal) -> ToolContext {
     ToolContext {
         session_id: "test-session".to_string(),
@@ -186,94 +306,33 @@ async fn test_basic_command_with_unused_stdin_channel() {
 }
 
 #[tokio::test]
-async fn test_stdin_forwarding_single_line() {
+async fn test_stdin_reader_gets_eof_immediately() {
     let (tx, mut rx) = mpsc::unbounded_channel::<StdinInputRequest>();
     let tool = BashTool::new();
 
-    // "head -n1" reads one line from stdin and prints it
-    let input = json!({"command": "head -n1", "timeout": 10000});
+    // Commands are non-interactive: a stdin reader sees EOF right away, and no
+    // input request is ever raised.
+    let input =
+        json!({"command": "if read -r line; then echo got; else echo eof_ok; fi", "timeout": 5000});
     let ctx = make_ctx(Some(tx));
-
-    // Spawn the tool execution
-    let tool_handle = tokio::spawn(async move { tool.execute(input, ctx).await });
-
-    // Wait for the stdin request to arrive
-    let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timed out waiting for stdin request")
-        .expect("channel closed");
-
-    assert!(req.request_id.starts_with("stdin-test-call-"));
-    assert!(!req.is_password);
-
-    // Send the response
-    req.response_tx.send("test_input_line".to_string()).unwrap();
-
-    // Wait for tool to finish
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), tool_handle)
-        .await
-        .expect("tool timed out")
-        .expect("tool panicked")
-        .expect("tool errored");
-
-    assert!(
-        result.output.contains("test_input_line"),
-        "output should contain the input we sent: {}",
-        result.output
-    );
+    let started = std::time::Instant::now();
+    let result = tool.execute(input, ctx).await.unwrap();
+    assert!(result.output.contains("eof_ok"), "{}", result.output);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(rx.try_recv().is_err(), "no stdin request should be raised");
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn test_stdin_forwarding_multiple_lines() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<StdinInputRequest>();
+async fn test_command_has_no_controlling_tty_and_no_prompt_env() {
     let tool = BashTool::new();
-
-    // "head -n2" reads two lines
-    let input = json!({"command": "head -n2", "timeout": 15000});
-    let ctx = make_ctx(Some(tx));
-
-    let tool_handle = tokio::spawn(async move { tool.execute(input, ctx).await });
-
-    // First line
-    let req1 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timed out waiting for first stdin request")
-        .expect("channel closed");
-    assert!(
-        req1.request_id.ends_with("-1"),
-        "first request should end with -1: {}",
-        req1.request_id
-    );
-    req1.response_tx.send("line_one".to_string()).unwrap();
-
-    // Second line
-    let req2 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timed out waiting for second stdin request")
-        .expect("channel closed");
-    assert!(
-        req2.request_id.ends_with("-2"),
-        "second request should end with -2: {}",
-        req2.request_id
-    );
-    req2.response_tx.send("line_two".to_string()).unwrap();
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), tool_handle)
-        .await
-        .expect("tool timed out")
-        .expect("tool panicked")
-        .expect("tool errored");
-
-    assert!(
-        result.output.contains("line_one"),
-        "missing line_one in: {}",
-        result.output
-    );
-    assert!(
-        result.output.contains("line_two"),
-        "missing line_two in: {}",
-        result.output
-    );
+    let input = json!({
+        "command": "(exec 3</dev/tty) 2>/dev/null && echo has_tty || echo no_tty; echo GTP=$GIT_TERMINAL_PROMPT",
+        "timeout": 5000
+    });
+    let result = tool.execute(input, make_ctx(None)).await.unwrap();
+    assert!(result.output.contains("no_tty"), "{}", result.output);
+    assert!(result.output.contains("GTP=0"), "{}", result.output);
 }
 
 #[tokio::test]
@@ -300,10 +359,9 @@ async fn test_command_timeout_with_stdin_channel() {
     let (tx, _rx) = mpsc::unbounded_channel::<StdinInputRequest>();
     let tool = BashTool::new();
 
-    // `cat` blocks forever on stdin. With a short timeout and no stdin response,
-    // the command should be promoted to the background (kept running), not killed
-    // with an error.
-    let input = json!({"command": "cat", "timeout": 1000});
+    // A long-running command with a stdin channel present should be promoted
+    // to the background (kept running) on timeout, not killed with an error.
+    let input = json!({"command": "sleep 30", "timeout": 1000});
     let ctx = make_ctx(Some(tx));
 
     let result = tool
@@ -316,6 +374,8 @@ async fn test_command_timeout_with_stdin_channel() {
         result.output
     );
     let metadata = result.metadata.expect("expected background metadata");
+    assert!(result.output.contains(BACKGROUND_WAIT_GUIDANCE));
+    assert!(!result.output.contains("Use `bg`"));
     assert_eq!(metadata["background"], true);
     assert_eq!(metadata["timeout_promoted"], true);
     assert_eq!(metadata["foreground_timeout_ms"], 1000);
@@ -862,15 +922,9 @@ async fn test_background_command_without_timeout_keeps_running_past_default_fore
 #[cfg(unix)]
 #[tokio::test]
 async fn process_group_kill_guard_terminates_descendants() {
+    // build_shell_command runs the child in its own session (setsid), which
+    // also makes it a process group leader.
     let mut cmd = build_shell_command("sleep 60 & echo $!; wait");
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     cmd.kill_on_drop(true).stdout(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn process group probe");
@@ -984,12 +1038,10 @@ async fn bash_holds_a_risky_delete_until_justified_then_runs_it() {
     std::fs::create_dir_all(&target).expect("target");
     std::fs::write(target.join("f.txt"), "x").expect("file");
 
-    // The concrete outside-workspace directory is allowed by policy. Its glob
-    // keeps this test focused on the Confirm path for a statically unknown set
-    // of affected files.
+    // Temp paths are deliberately low risk. Use a shell-expanded target to
+    // exercise Confirm for a target the static assessor cannot resolve.
     let command = format!(
-        "rm -rf {}/* && rmdir {}",
-        target.display(),
+        "fixture_target=\"{}\"; rm -rf \"$fixture_target\"/* && rmdir \"$fixture_target\"",
         target.display()
     );
     let tool = BashTool::new();
@@ -1080,4 +1132,55 @@ async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
         "background dispatch must be gated too, not just foreground"
     );
     assert!(canary.exists(), "the file must survive a backgrounded call");
+}
+
+#[test]
+fn parse_progress_line_classifies_markers_checkpoints_and_heuristics() {
+    let update = parse_progress_line(r#"JCODE_PROGRESS {"percent":40,"message":"Working"}"#)
+        .expect("parser should not fail")
+        .expect("progress marker should parse");
+    match update {
+        ProgressLineUpdate::Progress(progress) => assert_eq!(progress.percent, Some(40.0)),
+        other => panic!("expected a progress update, got {other:?}"),
+    }
+
+    let update = parse_progress_line(r#"JCODE_CHECKPOINT {"message":"Tests passed"}"#)
+        .expect("parser should not fail")
+        .expect("checkpoint marker should parse");
+    match update {
+        ProgressLineUpdate::Checkpoint(progress) => {
+            assert_eq!(progress.message.as_deref(), Some("Tests passed"))
+        }
+        other => panic!("expected a checkpoint update, got {other:?}"),
+    }
+
+    let update = parse_progress_line("Copied 7/10 files")
+        .expect("parser should not fail")
+        .expect("heuristic ratio should parse");
+    match update {
+        ProgressLineUpdate::Progress(progress) => {
+            assert_eq!(progress.percent, Some(70.0));
+            assert_eq!(progress.source, BackgroundTaskProgressSource::ParsedOutput);
+        }
+        other => panic!("expected a progress update, got {other:?}"),
+    }
+
+    assert!(
+        parse_progress_line("plain log line with no progress")
+            .expect("parser should not fail")
+            .is_none(),
+        "non-progress output must not produce updates"
+    );
+}
+
+#[path = "bash_promoted_tests.rs"]
+mod promoted;
+
+#[test]
+fn background_timeout_honors_values_above_the_foreground_cap() {
+    // Field report: run_in_background with timeout=1800000 (30 min) was
+    // recorded as "timed out after 600000ms" and killed at 10 minutes.
+    assert_eq!(background_timeout_ms(Some(1_800_000)), Some(1_800_000));
+    assert_eq!(background_timeout_ms(Some(100)), Some(100));
+    assert_eq!(background_timeout_ms(None), None);
 }

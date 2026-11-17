@@ -1,5 +1,15 @@
 use super::*;
 
+/// Normalize CRLF/CR to LF, borrowing when the input has no carriage returns
+/// (the common case) so per-frame role checks do not copy every message.
+fn normalize_line_endings(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.contains('\r') {
+        std::borrow::Cow::Owned(content.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    }
+}
+
 fn sanitize_fenced_block(text: &str) -> String {
     text.replace("```", "``\u{200b}`")
 }
@@ -254,6 +264,17 @@ pub fn format_background_task_notification_markdown(task: &BackgroundTaskComplet
         exit_code,
     );
 
+    if matches!(task.status, BackgroundTaskStatus::Failed) {
+        // Completion events are formatted on delivery. Preserve the inferred call
+        // time so the UI can show age rather than confusing runtime with age.
+        if let Ok(elapsed) = std::time::Duration::try_from_secs_f64(task.duration_secs)
+            && let Ok(elapsed) = chrono::Duration::from_std(elapsed)
+            && let Some(called_at) = chrono::Utc::now().checked_sub_signed(elapsed)
+        {
+            message.push_str(&format!("\n\n_Called at:_ `{}`", called_at.to_rfc3339()));
+        }
+    }
+
     if matches!(task.status, BackgroundTaskStatus::Failed)
         && let Some(summary) = background_task_failure_summary(&task.output_preview)
     {
@@ -390,7 +411,7 @@ pub fn parse_background_task_progress_notification_markdown(
     static HEADER_RE: OnceLock<Option<Regex>> = OnceLock::new();
     static INLINE_RE: OnceLock<Option<Regex>> = OnceLock::new();
 
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalize_line_endings(content);
     let trimmed = normalized.trim();
 
     let header_re = HEADER_RE
@@ -483,7 +504,7 @@ pub fn parse_background_task_notification_markdown(
         .get_or_init(|| compile_static_regex(r#"^_Full output:_ `(?P<command>[^`]+)`$"#))
         .as_ref()?;
 
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalize_line_endings(content);
     let mut sections = normalized.split("\n\n");
     let header = sections.next()?.trim();
     let captures = header_re.captures(header)?;

@@ -23,6 +23,8 @@ use tokio::time::{Duration, Instant as TokioInstant, MissedTickBehavior};
 
 mod model;
 mod orchestration_watchdog;
+#[path = "background/stall_watchdog.rs"]
+mod stall_watchdog;
 
 pub use model::{
     BackgroundCleanupResult, BackgroundTaskEventKind, BackgroundTaskEventRecord,
@@ -39,13 +41,16 @@ use model::{
 #[derive(Clone)]
 pub struct BackgroundTaskManager {
     tasks: Arc<RwLock<HashMap<String, RunningTask>>>,
-    /// Serializes progress status read-modify-write cycles so concurrent output
-    /// readers cannot overwrite a newer high-water mark with a stale update.
+    /// Serializes status updates, including completion and delivery flag capture,
+    /// so stale Running snapshots cannot replace terminal status.
     progress_updates: Arc<Mutex<()>>,
     /// Live stall watchdogs by task id. Each entry is a spawned monitor that
     /// fires a [`BusEvent::BackgroundTaskStalled`] after its task produces no
     /// output bytes and no progress events for the configured window.
     stall_watchdogs: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    /// Status files already seen in a terminal state by [`Self::sweep`]. A
+    /// finished task never runs again, so the periodic sweep skips them.
+    settled: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     output_dir: PathBuf,
     watchdog: crate::orchestration_watchdog::OrchestrationWatchdog,
 }
@@ -66,6 +71,7 @@ impl BackgroundTaskManager {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress_updates: Arc::new(Mutex::new(())),
             stall_watchdogs: Arc::new(RwLock::new(HashMap::new())),
+            settled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             output_dir,
             watchdog: crate::orchestration_watchdog::OrchestrationWatchdog::with_root(
                 watchdog_root,
@@ -87,6 +93,7 @@ impl BackgroundTaskManager {
             progress_updates: Arc::new(Mutex::new(())),
             stall_watchdogs: Arc::new(RwLock::new(HashMap::new())),
             output_dir,
+            settled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             watchdog: crate::orchestration_watchdog::OrchestrationWatchdog::new(),
         }
     }
@@ -127,11 +134,9 @@ impl BackgroundTaskManager {
         tool_name: &str,
         display_name: Option<&str>,
         session_id: &str,
-        notify: bool,
+        _notify: bool,
     ) {
-        if !notify {
-            return;
-        }
+        // Lifecycle visibility is independent of transcript delivery and agent wake.
         let label = crate::message::background_task_display_label(tool_name, display_name);
         let safe_label = label.replace('`', "'");
         Bus::global().publish(BusEvent::UiActivity(crate::bus::UiActivity::background(
@@ -363,7 +368,9 @@ impl BackgroundTaskManager {
         F: FnOnce(PathBuf) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<TaskResult>> + Send,
     {
-        let runtime_activity = crate::runtime_activity::global().enter().await;
+        let runtime_activity = crate::runtime_activity::global()
+            .enter_session(session_id)
+            .await;
         let (notify, wake) = normalize_delivery(notify, wake);
         let task_id = Self::generate_task_id();
         let output_path = self.output_dir.join(format!("{}.output", task_id));
@@ -411,13 +418,13 @@ impl BackgroundTaskManager {
         let started_at = Instant::now();
         let started_at_rfc3339_for_task = started_at_rfc3339.clone();
         let (delivery_flags_tx, delivery_flags_rx) = watch::channel((notify, wake));
+        let status_updates = Arc::clone(&self.progress_updates);
         let tasks_for_prune = Arc::clone(&self.tasks);
         let manager = self.clone();
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Spawn the background task
-        let handle = tokio::spawn(async move {
-            let _runtime_activity = runtime_activity;
+        let handle = tokio::spawn(runtime_activity.scope(async move {
             let result = execute_fn(output_path_clone.clone()).await;
 
             let duration_secs = started_at.elapsed().as_secs_f64();
@@ -435,6 +442,7 @@ impl BackgroundTaskManager {
                 Err(e) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
             };
 
+            let status_guard = status_updates.lock().await;
             let (notify_flag, wake_flag) = *delivery_flags_rx.borrow();
             let prior_status = tokio::fs::read_to_string(&status_path_clone)
                 .await
@@ -483,7 +491,12 @@ impl BackgroundTaskManager {
             // rely on. Awaiting registration first means a task that finishes
             // instantly cannot race the insert below and leave a permanent
             // phantom entry in the map.
-            let _ = registered_rx.await;
+            drop(status_guard);
+            if let Err(error) = registered_rx.await {
+                crate::logging::debug(&format!(
+                    "Background task registration ended before completion: {error}"
+                ));
+            }
             tasks_for_prune.write().await.remove(&task_id_clone);
 
             // Read output preview for notification
@@ -514,7 +527,7 @@ impl BackgroundTaskManager {
             });
 
             result
-        });
+        }));
 
         // Track the running task
         let running_task = RunningTask {
@@ -569,8 +582,11 @@ impl BackgroundTaskManager {
         wake: bool,
         handle: JoinHandle<Result<jcode_tool_types::ToolOutput>>,
     ) -> BackgroundTaskInfo {
+        let mut handle = model::AbortAdoptedTask(handle);
         // Reserve before the foreground caller can release its turn/tool guard.
-        let runtime_activity = crate::runtime_activity::global().enter().await;
+        let runtime_activity = crate::runtime_activity::global()
+            .enter_session(session_id)
+            .await;
         let (notify, wake) = normalize_delivery(notify, wake);
         let task_id = Self::generate_task_id();
         let output_path = self.output_dir.join(format!("{}.output", task_id));
@@ -622,13 +638,12 @@ impl BackgroundTaskManager {
         let started_at_rfc3339 = initial_status.started_at.clone();
         let display_name_owned = initial_status.display_name.clone();
         let (delivery_flags_tx, delivery_flags_rx) = watch::channel((notify, wake));
+        let status_updates = Arc::clone(&self.progress_updates);
         let tasks_for_prune = Arc::clone(&self.tasks);
         let manager = self.clone();
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let wrapper_handle = tokio::spawn(async move {
-            let _runtime_activity = runtime_activity;
-            let tool_result = handle.await;
+        let wrapper_handle = tokio::spawn(runtime_activity.scope(async move {
+            let tool_result = (&mut handle.0).await;
             let duration_secs = started_at.elapsed().as_secs_f64();
 
             let (status, exit_code, error, output_text) = match tool_result {
@@ -656,6 +671,7 @@ impl BackgroundTaskManager {
                 let _ = file.write_all(output_text.as_bytes()).await;
             }
 
+            let status_guard = status_updates.lock().await;
             let (notify_flag, wake_flag) = *delivery_flags_rx.borrow();
             let prior_status = tokio::fs::read_to_string(&status_path_clone)
                 .await
@@ -698,7 +714,12 @@ impl BackgroundTaskManager {
             // Prune the live-map entry only after the terminal status file is
             // persisted (and after registration below, so instant completions
             // cannot race the insert and leave a phantom entry).
-            let _ = registered_rx.await;
+            drop(status_guard);
+            if let Err(error) = registered_rx.await {
+                crate::logging::debug(&format!(
+                    "Background task registration ended before completion: {error}"
+                ));
+            }
             tasks_for_prune.write().await.remove(&task_id_clone);
 
             let output_preview = if output_text.len() > 500 {
@@ -726,7 +747,7 @@ impl BackgroundTaskManager {
                 error,
                 status: Some(status),
             })
-        });
+        }));
 
         let running_task = RunningTask {
             task_id: task_id.clone(),
@@ -751,6 +772,65 @@ impl BackgroundTaskManager {
             output_file: output_path,
             status_file: status_path,
         }
+    }
+
+    /// Periodic maintenance pass: reconcile tasks that may still be running
+    /// and return the number of status files on disk.
+    ///
+    /// `list` opens, parses and reconciles every status file through tokio's
+    /// blocking pool, which costs several thread wakeups per file, and the
+    /// task directory keeps thousands of finished tasks. A once-a-minute
+    /// caller (the runtime memory heartbeat) made that the server's largest
+    /// source of idle wakeups. This lists the directory in one blocking call
+    /// and only reads files not yet seen in a terminal state, so a quiet
+    /// server reads nothing after the first pass.
+    ///
+    /// Reconciliation is kept because it is what finalizes a detached task,
+    /// and publishes its completion, when the task outlived the server that
+    /// started it and no one is waiting on it. The count is by file
+    /// extension, so an unparseable status file is included.
+    pub async fn sweep(&self) -> usize {
+        let dir = self.output_dir.clone();
+        let paths = tokio::task::spawn_blocking(move || {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.extension().is_some_and(|e| e == "json"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        let pending: Vec<PathBuf> = {
+            let mut settled = self.settled.lock().await;
+            // Drop entries for files that were cleaned up.
+            if settled.len() > paths.len() {
+                let present: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+                settled.retain(|path| present.contains(path));
+            }
+            paths
+                .iter()
+                .filter(|path| !settled.contains(*path))
+                .cloned()
+                .collect()
+        };
+
+        for path in pending {
+            let Some(status) = self.read_status_file(&path).await else {
+                continue;
+            };
+            let status = self.finalize_detached_status_if_needed(status, &path).await;
+            let status = self.finalize_orphaned_status_if_needed(status, &path).await;
+            if status.status != BackgroundTaskStatus::Running {
+                self.settled.lock().await.insert(path);
+            }
+        }
+
+        paths.len()
     }
 
     /// List all tasks (both running and completed from disk)
@@ -1047,162 +1127,6 @@ impl BackgroundTaskManager {
     /// Minimum accepted stall window, to keep watchdogs from spamming wakes.
     pub const MIN_STALL_WAKE_SECONDS: u64 = 30;
 
-    /// Arm (or re-arm) a stall watchdog for a running task.
-    ///
-    /// The watchdog fires a [`BusEvent::BackgroundTaskStalled`] after the task
-    /// produces no new output bytes and no new progress/checkpoint events for
-    /// `stall_wake_seconds`. Any activity resets the countdown. It fires at
-    /// most once per silence episode and re-arms itself when activity resumes,
-    /// so a task that stalls, recovers, and stalls again produces one wake per
-    /// stall. The watchdog exits when the task leaves `Running`.
-    ///
-    /// Returns the effective (clamped) window, or `None` when the task does
-    /// not exist or is no longer running.
-    pub async fn arm_stall_watchdog(&self, task_id: &str, stall_wake_seconds: u64) -> Option<u64> {
-        let stall_wake_seconds = stall_wake_seconds.max(Self::MIN_STALL_WAKE_SECONDS);
-        let status_path = self.status_path_for(task_id);
-        let mut status = self.read_status_file(&status_path).await?;
-        if status.status != BackgroundTaskStatus::Running {
-            return None;
-        }
-        status.stall_wake_seconds = Some(stall_wake_seconds);
-        self.write_status_file(&status_path, &status).await;
-
-        let task_id_owned = task_id.to_string();
-        let output_path = self.output_path_for(task_id);
-        let status_path_clone = status_path.clone();
-        let started_at = status.started_at.clone();
-        let watchdogs = Arc::clone(&self.stall_watchdogs);
-
-        let handle = tokio::spawn(async move {
-            let mut last_len = fs::metadata(&output_path)
-                .await
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            let mut last_event_count: Option<usize> = None;
-            let mut quiet_since = TokioInstant::now();
-            let mut fired_this_episode = false;
-            let window = Duration::from_secs(stall_wake_seconds);
-            let mut poll = tokio::time::interval(Self::STALL_POLL_INTERVAL);
-            poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            // interval fires immediately on first tick; consume it.
-            poll.tick().await;
-
-            loop {
-                poll.tick().await;
-
-                let Ok(content) = fs::read_to_string(&status_path_clone).await else {
-                    break;
-                };
-                let Ok(status) = serde_json::from_str::<TaskStatusFile>(&content) else {
-                    break;
-                };
-                if status.status != BackgroundTaskStatus::Running {
-                    break;
-                }
-                // Disarmed externally (e.g. re-armed with a new window by a
-                // newer watchdog that overwrote this one's registry entry and
-                // cleared the field first): keep it simple, exit if cleared.
-                if status.stall_wake_seconds != Some(stall_wake_seconds) {
-                    break;
-                }
-
-                let output_len = fs::metadata(&output_path)
-                    .await
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
-                let event_count = status.event_history.len();
-                let activity = output_len != last_len
-                    || last_event_count.is_some_and(|prior| prior != event_count);
-                last_len = output_len;
-                last_event_count = Some(event_count);
-
-                if activity {
-                    quiet_since = TokioInstant::now();
-                    fired_this_episode = false;
-                    continue;
-                }
-
-                if fired_this_episode || quiet_since.elapsed() < window {
-                    continue;
-                }
-                fired_this_episode = true;
-
-                let running_secs =
-                    Self::status_duration_secs(&started_at, Utc::now()).unwrap_or(0.0);
-                let output_tail = match fs::read_to_string(&output_path).await {
-                    Ok(output) => {
-                        let tail: Vec<&str> = output.lines().rev().take(20).collect();
-                        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(error) => {
-                        crate::logging::warn(&format!(
-                            "Cannot read stalled background output {}: {error}",
-                            output_path.display()
-                        ));
-                        String::new()
-                    }
-                };
-                let output_tail = if output_tail.len() > 2000 {
-                    crate::util::truncate_str(&output_tail, 2000).to_string()
-                } else {
-                    output_tail
-                };
-
-                Bus::global().publish(BusEvent::BackgroundTaskStalled(
-                    crate::bus::BackgroundTaskStalled {
-                        task_id: status.task_id.clone(),
-                        tool_name: status.tool_name.clone(),
-                        display_name: status.display_name.clone(),
-                        session_id: status.session_id.clone(),
-                        stall_wake_seconds,
-                        running_secs,
-                        output_tail,
-                        output_file: output_path.clone(),
-                        // Arming a stall watchdog is an explicit "wake me if
-                        // this goes quiet" request, independent of the task's
-                        // completion-delivery flags.
-                        notify: true,
-                        wake: true,
-                    },
-                ));
-            }
-
-            watchdogs.write().await.remove(&task_id_owned);
-        });
-
-        // Replace any existing watchdog for this task.
-        if let Some(prior) = self
-            .stall_watchdogs
-            .write()
-            .await
-            .insert(task_id.to_string(), handle)
-        {
-            prior.abort();
-        }
-
-        Some(stall_wake_seconds)
-    }
-
-    /// Disarm the stall watchdog for a task, if one is armed.
-    pub async fn disarm_stall_watchdog(&self, task_id: &str) -> bool {
-        let removed = self.stall_watchdogs.write().await.remove(task_id);
-        let disarmed = removed.is_some();
-        if let Some(handle) = removed {
-            handle.abort();
-        }
-        let status_path = self.status_path_for(task_id);
-        if let Some(mut status) = self.read_status_file(&status_path).await
-            && status.stall_wake_seconds.is_some()
-        {
-            status.stall_wake_seconds = None;
-            self.write_status_file(&status_path, &status).await;
-            return true;
-        }
-        disarmed
-    }
-
     /// Update delivery behavior for an existing background task.
     ///
     /// This supports retroactively enabling notify/wake after the task was already started.
@@ -1212,6 +1136,7 @@ impl BackgroundTaskManager {
         notify: bool,
         wake: bool,
     ) -> Result<Option<TaskStatusFile>> {
+        let _status_guard = self.progress_updates.lock().await;
         let (notify, wake) = normalize_delivery(notify, wake);
         let status_path = self.status_path_for(task_id);
         let Some(mut status) = self.read_status_file(&status_path).await else {
@@ -1255,9 +1180,13 @@ impl BackgroundTaskManager {
         task_id: &str,
         _graceful_timeout: std::time::Duration,
     ) -> Result<bool> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.remove(task_id) {
+        // Never hold the map or status lock while awaiting the task: completion
+        // needs both locks before it can exit.
+        let task = self.tasks.write().await.remove(task_id);
+        if let Some(mut task) = task {
             task.handle.abort();
+            let _ = (&mut task.handle).await;
+            let _status_guard = self.progress_updates.lock().await;
 
             // Update status file
             let (notify_flag, wake_flag) = *task.delivery_flags.borrow();
@@ -1293,7 +1222,7 @@ impl BackgroundTaskManager {
 
             Ok(true)
         } else {
-            drop(tasks);
+            let _status_guard = self.progress_updates.lock().await;
 
             let status_path = self.status_path_for(task_id);
             let Some(mut status) = self.read_status_file(&status_path).await else {
@@ -1415,84 +1344,6 @@ impl BackgroundTaskManager {
         }
 
         finalized
-    }
-
-    /// Clean up old task files (older than specified hours)
-    pub async fn cleanup(&self, max_age_hours: u64) -> Result<usize> {
-        Ok(self
-            .cleanup_filtered(max_age_hours, &std::collections::HashSet::new(), false)
-            .await?
-            .removed_files)
-    }
-
-    /// Clean up old task files, skipping running tasks and optionally filtering by status.
-    pub async fn cleanup_filtered(
-        &self,
-        max_age_hours: u64,
-        status_filter: &std::collections::HashSet<&str>,
-        dry_run: bool,
-    ) -> Result<BackgroundCleanupResult> {
-        let mut result = BackgroundCleanupResult {
-            matched_files: 0,
-            removed_files: 0,
-            skipped_running_files: 0,
-        };
-        let cutoff =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(max_age_hours * 3600);
-
-        if let Ok(mut entries) = fs::read_dir(&self.output_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let Ok(metadata) = fs::metadata(&path).await else {
-                    continue;
-                };
-                let Ok(modified) = metadata.modified() else {
-                    continue;
-                };
-                if modified >= cutoff {
-                    continue;
-                }
-
-                let mut associated_status = None;
-                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                    associated_status = self.read_status_file(&path).await;
-                } else if path.extension().and_then(|ext| ext.to_str()) == Some("output")
-                    && let Some(task_id) = path.file_stem().and_then(|stem| stem.to_str())
-                {
-                    associated_status = self.status(task_id).await;
-                }
-
-                if let Some(status) = associated_status.as_ref() {
-                    if status.status == BackgroundTaskStatus::Running {
-                        result.skipped_running_files += 1;
-                        continue;
-                    }
-                    let status_label = match status.status {
-                        BackgroundTaskStatus::Running => "running",
-                        BackgroundTaskStatus::Completed => "completed",
-                        BackgroundTaskStatus::Superseded => "superseded",
-                        BackgroundTaskStatus::Failed => "failed",
-                    };
-                    if !status_filter.is_empty() && !status_filter.contains(status_label) {
-                        continue;
-                    }
-                } else if !status_filter.is_empty() {
-                    continue;
-                }
-
-                result.matched_files += 1;
-                if !dry_run {
-                    let _ = fs::remove_file(&path).await;
-                    result.removed_files += 1;
-                }
-            }
-        }
-
-        if dry_run {
-            result.removed_files = result.matched_files;
-        }
-
-        Ok(result)
     }
 
     /// Best-effort synchronous snapshot of currently running tasks.
@@ -1632,3 +1483,6 @@ pub fn global() -> &'static BackgroundTaskManager {
 
 #[cfg(test)]
 mod tests;
+
+#[path = "background/cleanup.rs"]
+mod cleanup;

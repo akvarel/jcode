@@ -43,48 +43,30 @@ mod model_selection;
 mod openai_ws_connect;
 use openai_ws_connect::connect_ws;
 mod native_compaction;
+mod openai_retry_diagnostics;
 mod openai_stream_cancellation;
 mod openai_stream_diagnostics;
 
 const CHATGPT_API_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_PATH: &str = "responses";
 const DEFAULT_MODEL: &str = jcode_provider_core::DEFAULT_OPENAI_MODEL;
-const ORIGINATOR: &str = "codex_cli_rs";
+/// `originator` header for ChatGPT-login (Codex backend) requests.
+///
+/// This used to be `codex_cli_rs` to look like the official Codex CLI. Live
+/// probes on 2026-11-05 against chatgpt.com/backend-api/codex (HTTPS and
+/// websocket, two ChatGPT accounts, gpt-5.6-sol and gpt-6-astra) showed
+/// `codex_cli_rs`, `jcode` and no originator at all are all accepted and get
+/// identical `x-codex-plan-type` / `x-codex-active-limit` / usage headers, so
+/// Jcode now identifies itself. See
+/// docs/ANTHROPIC_OAUTH_IDENTITY_PROBE_2026_11_05.md.
+const ORIGINATOR: &str = "jcode";
 
 pub(crate) const CHATGPT_WEB_MODEL: &str = jcode_provider_core::CHATGPT_WEB_MODEL;
 
-pub(crate) fn is_chatgpt_web_model(model: &str) -> bool {
-    model.trim() == CHATGPT_WEB_MODEL
-}
-
-/// Whether the hosted `image_generation` tool can be attached for `model_id`.
-///
-/// The Responses backend only exposes `image_generation` to general
-/// ChatGPT/GPT models. Codex models (ids containing `codex`) reject unknown
-/// hosted tools, so they must not receive it. See issue #369.
-/// Responses `additional_tools` / deferred tool loading requires gpt-5.4 or
-/// newer. Unknown model families stay eager, which is always correct.
-fn model_supports_additional_tools(model_id: &str) -> bool {
-    let lower = model_id.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("gpt-") else {
-        return false;
-    };
-    let version: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let mut parts = version.split('.').filter(|p| !p.is_empty());
-    let major: u32 = match parts.next().and_then(|p| p.parse().ok()) {
-        Some(major) => major,
-        None => return false,
-    };
-    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    major > 5 || (major == 5 && minor >= 4)
-}
-
-fn model_supports_image_generation(model_id: &str) -> bool {
-    !model_id.to_ascii_lowercase().contains("codex")
-}
+use model_capabilities::{
+    is_chatgpt_web_model, model_supports_additional_tools, model_supports_image_generation,
+};
+mod model_capabilities;
 
 /// Maximum number of retries for transient errors
 const MAX_RETRIES: u32 = 3;
@@ -197,6 +179,7 @@ impl OpenAITransportMode {
 
 #[derive(Debug)]
 enum OpenAIStreamFailure {
+    OpaqueWsRejection,
     FallbackToHttps(anyhow::Error),
     Other(anyhow::Error),
 }
@@ -1076,6 +1059,14 @@ impl OpenAIProvider {
     /// so validation, availability, and refresh must all use the loaded
     /// credential's own catalog instead of one shared per-account slot.
     pub(crate) fn catalog_scope_for(credentials: &CodexCredentials) -> String {
+        if Self::is_chatgpt_mode(credentials)
+            && let Ok(accounts) = jcode_base::auth::codex::list_accounts()
+            && let Some(label) =
+                jcode_base::auth::codex::account_label_for_credentials(&accounts, credentials)
+        {
+            return label;
+        }
+        // Unmatched legacy OAuth credentials retain the existing account fallback.
         jcode_base::provider::openai_catalog_scope_for_credential(
             Self::is_chatgpt_mode(credentials),
             &credentials.access_token,
@@ -1568,12 +1559,13 @@ mod stream;
 use self::openai_stream_runtime::try_persistent_ws_continuation;
 use self::openai_stream_runtime::{PersistentWsResult, is_retryable_error, openai_access_token};
 
-use self::stream::{OpenAIResponsesStream, parse_openai_response_event};
 #[cfg(test)]
-use self::stream::{handle_openai_output_item, parse_text_wrapped_tool_call};
+use self::stream::handle_openai_output_item;
+use self::stream::{OpenAIResponsesStream, parse_openai_response_event};
 
 mod chatgpt_web;
 mod native_web_search;
+mod openai_prewarm_request;
 #[path = "openai_provider_impl.rs"]
 mod openai_provider_impl;
 #[path = "openai_stream_runtime.rs"]
@@ -1585,17 +1577,16 @@ mod websocket_health;
 
 use self::websocket_health::{
     WEBSOCKET_FALLBACK_NOTICE, WEBSOCKET_FIRST_EVENT_TIMEOUT_SECS,
-    classify_websocket_fallback_reason, is_stream_activity_event, is_websocket_activity_payload,
-    is_websocket_fallback_notice, is_websocket_first_activity_payload, record_websocket_fallback,
+    classify_websocket_fallback_reason, is_stream_activity_event, record_websocket_fallback,
     record_websocket_success, summarize_websocket_fallback_reason, websocket_activity_timeout_kind,
     websocket_cooldown_remaining, websocket_next_activity_timeout_secs_with_completion,
 };
 #[cfg(test)]
 use self::websocket_health::{
     WEBSOCKET_MODEL_COOLDOWN_BASE_SECS, WEBSOCKET_MODEL_COOLDOWN_MAX_SECS, WebsocketFallbackReason,
-    clear_websocket_cooldown, normalize_transport_model, set_websocket_cooldown,
-    websocket_cooldown_for_streak, websocket_next_activity_timeout_secs,
-    websocket_remaining_timeout_secs,
+    clear_websocket_cooldown, is_websocket_activity_payload, is_websocket_first_activity_payload,
+    normalize_transport_model, set_websocket_cooldown, websocket_cooldown_for_streak,
+    websocket_next_activity_timeout_secs, websocket_remaining_timeout_secs,
 };
 
 #[cfg(test)]

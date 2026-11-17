@@ -1,5 +1,6 @@
 pub mod account_picker;
 pub(crate) mod app;
+pub mod justrust_status;
 
 #[derive(Clone)]
 pub struct ContextSnapshot {
@@ -22,23 +23,28 @@ pub struct BackgroundTaskRow {
     pub label: String,
     pub percent: Option<f32>,
     pub status: BackgroundTaskRowStatus,
-    /// When a successful task stopped being actionable. Running and failed
-    /// tasks remain visible until their state changes or the session closes.
+    /// When a successful task stopped being actionable, retained until session closure.
     pub completed_at: Option<std::time::Instant>,
 }
 
 pub mod backend;
 mod cloud_git;
+mod cloud_latency;
 mod cloud_status;
 pub(crate) mod color_support;
 mod core;
 pub(crate) mod fuzzy;
 pub mod herdr;
 mod info_widget_cloud;
+mod info_widget_cloud_directories;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
 // so existing `crate::tui::image` paths keep working.
 pub use jcode_terminal_image::display as image;
+#[path = "tui_text_filter.rs"]
+mod text_filter;
+
+mod focus_carryover;
 pub mod info_widget;
 mod info_widget_layout;
 mod info_widget_overview;
@@ -57,9 +63,9 @@ mod redraw_schedule;
 #[allow(unused_imports)]
 pub(crate) use redraw_schedule::{
     REDRAW_DEEP_IDLE, REDRAW_DEEP_IDLE_AFTER, REDRAW_IDLE, REDRAW_PASSIVE_LIVENESS,
-    REDRAW_REMOTE_STARTUP, REDRAW_SWARM_SPINNER, current_full_frame_redraw_reason,
-    idle_donut_active, last_full_frame_redraw_reason, periodic_redraw_required,
-    periodic_redraw_required_excluding_idle_animation, redraw_interval,
+    REDRAW_REMOTE_STARTUP, REDRAW_STATIC_STREAM, REDRAW_SWARM_SPINNER,
+    current_full_frame_redraw_reason, idle_donut_active, last_full_frame_redraw_reason,
+    periodic_redraw_required, periodic_redraw_required_excluding_idle_animation, redraw_interval,
     redraw_interval_with_policy,
 };
 mod remote_diff;
@@ -67,6 +73,7 @@ pub mod screenshot;
 pub(crate) mod session_facts;
 pub mod session_picker;
 mod stream_buffer;
+mod terminal_events;
 pub mod terminal_setup;
 pub mod test_harness;
 pub mod theme_detect;
@@ -74,6 +81,7 @@ mod ui;
 mod ui_diff;
 pub mod usage_overlay;
 pub mod visual_debug;
+pub(crate) mod window_visibility;
 pub mod workspace_client;
 pub use jcode_tui_workspace::workspace_map;
 pub use jcode_tui_workspace::workspace_map_widget;
@@ -732,6 +740,11 @@ pub trait TuiState {
     /// Version counter for display_messages (monotonic, increments on mutation)
     fn display_messages_version(&self) -> u64;
     fn streaming_text(&self) -> &str;
+    /// Content signature for the prepare cache. Views without tracked mutations
+    /// hash on demand so even same-length replacements invalidate correctly.
+    fn streaming_text_hash(&self) -> u64 {
+        ui::hash_text_for_cache(self.streaming_text())
+    }
     /// JSON payload for the pinned todo band rendered at the top of the chat
     /// viewport when `display.pin_todos` is enabled. `None` when the feature
     /// is off or the session has no todos.
@@ -741,6 +754,10 @@ pub trait TuiState {
     /// Whether the pinned todo band is temporarily expanded to show every row.
     fn pinned_todos_expanded(&self) -> bool {
         false
+    }
+    /// Live build telemetry displayed below the pinned todo band.
+    fn justrust_status(&self) -> Option<&justrust_status::StatusRow> {
+        None
     }
     /// Running and recently completed background tasks for the session.
     fn background_task_rows(&self) -> &[BackgroundTaskRow] {
@@ -753,6 +770,11 @@ pub trait TuiState {
         None
     }
     fn input(&self) -> &str;
+    /// Whether the one-based composer image tag has a pending payload.
+    /// This does not acknowledge delivery to a provider.
+    fn input_image_attached(&self, _number: usize) -> bool {
+        false
+    }
     fn cursor_pos(&self) -> usize;
     fn is_processing(&self) -> bool;
     fn queued_messages(&self) -> &[String];
@@ -920,6 +942,10 @@ pub trait TuiState {
     fn voice_input_status(&self) -> Option<(bool, String)> {
         None
     }
+    /// Voice input rendered in the composer instead of the status line.
+    fn voice_composer_preview(&self) -> Option<VoiceComposerPreview> {
+        None
+    }
     /// How long since the user last pressed a key, scrolled, or pasted, or
     /// `None` when they have not interacted yet.
     ///
@@ -949,6 +975,15 @@ pub trait TuiState {
     /// Whether mouse-wheel smoothing has queued lines to animate.
     fn has_pending_mouse_scroll_animation(&self) -> bool {
         false
+    }
+    /// Whether the paced stream buffer still holds text that later ticks will
+    /// reveal. While streamed text sits on screen with no backlog (e.g. the
+    /// model is thinking or running a tool after emitting text), nothing in the
+    /// transcript changes per tick, so the animation cadence is pure waste.
+    /// Defaults to true so state impls that do not track a backlog keep the
+    /// conservative fast cadence.
+    fn stream_reveal_pending(&self) -> bool {
+        true
     }
     /// Optional configured keybinding label for external dictation.
     fn dictation_key_label(&self) -> Option<String>;
@@ -1036,6 +1071,12 @@ pub trait TuiState {
     /// Render streaming text using incremental markdown renderer
     /// This is more efficient than re-rendering on every frame
     fn render_streaming_markdown(&self, width: usize) -> Vec<Line<'static>>;
+    /// `(generation, count)` of the leading lines of the last
+    /// `render_streaming_markdown` result that are unchanged for as long as
+    /// the generation is. `(0, 0)` when nothing is known to be stable.
+    fn streaming_markdown_stable_prefix(&self) -> (u64, usize) {
+        (0, 0)
+    }
     /// Whether centered mode is enabled
     fn centered_mode(&self) -> bool;
     /// Authentication status for all supported providers
@@ -1150,6 +1191,11 @@ pub trait TuiState {
     fn git_branch(&self) -> Option<String> {
         None
     }
+    /// Remote machine this session runs on (SSH host or cloud VM), shown on
+    /// the status line. Embedded views override it with their own host.
+    fn remote_machine(&self) -> Option<String> {
+        ssh_remote_host()
+    }
     /// Monotonic clock for viewport animations
     fn now_millis(&self) -> u64;
     /// UI state for live copy badge highlighting / feedback
@@ -1161,6 +1207,11 @@ pub trait TuiState {
     fn copy_selection_range(&self) -> Option<CopySelectionRange>;
     /// Persistent status for in-app copy selection mode.
     fn copy_selection_status(&self) -> Option<CopySelectionStatus>;
+
+    /// The composer follows the selection endpoint only during a mouse drag.
+    fn input_drag_scroll_offset(&self) -> Option<usize> {
+        None
+    }
     /// Whether the first-run onboarding empty state is being previewed in this session.
     // ---- Onboarding ----
     fn onboarding_preview_mode(&self) -> bool {
@@ -1370,117 +1421,11 @@ impl KvCacheProblem {
     }
 }
 
-fn normalized_provider_matches(provider: &str, needle: &str) -> bool {
-    provider.trim().to_ascii_lowercase().contains(needle)
-}
-
-fn provider_stack_contains(provider: &str, upstream_provider: Option<&str>, needle: &str) -> bool {
-    let needle = &needle.to_ascii_lowercase();
-    normalized_provider_matches(provider, needle)
-        || upstream_provider
-            .map(|upstream| normalized_provider_matches(upstream, needle))
-            .unwrap_or(false)
-}
-
-fn provider_stack_contains_any(
-    provider: &str,
-    upstream_provider: Option<&str>,
-    needles: &[&str],
-) -> bool {
-    needles
-        .iter()
-        .any(|needle| provider_stack_contains(provider, upstream_provider, needle))
-}
-
-fn supports_reliable_zero_cache_read_warning(
-    provider: &str,
-    upstream_provider: Option<&str>,
-) -> bool {
-    if provider_stack_contains_any(
-        provider,
-        upstream_provider,
-        &["openai", "anthropic", "claude", "gemini", "google"],
-    ) {
-        return true;
-    }
-
-    // OpenRouter/Jcode-subscription routes can only be treated as reliable for zero-read
-    // warnings once the upstream provider identifies a known cache-reporting family.
-    // A bare OpenRouter route with cached_tokens=0 is not enough: some upstreams simply
-    // do not implement prompt caching, and warning on those would make the UI untrustworthy.
-    false
-}
-
-fn min_cacheable_input_tokens(provider: &str, upstream_provider: Option<&str>) -> u64 {
-    if provider_stack_contains_any(provider, upstream_provider, &["gemini", "google"]) {
-        // Be conservative for Gemini-style implicit caching. Several Gemini models have
-        // higher minimums than OpenAI/Anthropic; a higher UI threshold avoids warning on
-        // prompts that might legitimately be below the provider's cacheable size.
-        4_096
-    } else {
-        1_024
-    }
-}
-
-fn cache_expected_warm(cache_ttl: Option<&CacheTtlInfo>) -> bool {
-    cache_ttl
-        .map(|info| !info.is_cold && !info.is_estimate)
-        .unwrap_or(false)
-}
-
-/// Detect a KV/prompt-cache problem that is reliable enough to surface in the UI.
-///
-/// This intentionally does **not** warn merely because a cache-hit metric is absent. A warning
-/// requires all of the following:
-/// - a multi-turn conversation where cache reuse should be possible;
-/// - a prior completed turn still within the provider's expected cache TTL;
-/// - explicit provider telemetry showing either a cache rewrite without a read, or an explicit
-///   zero cache-read count from a known cache-reporting provider family;
-/// - enough input tokens to be cacheable for read-only providers.
-pub(crate) fn detect_kv_cache_problem(
-    provider: &str,
-    upstream_provider: Option<&str>,
-    user_turn_count: usize,
-    input_tokens: u64,
-    cache_read: Option<u64>,
-    cache_creation: Option<u64>,
-    cache_ttl: Option<&CacheTtlInfo>,
-) -> Option<KvCacheProblem> {
-    if user_turn_count <= 2 || !cache_expected_warm(cache_ttl) {
-        return None;
-    }
-
-    let cache_read_tokens = cache_read.unwrap_or(0);
-    let cache_creation_tokens = cache_creation.unwrap_or(0);
-
-    // Strongest signal: the provider explicitly says it created cache but read none.
-    if cache_creation_tokens > 0 && cache_read_tokens == 0 {
-        return Some(KvCacheProblem {
-            kind: KvCacheProblemKind::UnexpectedCacheCreation,
-            affected_tokens: Some(cache_creation_tokens),
-        });
-    }
-
-    // Read-only telemetry providers (OpenAI/Gemini and known OpenRouter upstreams) do not expose
-    // cache creation tokens. For those, an explicit zero read on a warm, cacheable conversation is
-    // the reliable signal. Absence of the metric is ignored.
-    if cache_read != Some(0) {
-        return None;
-    }
-
-    if !supports_reliable_zero_cache_read_warning(provider, upstream_provider) {
-        return None;
-    }
-
-    if input_tokens < min_cacheable_input_tokens(provider, upstream_provider) {
-        return None;
-    }
-
-    Some(KvCacheProblem {
-        kind: KvCacheProblemKind::ExpectedCacheReadMissing,
-        affected_tokens: Some(input_tokens),
-    })
-}
+#[path = "cache_diagnostics.rs"]
+mod cache_diagnostics;
+#[cfg(test)]
+use cache_diagnostics::cache_expected_warm;
+pub(crate) use cache_diagnostics::detect_kv_cache_problem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -1488,6 +1433,19 @@ pub enum PickerKind {
     Account,
     Login,
     Usage,
+}
+
+/// Live voice input shown inside the composer: a waveform row above the
+/// prompt and the in-progress transcript as ghost text after the cursor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceComposerPreview {
+    pub recording: bool,
+    pub elapsed_secs: u64,
+    /// Recent RMS levels, oldest first.
+    pub levels: Vec<f32>,
+    pub live: String,
+    /// Trailing key hint, e.g. `Ctrl+Space send · Esc cancel`.
+    pub hint: String,
 }
 
 /// Render snapshot of the Ctrl+R reverse prompt-history search overlay.
@@ -1705,64 +1663,6 @@ impl PickerKind {
 
     pub fn uses_compact_navigation(&self) -> bool {
         self.schema().layout == InlineInteractiveLayout::Compact
-    }
-
-    pub fn filter_text(&self, entry: &PickerEntry) -> String {
-        match self {
-            Self::Account => {
-                let provider = entry
-                    .active_option()
-                    .map(|option| option.provider.as_str())
-                    .unwrap_or("");
-                let state = entry.account_state_label().unwrap_or("");
-                format!("{} {} {}", entry.name, provider, state)
-            }
-            Self::Login => {
-                let auth_kind = entry
-                    .active_option()
-                    .map(|option| option.provider.as_str())
-                    .unwrap_or("");
-                let state = entry
-                    .active_option()
-                    .map(|option| option.api_method.as_str())
-                    .unwrap_or("");
-                let detail = entry
-                    .active_option()
-                    .map(|option| option.detail.as_str())
-                    .unwrap_or("");
-                format!("{} {} {} {}", entry.name, auth_kind, state, detail)
-            }
-            Self::Usage => {
-                let status = entry
-                    .active_option()
-                    .map(|option| option.provider.as_str())
-                    .unwrap_or("");
-                let window = entry
-                    .active_option()
-                    .map(|option| option.api_method.as_str())
-                    .unwrap_or("");
-                let detail = entry
-                    .active_option()
-                    .map(|option| option.detail.as_str())
-                    .unwrap_or("");
-                format!("{} {} {} {}", entry.name, status, window, detail)
-            }
-            Self::Model => {
-                let route = entry.active_option();
-                let provider = route.map(|option| option.provider.as_str()).unwrap_or("");
-                let method = route.map(|option| option.api_method.as_str()).unwrap_or("");
-                let detail = route.map(|option| option.detail.as_str()).unwrap_or("");
-                // Include the pretty name so a query like "opus 4.8" matches
-                // the row even though the underlying id is `claude-opus-4-8`.
-                let pretty =
-                    crate::tui::app::helpers::model_names::pretty_known_model_family(&entry.name)
-                        .unwrap_or_default();
-                format!(
-                    "{} {} {} {} {}",
-                    entry.name, pretty, provider, method, detail
-                )
-            }
-        }
     }
 }
 
@@ -2070,6 +1970,8 @@ pub struct PickerEntry {
     pub is_default: bool,
     pub is_favorite: bool,
     pub recommended: bool,
+    /// Model recommendation rank, or effective account priority in /account.
+    /// usize::MAX means no ranked account metadata (e.g. management actions).
     pub recommendation_rank: usize,
     pub usage_score: u32,
     pub old: bool,
@@ -2079,6 +1981,28 @@ pub struct PickerEntry {
 }
 
 impl PickerEntry {
+    pub fn account_pool_key(&self) -> Option<String> {
+        match &self.action {
+            PickerAction::Account(AccountPickerAction::Switch { provider_id, label }) => Some(
+                crate::auth::account_pool::account_key(provider_id, Some(label)),
+            ),
+            PickerAction::Login(provider)
+                if !matches!(
+                    provider.target,
+                    crate::provider_catalog::LoginProviderTarget::AutoImport
+                ) =>
+            {
+                Some(provider.id.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn account_priority(&self) -> Option<u32> {
+        self.account_pool_key()?;
+        u32::try_from(self.recommendation_rank).ok()
+    }
+
     pub fn active_option(&self) -> Option<&PickerOption> {
         self.options.get(self.selected_option)
     }
@@ -2122,6 +2046,19 @@ pub(crate) fn ssh_remote_host() -> Option<String> {
         .filter(|host| !host.trim().is_empty())
 }
 
+// A submitted prompt is an explicit retry request, not an automatic retry.
+// The native SSH adapter consumes this once on the next socket connection.
+static USER_REQUESTED_SSH_RECONNECT: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn request_immediate_ssh_reconnect() {
+    USER_REQUESTED_SSH_RECONNECT.store(true, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn take_immediate_ssh_reconnect_request() -> bool {
+    USER_REQUESTED_SSH_RECONNECT.swap(false, Ordering::AcqRel)
+}
+
 pub(crate) fn is_ssh_remote() -> bool {
     ssh_remote_host().is_some()
 }
@@ -2136,7 +2073,15 @@ pub(crate) fn subscribe_metadata(
             jcode_selfdev_types::client_selfdev_requested().then_some(true),
         );
     }
-    let working_dir = std::env::current_dir().ok();
+    let working_dir = std::env::current_dir().map_or_else(
+        |error| {
+            crate::logging::debug(&format!(
+                "Could not read working directory for session subscription: {error}"
+            ));
+            None
+        },
+        Some,
+    );
     resolve_subscribe_metadata(
         working_dir.as_deref(),
         remote_working_dir,

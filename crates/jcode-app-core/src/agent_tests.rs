@@ -38,45 +38,6 @@ struct NativeAutoCompactionProvider;
 
 struct BoundSavedAccountProvider;
 
-#[tokio::test]
-async fn user_response_capability_updates_locked_tool_surface() {
-    let mut agent = Agent::new(Arc::new(BoundSavedAccountProvider), Registry::empty());
-    assert!(
-        !agent
-            .tool_definitions()
-            .await
-            .iter()
-            .any(|d| d.name == "user_response")
-    );
-    assert!(agent.locked_tools.is_some());
-    assert!(!agent.tool_names().await.iter().any(|n| n == "applet"));
-    agent.set_desktop_response_capability(true).await;
-    assert!(agent.locked_tools.is_none());
-    assert!(agent.tool_names().await.iter().any(|n| n == "applet"));
-    assert!(
-        agent
-            .tool_definitions()
-            .await
-            .iter()
-            .any(|d| d.name == "user_response")
-    );
-    agent.set_desktop_response_capability(true).await;
-    assert!(
-        agent.locked_tools.is_some(),
-        "unchanged capability preserves the cache"
-    );
-    agent.set_desktop_response_capability(false).await;
-    assert!(agent.locked_tools.is_none());
-    assert!(!agent.tool_names().await.iter().any(|n| n == "applet"));
-    assert!(
-        !agent
-            .tool_definitions()
-            .await
-            .iter()
-            .any(|d| d.name == "user_response")
-    );
-}
-
 #[async_trait]
 impl Provider for BoundSavedAccountProvider {
     async fn complete(
@@ -100,67 +61,6 @@ impl Provider for BoundSavedAccountProvider {
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(Self)
     }
-}
-
-#[tokio::test]
-async fn saved_account_observed_binding_is_persisted() {
-    let _guard = crate::storage::lock_test_env();
-    let home = tempfile::tempdir().unwrap();
-    struct RestoreHome(Option<std::ffi::OsString>);
-    impl Drop for RestoreHome {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(home) => crate::env::set_var("JCODE_HOME", home),
-                None => crate::env::remove_var("JCODE_HOME"),
-            }
-            crate::config::Config::invalidate_cache();
-        }
-    }
-    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
-    crate::env::set_var("JCODE_HOME", home.path());
-    crate::config::Config::invalidate_cache();
-    let provider: Arc<dyn Provider> = Arc::new(BoundSavedAccountProvider);
-    let mut agent = Agent::new(provider, Registry::empty());
-    agent.session.route_api_method = None;
-    agent.session.save_prepared().unwrap();
-    agent.sync_bound_account_route();
-    assert_eq!(
-        agent.session.route_api_method.as_deref(),
-        Some("openai-oauth@work")
-    );
-    let saved = crate::session::Session::load(&agent.session.id).unwrap();
-    assert_eq!(saved.route_api_method.as_deref(), Some("openai-oauth@work"));
-    assert_eq!(saved.provider_key.as_deref(), Some("openai-oauth"));
-    agent.sync_bound_account_route();
-    assert_eq!(agent.session.route_api_method, saved.route_api_method);
-    crate::provider::clear_openai_provider_unavailability_for_account_label(Some("work"));
-    crate::provider::clear_openai_provider_unavailability_for_account_label(Some("personal"));
-    agent.record_failed_account_route("429 rate limit reached");
-    assert!(
-        crate::provider::provider_unavailability_detail_for_account_label("openai", Some("work"))
-            .is_some()
-    );
-    assert!(
-        crate::provider::provider_unavailability_detail_for_account_label(
-            "openai",
-            Some("personal")
-        )
-        .is_none()
-    );
-    crate::provider::clear_openai_provider_unavailability_for_account_label(Some("work"));
-    agent.session.route_api_method = Some("openai-oauth@personal".to_string());
-    agent.sync_bound_account_route();
-    assert_eq!(
-        agent.session.route_api_method.as_deref(),
-        Some("openai-oauth@personal")
-    );
-    assert!(
-        agent
-            .ensure_session_lease()
-            .unwrap_err()
-            .to_string()
-            .contains("personal")
-    );
 }
 
 #[tokio::test]
@@ -786,6 +686,62 @@ async fn injected_soft_interrupts_report_client_ids_per_group_in_queue_order() {
             ("three".to_string(), vec!["f3".into()]),
         ]
     );
+}
+
+#[tokio::test]
+async fn file_activity_interrupt_keeps_typed_identity_without_model_prefix() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+    let content = "moss edited src/parser.rs +3-1: fix parser";
+    agent.queue_soft_interrupt(
+        content.into(),
+        vec![],
+        false,
+        SoftInterruptSource::FileActivity,
+    );
+    let injected = agent.inject_soft_interrupts();
+    let stored = agent.session.messages.last().unwrap();
+    assert_eq!(
+        stored.display_role,
+        Some(crate::session::StoredDisplayRole::FileActivity)
+    );
+    assert!(matches!(&stored.content[0], ContentBlock::Text { text, .. } if text == content));
+    let events = Agent::build_soft_interrupt_events(injected, "D", None);
+    assert!(
+        matches!(&events[0], ServerEvent::SoftInterruptInjected { content: text, display_role: Some(role), .. }
+        if text == content && role == "file_activity")
+    );
+}
+
+#[tokio::test]
+async fn adjacent_notifications_each_emit_a_delivery_event() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+    for source in [
+        SoftInterruptSource::System,
+        SoftInterruptSource::BackgroundTask,
+    ] {
+        for content in ["first notice", "second notice"] {
+            agent.queue_soft_interrupt(content.into(), vec![], false, source);
+        }
+    }
+    let injected = agent.inject_soft_interrupts();
+    let events = Agent::build_soft_interrupt_events(injected, "D", None);
+    assert_eq!(events.len(), 4);
+    for (event, expected) in events.iter().zip([
+        "first notice",
+        "second notice",
+        "first notice",
+        "second notice",
+    ]) {
+        assert!(
+            matches!(event, ServerEvent::SoftInterruptInjected { content, .. } if content == expected)
+        );
+    }
 }
 
 #[tokio::test]
@@ -1741,7 +1697,8 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: Some(chrono::Utc::now()),
             tool_duration_ms: None,
         },
@@ -1901,7 +1858,8 @@ async fn env_snapshot_detail_is_minimal_for_empty_sessions_and_full_after_histor
             content: vec![ContentBlock::Text {
                 text: "hello".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
@@ -2706,97 +2664,8 @@ async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
     );
 }
 
-#[derive(Clone, Default)]
-struct SystemPromptCaptureProvider {
-    requests: Arc<std::sync::Mutex<Vec<(String, Vec<Message>)>>>,
-}
-
-#[async_trait]
-impl Provider for SystemPromptCaptureProvider {
-    async fn complete(
-        &self,
-        messages: &[Message],
-        _tools: &[ToolDefinition],
-        system: &str,
-        _resume_session_id: Option<&str>,
-    ) -> Result<EventStream> {
-        self.requests
-            .lock()
-            .unwrap()
-            .push((system.to_string(), messages.to_vec()));
-        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
-        tokio::spawn(async move {
-            let _ = tx.send(Ok(StreamEvent::TextDelta("ok".to_string()))).await;
-            let _ = tx
-                .send(Ok(StreamEvent::MessageEnd {
-                    stop_reason: Some("end_turn".to_string()),
-                }))
-                .await;
-        });
-        Ok(Box::pin(ReceiverStream::new(rx)))
-    }
-
-    fn name(&self) -> &str {
-        "mock"
-    }
-
-    fn fork(&self) -> Arc<dyn Provider> {
-        Arc::new(self.clone())
-    }
-}
-
-/// A swarm DM wakes the recipient with a per-turn system reminder. Putting it
-/// in the system prompt changed the prefix of every cached message, so each DM
-/// cost a full KV cache miss, and the next turn missed again when it vanished.
-/// The reminder must ride in the transcript and leave the system prompt alone.
-#[tokio::test]
-async fn turn_system_reminder_does_not_change_the_system_prompt() {
-    let _guard = crate::storage::lock_test_env();
-    let capture = SystemPromptCaptureProvider::default();
-    let requests = capture.requests.clone();
-    let provider: Arc<dyn Provider> = Arc::new(capture);
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
-
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    agent
-        .run_once_streaming_mpsc("first", Vec::new(), None, tx.clone())
-        .await
-        .expect("plain turn");
-    agent
-        .run_once_streaming_mpsc(
-            "DM from fox: hello",
-            Vec::new(),
-            Some("You just received a direct swarm message from fox.".to_string()),
-            tx.clone(),
-        )
-        .await
-        .expect("reminder turn");
-    agent
-        .run_once_streaming_mpsc("third", Vec::new(), None, tx)
-        .await
-        .expect("follow-up turn");
-
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        requests.iter().all(|(system, _)| system == &requests[0].0),
-        "the system prompt must be identical across reminder and plain turns"
-    );
-    assert!(!requests[1].0.contains("direct swarm message"));
-
-    let reminder_turn = &requests[1].1;
-    let last = reminder_turn.last().map(message_text).unwrap_or_default();
-    assert!(last.starts_with("<system-reminder>"), "got {last:?}");
-    assert!(last.contains("direct swarm message from fox"));
-
-    // The follow-up turn replays the reminder turn unchanged as its prefix.
-    let follow_up = &requests[2].1;
-    assert!(follow_up.len() > reminder_turn.len());
-    for (before, after) in reminder_turn.iter().zip(follow_up.iter()) {
-        assert_eq!(message_text(before), message_text(after));
-    }
-}
+#[path = "agent_tests/system_prompt_reminder.rs"]
+mod system_prompt_reminder;
 
 #[derive(Clone, Default)]
 struct FableGuardrailProvider {
@@ -3253,3 +3122,6 @@ async fn resume_heals_stale_credential_route_after_credential_type_change() {
         "workers inheriting the healed session must target the live credential"
     );
 }
+
+#[path = "agent_tests_additional_tests.rs"]
+mod additional_working_directory_moves_preserve_first_active_session_origin;

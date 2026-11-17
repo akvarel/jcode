@@ -25,6 +25,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 
+fn unwrap_test_turn_event(mut event: ServerEvent) -> ServerEvent {
+    while let ServerEvent::TurnEvent { event: inner, .. } = event {
+        event = *inner;
+    }
+    event
+}
+
 struct EnvGuard {
     prev_home: Option<OsString>,
     prev_runtime_dir: Option<OsString>,
@@ -45,6 +52,8 @@ fn file_access_with_summary(summary: Option<&str>) -> FileAccess {
         intent: None,
         summary: summary.map(str::to_string),
         detail: None,
+        added: 0,
+        removed: 0,
     }
 }
 
@@ -56,6 +65,8 @@ fn file_touch_with_summary(summary: Option<&str>) -> FileTouch {
         intent: None,
         summary: summary.map(str::to_string),
         detail: None,
+        added: 0,
+        removed: 0,
     }
 }
 
@@ -98,20 +109,56 @@ fn swarm_watch_runtime_reconciles_running_success_and_failure() {
 }
 
 #[tokio::test]
+async fn session_env_live_updates_cannot_recreate_destroyed_sessions() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("create temporary JCODE_HOME");
+    let _home_guard = ScopedEnvVar::set("JCODE_HOME", home.path());
+    let sid = "session-env-live-update-cleanup";
+    let agent = test_agent(Arc::new(StreamingMockProvider::default())).await;
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(sid.to_owned(), agent.clone())]),
+    ));
+    let env = HashMap::from([("SESSION_SECRET".into(), "original".into())]);
+    super::set_live_session_env(&sessions, sid, env.clone())
+        .await
+        .unwrap();
+    assert_eq!(crate::session_env::session_env(sid), env);
+    let (update, removed) = tokio::join!(
+        super::set_live_session_env(&sessions, sid, env.clone()),
+        remove_session_entry(&sessions, sid),
+    );
+    let _ = update;
+    assert!(Arc::ptr_eq(&removed.unwrap(), &agent));
+    assert!(crate::session_env::session_env(sid).is_empty());
+    assert!(
+        super::set_live_session_env(&sessions, sid, env)
+            .await
+            .is_err()
+    );
+    assert!(crate::session_env::session_env(sid).is_empty());
+}
+
+#[tokio::test]
 async fn removing_server_session_clears_active_pid_marker() {
     let _guard = crate::storage::lock_test_env();
     let home = tempfile::tempdir().expect("create temporary JCODE_HOME");
     let _home_guard = ScopedEnvVar::set("JCODE_HOME", home.path());
     let session_id = "session_marker_cleanup_test";
     crate::storage::register_active_pid(session_id, std::process::id());
+    crate::session_env::set_session_env(
+        session_id,
+        HashMap::from([("LIFECYCLE_SECRET".into(), "cleanup-value".into())]),
+    )
+    .unwrap();
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        "agent",
-    )])));
+    let agent = test_agent(Arc::new(StreamingMockProvider::default())).await;
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.to_string(), agent.clone())]),
+    ));
     let removed = remove_session_entry(&sessions, session_id).await;
 
-    assert_eq!(removed, Some("agent"));
+    assert!(Arc::ptr_eq(&removed.unwrap(), &agent));
+    assert!(crate::session_env::session_env(session_id).is_empty());
     assert!(!sessions.read().await.contains_key(session_id));
     assert!(
         !crate::storage::active_session_ids()
@@ -346,6 +393,119 @@ fn persisted_headless_member(
 }
 
 #[tokio::test]
+async fn swarm_worker_report_wakes_idle_root_and_queues_for_busy_root() {
+    let _env_lock = crate::storage::lock_test_env();
+    for busy in [false, true] {
+        let provider = Arc::new(StreamingMockProvider::default());
+        provider.queue_response(vec![
+            StreamEvent::TextDelta("Assigning the next chunk.".into()),
+            StreamEvent::MessageEnd { stop_reason: None },
+        ]);
+        let agent = test_agent(provider).await;
+        let session_id = agent.lock().await.session_id().to_string();
+        let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+            HashMap::from([(session_id.clone(), agent.clone())]),
+        ));
+        let queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let members = Arc::new(RwLock::new(HashMap::from([(
+            session_id.clone(),
+            attached_swarm_member(&session_id, tx),
+        )])));
+        let (swarms, history, counter, events) = empty_swarm_status_state();
+        let report = crate::bus::SwarmWorkerReported {
+            session_id: session_id.clone(),
+            worker_session_id: "finished-worker".into(),
+            notification: "Worker finished parser tests and is ready for more.".into(),
+        };
+        let reservation = if busy { Some(agent.lock().await) } else { None };
+        let queue = if let Some(guard) = reservation.as_ref() {
+            let queue = guard.soft_interrupt_queue();
+            queues
+                .write()
+                .await
+                .insert(session_id.clone(), queue.clone());
+            Some(queue)
+        } else {
+            None
+        };
+        super::background_tasks::dispatch_swarm_worker_report(
+            &report,
+            &sessions,
+            &queues,
+            super::live_turn::LiveTurnSwarmContext::new(
+                &members, &swarms, &history, &counter, &events,
+            ),
+        )
+        .await;
+        if let Some(queue) = queue {
+            assert_eq!(
+                queue.lock().unwrap().len(),
+                1,
+                "busy root must receive the report without a new turn"
+            );
+        } else {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    if matches!(
+                        rx.recv().await.map(unwrap_test_turn_event),
+                        Some(ServerEvent::Done { .. })
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("idle root should wake and finish a real tracked turn");
+            let guard = agent.lock().await;
+            assert!(guard.messages().iter().any(|message| {
+                message.content.iter().any(|block| matches!(block,
+                    crate::message::ContentBlock::Text { text, .. } if text.contains(&report.notification)))
+            }), "worker report must reach model context, not just UI");
+        }
+    }
+}
+
+#[tokio::test]
+async fn swarm_worker_report_does_not_revive_cancelled_root() {
+    let _env_lock = crate::storage::lock_test_env();
+    let provider = Arc::new(StreamingMockProvider::default());
+    let agent = test_agent(provider).await;
+    let session_id = agent.lock().await.session_id().to_string();
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
+    let queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut member = attached_swarm_member(&session_id, tx);
+    member.status = "stopped".into();
+    let members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
+    let (swarms, history, counter, events) = empty_swarm_status_state();
+    super::background_tasks::dispatch_swarm_worker_report(
+        &crate::bus::SwarmWorkerReported {
+            session_id: session_id.clone(),
+            worker_session_id: "worker".into(),
+            notification: "done".into(),
+        },
+        &sessions,
+        &queues,
+        super::live_turn::LiveTurnSwarmContext::new(&members, &swarms, &history, &counter, &events),
+    )
+    .await;
+    assert!(rx.try_recv().is_err());
+    assert!(
+        agent
+            .lock()
+            .await
+            .soft_interrupt_queue()
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(members.read().await[&session_id].status, "stopped");
+}
+
+#[tokio::test]
 async fn background_task_wake_runs_live_session_immediately_when_idle() {
     let _env_lock = crate::storage::lock_test_env();
     let _wake_mode = ScopedEnvVar::set("JCODE_WAKE_MODE", "internal");
@@ -357,10 +517,9 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     let provider_dyn: Arc<dyn Provider> = provider.clone();
     let agent = test_agent(provider_dyn).await;
     let session_id = agent.lock().await.session_id().to_string();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
@@ -396,7 +555,7 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
 
     let notification = timeout(Duration::from_secs(2), async {
         loop {
-            match member_event_rx.recv().await {
+            match member_event_rx.recv().await.map(unwrap_test_turn_event) {
                 Some(ServerEvent::Notification {
                     notification_type,
                     message,
@@ -421,7 +580,7 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
 
     let streamed = timeout(Duration::from_secs(2), async {
         loop {
-            match member_event_rx.recv().await {
+            match member_event_rx.recv().await.map(unwrap_test_turn_event) {
                 Some(ServerEvent::TextDelta { text })
                     if text.contains("Build result processed.") =>
                 {
@@ -458,10 +617,9 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
     let agent = test_agent(provider_dyn).await;
     let session_id = agent.lock().await.session_id().to_string();
     let initial_message_count = agent.lock().await.messages().len();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
@@ -495,19 +653,19 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
     )
     .await;
 
-    let event = timeout(Duration::from_secs(2), async {
-        loop {
-            let event = member_event_rx
-                .recv()
-                .await
-                .expect("member event stream should remain open");
-            if matches!(event, ServerEvent::WakeRequested { .. }) {
-                break event;
-            }
-        }
-    })
-    .await
-    .expect("external wake request should arrive promptly");
+    let lifecycle = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("silent lifecycle should arrive promptly")
+        .expect("member event stream should remain open");
+    assert!(matches!(lifecycle, ServerEvent::Notification {
+        notification_type: crate::protocol::NotificationType::Message { scope: Some(scope), .. },
+        ..
+    } if scope == "background_activity"));
+
+    let event = timeout(Duration::from_secs(2), member_event_rx.recv())
+        .await
+        .expect("external wake request should arrive promptly")
+        .expect("member event stream should remain open");
     match event {
         ServerEvent::WakeRequested {
             session_id: event_session_id,
@@ -540,10 +698,9 @@ async fn idle_live_agent_wakes_restored_headless_member_without_attachments() {
     let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
     let agent = test_agent(provider).await;
     let session_id = agent.lock().await.session_id().to_string();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let (closed_tx, closed_rx) = mpsc::unbounded_channel();
     drop(closed_rx);
     let mut member = attached_swarm_member(&session_id, closed_tx);
@@ -579,10 +736,9 @@ async fn idle_live_agent_reservation_blocks_a_second_wake_until_released() {
     let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
     let agent = test_agent(provider).await;
     let session_id = agent.lock().await.session_id().to_string();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let (member_event_tx, _member_event_rx) = mpsc::unbounded_channel();
     let member = attached_swarm_member(&session_id, member_event_tx);
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
@@ -616,10 +772,9 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
     let provider_dyn: Arc<dyn Provider> = provider.clone();
     let agent = test_agent(provider_dyn).await;
     let session_id = agent.lock().await.session_id().to_string();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let member = attached_swarm_member(&session_id, member_event_tx);
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
@@ -645,7 +800,7 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
     // Wait for the terminal Done fanout.
     timeout(Duration::from_secs(2), async {
         loop {
-            match member_event_rx.recv().await {
+            match member_event_rx.recv().await.map(unwrap_test_turn_event) {
                 Some(ServerEvent::Done { .. }) => return,
                 Some(_) => continue,
                 None => panic!("member stream closed"),
@@ -688,10 +843,9 @@ async fn wake_turn_tracks_member_status_and_emits_terminal_done() {
     let provider_dyn: Arc<dyn Provider> = provider.clone();
     let agent = test_agent(provider_dyn).await;
     let session_id = agent.lock().await.session_id().to_string();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let mut member = attached_swarm_member(&session_id, member_event_tx);
     member.swarm_id = Some("test-swarm".to_string());
@@ -742,7 +896,7 @@ async fn wake_turn_tracks_member_status_and_emits_terminal_done() {
     // Attached clients must see a terminal Done event so the UI can settle.
     let saw_done = timeout(Duration::from_secs(2), async {
         loop {
-            match member_event_rx.recv().await {
+            match member_event_rx.recv().await.map(unwrap_test_turn_event) {
                 Some(ServerEvent::Done { .. }) => return true,
                 Some(_) => continue,
                 None => return false,
@@ -789,10 +943,9 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
     let agent = test_agent(provider).await;
     let session_id = agent.lock().await.session_id().to_string();
     let queue = agent.lock().await.soft_interrupt_queue();
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.clone(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.clone(), agent.clone())]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::from([(
         session_id.clone(),
         queue.clone(),
@@ -845,6 +998,105 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
         pending.is_empty(),
         "notify-only delivery should not wake the session"
     );
+}
+
+#[test]
+fn background_completion_acknowledges_only_delivered_notifications() {
+    use crate::orchestration_watchdog::{
+        OrchestrationWatchdog, ReconcileObservation, RetryPolicy, RuntimeState, WatchSpec,
+    };
+
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("isolated home");
+    let _home = ScopedEnvVar::set("JCODE_HOME", home.path());
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        for (job_id, notify, attached, expected_delivered) in [
+            ("notify-unattached", true, false, false),
+            ("notify-attached", true, true, true),
+            ("silent-attached", false, true, true),
+        ] {
+            let watchdog = OrchestrationWatchdog::new();
+            watchdog
+                .register(WatchSpec {
+                    job_id: job_id.to_string(),
+                    dedupe_key: job_id.to_string(),
+                    owner_session_id: "delivery-session".to_string(),
+                    worker_session_id: None,
+                    process_id: None,
+                    working_dir: home.path().to_path_buf(),
+                    baseline_sha: None,
+                    expected_sha: None,
+                    expected_artifacts: Vec::new(),
+                    deadline: None,
+                    stale_after: chrono::Duration::hours(1),
+                    retry: RetryPolicy::default(),
+                })
+                .expect("register watch");
+            watchdog
+                .reconcile(
+                    job_id,
+                    ReconcileObservation::runtime(RuntimeState::Completed),
+                )
+                .expect("complete watch");
+            assert!(
+                watchdog
+                    .claim_terminal_delivery(job_id, "test-dispatcher")
+                    .expect("claim delivery")
+                    .is_some()
+            );
+
+            let sessions = Arc::new(super::session_manager::SessionManager::from_agents(
+                HashMap::new(),
+            ));
+            let queues = Arc::new(RwLock::new(HashMap::new()));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let members = Arc::new(RwLock::new(if attached {
+                HashMap::from([(
+                    "delivery-session".to_string(),
+                    attached_swarm_member("delivery-session", tx),
+                )])
+            } else {
+                HashMap::new()
+            }));
+            let task = BackgroundTaskCompleted {
+                task_id: job_id.to_string(),
+                tool_name: "bash".to_string(),
+                display_name: None,
+                session_id: "delivery-session".to_string(),
+                status: BackgroundTaskStatus::Completed,
+                exit_code: Some(0),
+                output_preview: "done".to_string(),
+                output_file: home.path().join("output"),
+                duration_secs: 0.1,
+                notify,
+                wake: false,
+            };
+            let (swarms, history, counter, events) = empty_swarm_status_state();
+            dispatch_background_task_completion(
+                &task, &sessions, &queues, &members, &swarms, &history, &counter, &events,
+            )
+            .await;
+
+            let record = watchdog.get(job_id).expect("read watch").expect("watch");
+            assert_eq!(
+                record.audit.iter().any(|event| event.kind == "delivered"),
+                expected_delivered,
+                "{job_id}"
+            );
+            if attached {
+                let expected_scope = if notify {
+                    "background_task"
+                } else {
+                    "background_activity"
+                };
+                assert!(matches!(rx.try_recv(), Ok(ServerEvent::Notification {
+                    notification_type: NotificationType::Message { scope: Some(scope), .. },
+                    ..
+                }) if scope == expected_scope));
+            }
+        }
+    });
 }
 
 #[tokio::test]
@@ -901,322 +1153,8 @@ async fn background_task_progress_notifies_attached_clients() {
     }
 }
 
-#[tokio::test]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "test intentionally serializes process-wide JCODE_HOME/env state across async recovery assertions"
-)]
-async fn startup_recovery_resumes_interrupted_headless_sessions_after_reload() -> Result<()> {
-    let _storage_guard = crate::storage::lock_test_env();
-    let temp = tempfile::TempDir::new()?;
-    let _env = configure_test_env(&temp);
+#[path = "startup_recovery_tests.rs"]
+mod startup_recovery;
 
-    let provider = Arc::new(StreamingMockProvider::default());
-    for _ in 0..2 {
-        provider.queue_response(vec![
-            StreamEvent::TextDelta("continued after reload".to_string()),
-            StreamEvent::MessageEnd { stop_reason: None },
-        ]);
-    }
-
-    let mut initiator = crate::session::Session::create(None, Some("initiator".to_string()));
-    initiator.set_canary("self-dev");
-    initiator.add_message(
-        Role::User,
-        vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_reload".to_string(),
-            content: "Reload initiated. Process restarting...".to_string(),
-            is_error: Some(false),
-        }],
-    );
-    initiator.save()?;
-
-    ReloadContext {
-        task_context: Some("Verify multi-session reload recovery".to_string()),
-        version_before: "old-build".to_string(),
-        version_after: "new-build".to_string(),
-        session_id: initiator.id.clone(),
-        timestamp: "2026-04-19T00:00:00Z".to_string(),
-    }
-    .save()?;
-
-    let mut peer = crate::session::Session::create(None, Some("peer".to_string()));
-    peer.add_message(
-        Role::User,
-        vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_bash".to_string(),
-            content: "[Tool 'bash' interrupted by server reload after 0.2s]".to_string(),
-            is_error: Some(true),
-        }],
-    );
-    peer.save()?;
-
-    let swarm_id = "swarm-reload-recovery";
-    persist_swarm_state_snapshot(
-        swarm_id,
-        None,
-        None,
-        &[
-            persisted_headless_member(&initiator.id, swarm_id, "running", "selfdev reload"),
-            persisted_headless_member(&peer.id, swarm_id, "running", "bash tool"),
-        ],
-    );
-
-    let server = Server::new(provider.clone());
-    {
-        let members = server.swarm_state.members.read().await;
-        assert_eq!(
-            members
-                .get(&initiator.id)
-                .map(|member| member.status.as_str()),
-            Some("crashed"),
-            "persisted running headless sessions should load as crashed before recovery"
-        );
-        assert_eq!(
-            members.get(&peer.id).map(|member| member.status.as_str()),
-            Some("crashed")
-        );
-    }
-
-    server.recover_headless_sessions_on_startup().await;
-
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let sessions = server.sessions.read().await;
-            let Some(initiator_agent) = sessions.get(&initiator.id).cloned() else {
-                drop(sessions);
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            let Some(peer_agent) = sessions.get(&peer.id).cloned() else {
-                drop(sessions);
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            drop(sessions);
-
-            let initiator_done = {
-                let guard = initiator_agent.lock().await;
-                guard.messages().iter().any(|message| {
-                    message.role == Role::Assistant
-                        && message.content_preview().contains("continued after reload")
-                })
-            };
-            let peer_done = {
-                let guard = peer_agent.lock().await;
-                guard.messages().iter().any(|message| {
-                    message.role == Role::Assistant
-                        && message.content_preview().contains("continued after reload")
-                })
-            };
-            let statuses_ready = {
-                let members = server.swarm_state.members.read().await;
-                members
-                    .get(&initiator.id)
-                    .map(|member| member.status.as_str())
-                    == Some("ready")
-                    && members.get(&peer.id).map(|member| member.status.as_str()) == Some("ready")
-            };
-
-            if initiator_done && peer_done && statuses_ready {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("headless reload recovery should resume both sessions");
-
-    assert!(
-        ReloadContext::peek_for_session(&initiator.id)?.is_none(),
-        "initiator reload context should be consumed by headless recovery"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "test intentionally serializes process-wide JCODE_HOME/env state across async recovery assertions"
-)]
-async fn startup_recovery_preserves_headed_session_reload_context_for_later_reconnect() -> Result<()>
-{
-    let _storage_guard = crate::storage::lock_test_env();
-    let temp = tempfile::TempDir::new()?;
-    let _env = configure_test_env(&temp);
-
-    let provider = Arc::new(StreamingMockProvider::default());
-    provider.queue_response(vec![
-        StreamEvent::TextDelta("continued after reload".to_string()),
-        StreamEvent::MessageEnd { stop_reason: None },
-    ]);
-
-    let mut headless = crate::session::Session::create(None, Some("headless".to_string()));
-    headless.add_message(
-        Role::User,
-        vec![crate::message::ContentBlock::ToolResult {
-            tool_use_id: "tool_bash".to_string(),
-            content: "[Tool 'bash' interrupted by server reload after 0.2s]".to_string(),
-            is_error: Some(true),
-        }],
-    );
-    headless.save()?;
-
-    ReloadContext {
-        task_context: Some("resume headless worker".to_string()),
-        version_before: "old-headless".to_string(),
-        version_after: "new-headless".to_string(),
-        session_id: headless.id.clone(),
-        timestamp: "2026-04-19T00:00:00Z".to_string(),
-    }
-    .save()?;
-
-    let headed_session_id = crate::id::new_id("headed-reconnect");
-    ReloadContext {
-        task_context: Some("resume headed reconnecting session".to_string()),
-        version_before: "old-headed".to_string(),
-        version_after: "new-headed".to_string(),
-        session_id: headed_session_id.clone(),
-        timestamp: "2026-04-19T00:00:01Z".to_string(),
-    }
-    .save()?;
-
-    let swarm_id = "swarm-reload-headed-mixed";
-    persist_swarm_state_snapshot(
-        swarm_id,
-        None,
-        None,
-        &[persisted_headless_member(
-            &headless.id,
-            swarm_id,
-            "running",
-            "bash tool",
-        )],
-    );
-
-    let server = Server::new(provider.clone());
-    server.recover_headless_sessions_on_startup().await;
-
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let sessions = server.sessions.read().await;
-            let Some(headless_agent) = sessions.get(&headless.id).cloned() else {
-                drop(sessions);
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            drop(sessions);
-
-            let headless_done = {
-                let guard = headless_agent.lock().await;
-                guard.messages().iter().any(|message| {
-                    message.role == Role::Assistant
-                        && message.content_preview().contains("continued after reload")
-                })
-            };
-            if headless_done {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("headless reload recovery should complete");
-
-    assert!(
-        ReloadContext::peek_for_session(&headless.id)?.is_none(),
-        "headless session reload context should be consumed by startup recovery"
-    );
-    assert!(
-        ReloadContext::peek_for_session(&headed_session_id)?.is_some(),
-        "headed reconnecting session reload context should remain available for later reconnect"
-    );
-
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "test intentionally serializes process-wide JCODE_HOME/env state across async startup assertions"
-)]
-async fn startup_ready_signal_is_not_blocked_by_headless_recovery_delay() -> Result<()> {
-    use std::os::unix::io::FromRawFd;
-    use tokio::io::AsyncReadExt;
-
-    let _storage_guard = crate::storage::lock_test_env();
-    let temp = tempfile::TempDir::new()?;
-    let _env = configure_test_env(&temp);
-    let _delay_guard = ScopedEnvVar::set("JCODE_TEST_HEADLESS_STARTUP_RECOVERY_DELAY_MS", "500");
-
-    let mut headless =
-        crate::session::Session::create(None, Some("headless-ready-delay".to_string()));
-    headless.save()?;
-
-    let swarm_id = "swarm-ready-before-recovery";
-    persist_swarm_state_snapshot(
-        swarm_id,
-        None,
-        None,
-        &[persisted_headless_member(
-            &headless.id,
-            swarm_id,
-            "running",
-            "delay startup recovery",
-        )],
-    );
-
-    let provider = Arc::new(StreamingMockProvider::default());
-    provider.queue_response(vec![StreamEvent::MessageEnd { stop_reason: None }]);
-    let server = Server::new(provider);
-
-    let mut ready_fds = [0; 2];
-    let pipe_rc = unsafe { libc::pipe(ready_fds.as_mut_ptr()) };
-    assert_eq!(pipe_rc, 0, "pipe() should succeed");
-    let read_fd = ready_fds[0];
-    let write_fd = ready_fds[1];
-    let _ready_fd_guard = ScopedEnvVar::set("JCODE_READY_FD", write_fd.to_string());
-
-    let main_listener = crate::transport::Listener::bind(&server.socket_path)?;
-    let debug_listener = crate::transport::Listener::bind(&server.debug_socket_path)?;
-
-    let startup = tokio::spawn(async move {
-        server
-            .finish_startup_after_bind(main_listener, debug_listener, Instant::now())
-            .await
-    });
-
-    let read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
-    let mut async_read = tokio::fs::File::from_std(read_file);
-    let mut ready = [0u8; 1];
-    timeout(Duration::from_millis(200), async {
-        async_read.read_exact(&mut ready).await
-    })
-    .await
-    .expect("ready signal should arrive before delayed startup recovery completes")?;
-    assert_eq!(ready, [b'R']);
-    assert!(
-        !startup.is_finished(),
-        "startup task should still be blocked on delayed recovery even though ready was already signaled"
-    );
-
-    let (runtime, main_handle, debug_handle) = timeout(Duration::from_secs(2), startup)
-        .await
-        .expect("startup should finish after delayed recovery")
-        .expect("startup task should succeed");
-    timeout(Duration::from_secs(1), runtime.shutdown())
-        .await
-        .expect("runtime should shut down");
-    timeout(Duration::from_secs(1), async {
-        main_handle.await.expect("main accept loop");
-        debug_handle.await.expect("debug accept loop");
-    })
-    .await
-    .expect("accept loops should observe runtime cancellation");
-
-    Ok(())
-}
+#[path = "mobile_local_tests.rs"]
+mod mobile_local;

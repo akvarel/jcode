@@ -57,6 +57,72 @@ impl Provider for AccountRoutingStreamProvider {
 
 struct AccountRoutingFixtureCleanup;
 
+struct RemoteQuotaCleanup;
+
+impl Drop for RemoteQuotaCleanup {
+    fn drop(&mut self) {
+        crate::usage::clear_remote_account_usage();
+    }
+}
+
+fn exhausted_account_snapshot(label: &str) -> jcode_protocol::AccountUsageSnapshot {
+    serde_json::from_value(serde_json::json!({
+        "label": label,
+        "exhausted": true,
+        "five_hour_ratio": 1.0,
+        "resets_at": "2999-01-01T00:00:00Z"
+    }))
+    .unwrap()
+}
+
+#[test]
+fn account_router_skips_known_exhausted_alternates_without_runtime_errors() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _guard = runtime.enter();
+        let (provider, _, _cleanup) = account_routing_fixture(&[]);
+        let _quota_cleanup = RemoteQuotaCleanup;
+        crate::usage::set_remote_account_usage(
+            vec![],
+            vec![exhausted_account_snapshot("openai-fox")],
+        );
+        assert_eq!(
+            MultiProvider::same_provider_account_candidates(ActiveProvider::OpenAI),
+            vec!["openai-panda".to_string()]
+        );
+        drop(provider);
+    });
+}
+
+#[test]
+fn bound_account_router_checks_known_quota_before_sending_in_both_modes() {
+    with_clean_provider_test_env(|| {
+        enter_test_runtime().block_on(async {
+            for split in [false, true] {
+                let (provider, attempts, _cleanup) = account_routing_fixture(&[]);
+                bind_fixture_account(&provider, &attempts, "openai-otter", &[]);
+                let _quota_cleanup = RemoteQuotaCleanup;
+                crate::usage::set_remote_account_usage(
+                    vec![],
+                    vec![exhausted_account_snapshot("openai-otter")],
+                );
+                let result = if split {
+                    provider
+                        .complete_split(&[], &[], "static", "dynamic", None)
+                        .await
+                } else {
+                    provider.complete(&[], &[], "system", None).await
+                };
+                let error = result
+                    .err()
+                    .expect("exhausted login must route before sending");
+                assert!(parse_failover_prompt_message(&error.to_string()).is_some());
+                assert!(attempts.lock().unwrap().is_empty());
+            }
+        });
+    });
+}
+
 impl Drop for AccountRoutingFixtureCleanup {
     fn drop(&mut self) {
         clear_provider_unavailable_for_account("openai-api");
@@ -93,6 +159,7 @@ fn account_routing_fixture(
             .filter(|account| !labels.contains(&account.label.as_str()))
             .map(|account| format!("openai:{}", account.label))
             .collect(),
+        ..Default::default()
     }
     .save()
     .expect("save fixture pool");
@@ -716,6 +783,8 @@ fn pool_order_can_choose_explicit_api_before_same_vendor_oauth() {
             );
             let mut pool = crate::auth::account_pool::AccountPool::load();
             pool.members.insert(1, "openai-api".into());
+            // Explicit priority may opt a metered identity ahead of subscriptions.
+            pool.set_priority("openai-api", 0);
             pool.save().unwrap();
             let error = provider
                 .complete(&[], &[], "system", None)

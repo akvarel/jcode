@@ -70,6 +70,30 @@ pub enum TranscriptMode {
     Send,
 }
 
+/// Push-to-talk state captured outside the TUI (for example `jcode companion`),
+/// shown in the target session's status line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum VoiceActivity {
+    /// Microphone open. `levels` holds recent RMS levels (`0.0..=1.0`),
+    /// oldest first. `live` is the partial transcript so far.
+    Recording {
+        #[serde(default)]
+        elapsed_ms: u64,
+        #[serde(default)]
+        levels: Vec<f32>,
+        #[serde(default)]
+        live: String,
+    },
+    /// Key released, waiting for the final transcript.
+    Transcribing {
+        #[serde(default)]
+        live: String,
+    },
+    /// Capture ended (sent, cancelled or failed). Clears the indicator.
+    Idle,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommDeliveryMode {
@@ -90,6 +114,29 @@ pub struct HistoryBase {
     /// When it matches, History omits `images` and sets `images_unchanged`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images_fingerprint: Option<u64>,
+    /// Opt into a recent rendered-history window on a full bootstrap. Only
+    /// honored when `count` is zero, never combined with prefix validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_messages: Option<usize>,
+}
+
+/// Synthetic lazy-window marker used by remote transcript bootstraps.
+pub const RECENT_HISTORY_MARKER_PREFIX: &str = "Earlier remote history - ";
+
+/// `Pong.capabilities` entry of servers that accept `Request::ClientFocus`.
+pub const CLIENT_FOCUS_CAPABILITY: &str = "client_focus";
+
+impl HistoryBase {
+    /// Request a bounded initial view. Older servers ignore this hint and
+    /// return their ordinary full History payload.
+    pub fn recent(visible: usize) -> Self {
+        Self {
+            count: 0,
+            fingerprint: 0,
+            images_fingerprint: None,
+            recent_messages: Some(visible),
+        }
+    }
 }
 
 /// Stable fingerprint of a History image set (order, metadata and data).
@@ -195,6 +242,7 @@ impl HistoryFingerprinter {
             count: self.count,
             fingerprint: self.finish(),
             images_fingerprint: None,
+            recent_messages: None,
         }
     }
 }
@@ -351,7 +399,7 @@ impl AuthChanged {
 pub type ReloadRecoverySnapshot = jcode_selfdev_types::ReloadRecoveryDirective;
 
 mod wire;
-pub use wire::{AccountUsageSnapshot, Request, ServerEvent};
+pub use wire::{AccountUsageSnapshot, AccountUsageWindow, Request, ServerEvent, TurnIdentity};
 pub use wire::{SessionToolConfig, SessionToolDefinition};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +707,24 @@ pub struct SwarmMemberStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwarmMemberRuntime {
+    /// Current turn's event-derived status. Absent for older producers and
+    /// sessions that have not emitted live telemetry. Never session totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status: Option<SwarmLiveStatus>,
+    /// Foreground blocking operation or user-authorization todo pause. A display reason,
+    /// not an automatically waking durable dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    /// Complete blocker derived from the worker's own unfinished todos. Kept
+    /// separate so stale foreground waits can never masquerade as todo gates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_blocked_reason: Option<String>,
+    /// Monotonic seconds spent in the current blocking operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_age_secs: Option<u64>,
+    /// Full ordered todo statuses, independent of the capped detail snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todo_statuses: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,7 +753,12 @@ pub struct SwarmMemberRuntime {
 
 impl SwarmMemberRuntime {
     fn is_empty(&self) -> bool {
-        self.model.is_none()
+        self.live_status.is_none()
+            && self.wait_reason.is_none()
+            && self.todo_blocked_reason.is_none()
+            && self.wait_age_secs.is_none()
+            && self.todo_statuses.is_empty()
+            && self.model.is_none()
             && self.provider.is_none()
             && self.auth_method.is_none()
             && self.effort.is_none()
@@ -697,6 +768,27 @@ impl SwarmMemberRuntime {
             && self.context_limit.is_none()
             && self.output_tokens.is_none()
     }
+}
+
+/// The same provider/tool event stream used by an opened worker, projected for
+/// lightweight observers. Unknown provider values stay absent, not inferred.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SwarmLiveStatus {
+    pub phase: String,
+    pub elapsed_ms: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Tokens per second multiplied by 1000, measured over active streaming
+    /// time, excluding tools and connection establishment.
+    pub output_tps_milli: Option<u64>,
+    pub connection_type: Option<String>,
+    pub connection_phase: Option<String>,
+    pub status_detail: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_intent: Option<String>,
+    pub stop_reason: Option<String>,
+    pub stream_message_ended: bool,
 }
 
 /// One compact todo entry crossing the swarm status boundary. Only the
@@ -765,6 +857,8 @@ impl Request {
             Request::RewindUndo { id } => *id,
             Request::Ping { id } => *id,
             Request::GetState { id } => *id,
+            Request::GetTodos { id } => *id,
+            Request::ClientFocus { id, .. } => *id,
             Request::DebugCommand { id, .. } => *id,
             Request::ClientDebugCommand { id, .. } => *id,
             Request::ClientDebugResponse { id, .. } => *id,
@@ -780,10 +874,12 @@ impl Request {
             Request::AppletAction { id, .. } => *id,
             Request::CloseApplet { id, .. } => *id,
             Request::Transcript { id, .. } => *id,
+            Request::VoiceActivity { id, .. } => *id,
             Request::InputShell { id, .. } => *id,
             Request::CycleModel { id, .. } => *id,
             Request::RefreshModels { id } => *id,
             Request::SetModel { id, .. } => *id,
+            Request::SetContextCap { id, .. } => *id,
             Request::SetRoute { id, .. } => *id,
             Request::SetSubagentModel { id, .. } | Request::SetAgentModel { id, .. } => *id,
             Request::RunSubagent { id, .. } => *id,
@@ -794,6 +890,7 @@ impl Request {
             Request::SetFeature { id, .. } => *id,
             Request::SetCompactionMode { id, .. } => *id,
             Request::RenameSession { id, .. } => *id,
+            Request::SetSessionEnv { id, .. } => *id,
             Request::SetSessionSaved { id, .. } => *id,
             Request::PersistSession { id } => *id,
             Request::Split { id } => *id,
@@ -851,6 +948,10 @@ impl Request {
                 | Request::AccountUsage { .. }
                 | Request::InvalidateOpenAiUsage { .. }
                 | Request::InvalidateAnthropicUsage { .. }
+                // One-shot login clients report new credentials without a
+                // session. Subscribed connections still take the
+                // session-local path that also switches their model.
+                | Request::NotifyAuthChanged { .. }
                 | Request::NotifySession { .. }
                 | Request::AppletAction { .. }
                 | Request::CloseApplet { .. }
@@ -894,6 +995,23 @@ pub fn encode_event(event: &ServerEvent) -> String {
     let mut json = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
     json.push('\n');
     json
+}
+
+/// Encode the same newline-terminated JSON as [`encode_event`], reusing storage
+/// for ordinary streaming events. Oversized snapshots are not retained on the
+/// next call. Callers should also release buffers over 64 KiB after writing to
+/// avoid retaining a large final snapshot while the connection is idle.
+pub fn encode_event_into(event: &ServerEvent, buffer: &mut Vec<u8>) {
+    if buffer.capacity() > 64 * 1024 {
+        *buffer = Vec::new();
+    } else {
+        buffer.clear();
+    }
+    if serde_json::to_writer(&mut *buffer, event).is_err() {
+        buffer.clear();
+        buffer.extend_from_slice(b"{}");
+    }
+    buffer.push(b'\n');
 }
 
 /// Decode a request from a JSON string.

@@ -10,9 +10,10 @@ pub use jcode_config_types::{
     GatewayConfig, HookCommands, HooksConfig, KeybindingsConfig, LatexRenderingMode,
     LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, MenubarConfig, NamedProviderAuth,
     NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
-    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
-    SessionConfig, SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout,
-    TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
+    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, ResumeOpenElsewhere,
+    ResumeTimeMode, SafetyConfig, SessionConfig, SessionPickerResumeAction, SponsorsConfig,
+    SwarmSpawnMode, SwarmStripLayout, TerminalConfig, UpdateChannel, WebSearchConfig,
+    WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -124,7 +125,10 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_REQUEST_COMPRESSION",
     "HOME",
     "JCODE_COMMIT_LOG_KEY",
+    "JCODE_RESUME_OPEN_ELSEWHERE",
     "JCODE_RESUME_PROJECT_SCOPE",
+    "JCODE_RESUME_TIME",
+    "JCODE_BROWSER_HANDOFF",
     "JCODE_SWARM_STALL_AFTER_SECS",
     "JCODE_SWARM_STALL_NUDGE",
     "JCODE_ACP_PROFILE",
@@ -402,6 +406,7 @@ pub fn config() -> &'static Config {
     }
 
     let mut reload_reason = None;
+    let mut changed_default_route = None;
     let config = {
         let mut cache = CONFIG_CACHE
             .write()
@@ -422,7 +427,16 @@ pub fn config() -> &'static Config {
                 &cache.fingerprint,
                 &fingerprint,
             ));
-            cache.config = leak_config(Config::load());
+            let next = Config::load();
+            // Direct file edits bypass set_default_model's account-pool sync.
+            // Reconcile only a changed default in the same home, so unrelated
+            // reloads never undo a deliberate pool ordering change.
+            if cache.fingerprint.path == fingerprint.path
+                && cache.config.provider.default_provider != next.provider.default_provider
+            {
+                changed_default_route = next.provider.default_provider.clone();
+            }
+            cache.config = leak_config(next);
             // Loading applies env overrides that can themselves set env vars
             // (e.g. copilot_premium propagates config -> JCODE_COPILOT_PREMIUM).
             // Re-fingerprint after the load so those self-inflicted env changes
@@ -432,6 +446,15 @@ pub fn config() -> &'static Config {
         }
         cache.config
     };
+
+    // Auth lookups may consult config, so do this after releasing CONFIG_CACHE.
+    if let Some(route) = changed_default_route
+        && let Err(error) = crate::auth::account_pool::sync_order_with_default_route(&route)
+    {
+        crate::logging::error(&format!(
+            "Could not sync account order after config edit: {error}"
+        ));
+    }
 
     if let Some(reason) = reload_reason {
         crate::logging::info(&format!("CONFIG_RELOAD {}", reason));
@@ -596,10 +619,44 @@ pub fn on_config_reloaded(listener: fn()) {
         .push(listener);
 }
 
+/// Scoped local resource bridge policy. Zero disables access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudConfig {
+    pub local_access_seconds: u32,
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            local_access_seconds: 86_400,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_config_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_access_defaults_and_overrides() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert_eq!(defaults.cloud.local_access_seconds, 86400);
+        for seconds in [0, 900, 172800] {
+            let config: Config =
+                toml::from_str(&format!("[cloud]\nlocal_access_seconds = {seconds}")).unwrap();
+            assert_eq!(config.cloud.local_access_seconds, seconds);
+        }
+        assert!(toml::from_str::<Config>("[cloud]\nlocal_access_seconds = -1").is_err());
+    }
+}
+
 /// Main configuration struct
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
+    /// Local resource access after cloud handoff.
+    pub cloud: CloudConfig,
     /// Idle session memory hibernation policy.
     pub session: SessionConfig,
 
@@ -669,6 +726,9 @@ pub struct Config {
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,
 
+    /// `jcode companion`: per-login helper for desktop effects.
+    pub companion: CompanionConfig,
+
     /// macOS menu bar session indicator
     pub menubar: MenubarConfig,
 
@@ -720,6 +780,9 @@ impl WakeMode {
 pub struct ServerConfig {
     /// Ownership model for autonomous wake requests.
     pub wake_mode: WakeMode,
+    /// Send mobile push notifications through the Jcode API when an account
+    /// key is available. `None` means enabled; set `false` to opt out.
+    pub mobile_push: Option<bool>,
 }
 
 /// Agent Client Protocol adapter configuration.
@@ -736,7 +799,7 @@ impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             profile: "standard".to_string(),
-            tool_profile: "acp".to_string(),
+            tool_profile: "full".to_string(),
         }
     }
 }
@@ -781,7 +844,17 @@ impl McpToolsMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolConfig {
-    /// Tool profile: "full" (default), "acp", "minimal"/"lite", or "none".
+    /// Opt into Jev browser handoff. Direct browser actions remain available.
+    pub browser_handoff: bool,
+    /// Foreground time before automatic tool handoff, in milliseconds. Zero disables it.
+    pub auto_background_timeout_ms: u64,
+    /// Tool profile: "full" (default), "minimal"/"lite", or "none".
+    ///
+    /// "acp" is a legacy name for "full". It used to be a nine-tool
+    /// allow-list, which left ACP clients without `todo`, `bg`, `swarm`, web
+    /// search, memory, and skills. The prompt and the auto-background handoff
+    /// still referred to those tools, and because the profile is server-wide,
+    /// TUI sessions attached to an ACP-started daemon were cut down too.
     pub profile: String,
     /// Explicit allow-list. When set, only these tools are exposed.
     /// Use "*" or "all" to expose all tools without an allow-list.
@@ -801,22 +874,24 @@ pub struct ToolConfig {
         alias = "mcp_tools_auto_threshold_tokens"
     )]
     pub mcp_tools_token_threshold: usize,
-    /// Opt-in Codemode: expose a `codemode` tool that runs model-written
+    /// Codemode: expose a `codemode` tool that runs model-written
     /// JavaScript in an embedded QuickJS sandbox able to call every other
-    /// tool (including MCP tools). Off by default.
+    /// tool (including MCP tools). Enabled by default.
     pub codemode: bool,
 }
 
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
+            browser_handoff: false,
+            auto_background_timeout_ms: 3_000,
             profile: String::new(),
             enabled: Vec::new(),
             disabled: Vec::new(),
             disable_base_tools: false,
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
-            codemode: false,
+            codemode: true,
         }
     }
 }
@@ -874,23 +949,6 @@ impl ToolConfig {
         } else if self.disable_base_tools || matches!(profile.as_str(), "none" | "off" | "disabled")
         {
             Some(HashSet::new())
-        } else if matches!(profile.as_str(), "acp") {
-            Some(
-                [
-                    "bash",
-                    "read",
-                    "write",
-                    "edit",
-                    "apply_patch",
-                    "agentgrep",
-                    "ls",
-                    "batch",
-                    "mcp",
-                ]
-                .into_iter()
-                .map(|name| name.to_string())
-                .collect(),
-            )
         } else if matches!(profile.as_str(), "minimal" | "lite" | "small") {
             Some(
                 [
@@ -936,6 +994,46 @@ fn normalize_tool_name(name: &str) -> String {
     jcode_tool_types::resolve_tool_name(trimmed).to_string()
 }
 
+/// `jcode companion` features. Each toggle is read when the companion starts,
+/// except `autostart`, which clients read when they launch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CompanionConfig {
+    /// Start the companion in the background when a Jcode client launches
+    /// and none is running.
+    pub autostart: bool,
+    /// Copilot-key push-to-talk (Linux). Also needs `[dictation] global_devices`.
+    pub voice: bool,
+    /// Show a live waveform and transcript in the focused Jcode CLI while
+    /// companion push-to-talk records.
+    pub voice_waveform: bool,
+    /// Show desktop notifications for companion voice state.
+    pub voice_notifications: bool,
+    /// Open URLs and files for the server.
+    pub open: bool,
+    /// Open new terminal windows for the server.
+    pub spawn_terminal: bool,
+    /// Lid-close override while agents work (macOS/Windows).
+    pub lid: bool,
+    /// Hourly browser bridge auto-update.
+    pub browser_updates: bool,
+}
+
+impl Default for CompanionConfig {
+    fn default() -> Self {
+        Self {
+            autostart: true,
+            voice: true,
+            voice_waveform: true,
+            voice_notifications: true,
+            open: true,
+            spawn_terminal: true,
+            lid: true,
+            browser_updates: true,
+        }
+    }
+}
+
 /// External dictation / speech-to-text integration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -960,6 +1058,9 @@ pub struct DictationConfig {
     /// (Linux evdev nodes, preferably stable `/dev/input/by-id/...` paths).
     /// Empty disables the companion's global voice listener.
     pub global_devices: Vec<std::path::PathBuf>,
+    /// Show live voice input (waveform and streaming transcript) inside the
+    /// input box. False puts it in the status line instead.
+    pub composer_preview: bool,
 }
 
 impl Default for DictationConfig {
@@ -972,6 +1073,7 @@ impl Default for DictationConfig {
             vocabulary: Vec::new(),
             recorder: String::new(),
             global_devices: Vec::new(),
+            composer_preview: true,
         }
     }
 }
@@ -993,18 +1095,8 @@ mod color_tests;
 /// Whether integration discovery settings carry no information beyond the shipped
 /// default, so `[sponsors]` can be left out of written config files.
 ///
-/// Discovery originally shipped opt-in with `enabled = false`, and because
-/// config saves serialize the whole struct, any save during that window froze
-/// the old default into the user's file and permanently disabled discovery even
-/// after the default flipped. Omitting default sections prevents a repeat.
+/// Explicit opt-ins must be serialized so unrelated preference saves cannot
+/// silently disable discovery on the next load.
 fn sponsors_is_default(sponsors: &SponsorsConfig) -> bool {
-    sponsors.enabled && is_default_discovery_endpoint(&sponsors.endpoint)
-}
-
-/// Endpoints used by shipped defaults. These may also be explicit user choices.
-fn is_default_discovery_endpoint(endpoint: &str) -> bool {
-    matches!(
-        endpoint.trim_end_matches('/'),
-        "https://api.jcode.sh/v1/discovery" | "https://api.solosystems.dev/v1/discovery"
-    )
+    !sponsors.enabled && sponsors.endpoint == SponsorsConfig::default().endpoint
 }

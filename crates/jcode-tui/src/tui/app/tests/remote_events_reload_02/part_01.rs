@@ -9,6 +9,8 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -21,6 +23,9 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                waiting_reason: None,
+                requires_user_auth: None,
+                waiting_on: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -54,6 +59,8 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -66,8 +73,13 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
                     confidence: None,
                     completion_confidence: None,
                     confidence_history: Vec::new(),
+                    waiting_reason: None,
+                    requires_user_auth: None,
+                    waiting_on: Vec::new(),
                 },
                 crate::todo::TodoItem {
+                    lane_after: None,
+                    lane_owner: None,
                     stage: None,
                     details: None,
                     group: None,
@@ -80,6 +92,9 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
                     confidence: None,
                     completion_confidence: None,
                     confidence_history: Vec::new(),
+                    waiting_reason: None,
+                    requires_user_auth: None,
+                    waiting_on: Vec::new(),
                 },
             ],
         )
@@ -92,7 +107,7 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
         assert!(app.pending_queued_dispatch);
         assert_eq!(app.queued_messages().len(), 1);
         assert!(app.queued_messages()[0].contains("You have 2 incomplete todos"));
-        assert!(!app.queued_messages()[0].contains("Handle the newly discovered follow-up"));
+        assert!(app.queued_messages()[0].contains("Handle the newly discovered follow-up"));
         assert!(!app.queued_messages()[0].contains("/poke off"));
     });
 }
@@ -160,6 +175,8 @@ fn test_remote_interrupted_auto_poke_requeues_after_deferred_poke() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                lane_after: None,
+                lane_owner: None,
                 stage: None,
                 details: None,
                 group: None,
@@ -172,6 +189,9 @@ fn test_remote_interrupted_auto_poke_requeues_after_deferred_poke() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                waiting_reason: None,
+                requires_user_auth: None,
+                waiting_on: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -720,7 +740,7 @@ fn test_handle_server_event_soft_interrupt_injected_unrelated_content_keeps_pend
 }
 
 #[test]
-fn test_handle_server_event_soft_interrupt_injected_background_task_retains_row_only() {
+fn test_handle_server_event_soft_interrupt_injected_background_task_adds_transcript_entry() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
@@ -737,7 +757,10 @@ fn test_handle_server_event_soft_interrupt_injected_background_task_retains_row_
         &mut remote,
     );
 
-    assert!(app.display_messages().is_empty());
+    assert_eq!(app.display_messages().len(), 1);
+    let delivered = &app.display_messages()[0];
+    assert_eq!(delivered.role, "background_task");
+    assert!(delivered.content.contains("abc123"));
     assert_eq!(
         app.background_task_rows_ref()[0].status,
         crate::tui::BackgroundTaskRowStatus::Completed
@@ -887,7 +910,7 @@ fn test_swarm_await_notification_inserts_only_compact_summary() {
                 channel: None,
                 tldr: None,
             },
-            message: "🐝 **Swarm await finished**\n\nAll members done. All 1 members are done: elephant\n\nMember statuses:\n  ✓ elephant (completed)\n\nCompletion reports:\n\n--- elephant (completed) ---\nCompact card demo finished.\n\nValidation:\nParser tests pass."
+            message: "🐝 **Swarm await finished**\n\nAll members done. All 1 members are done: elephant\n\nMember statuses:\n  ✓ elephant (completed)\n\nRecent outputs:\n\n--- elephant (completed) ---\nCompact card demo finished.\n\nValidation:\nParser tests pass."
                 .to_string(),
         },
         &mut remote,
@@ -898,38 +921,32 @@ fn test_swarm_await_notification_inserts_only_compact_summary() {
         .last()
         .expect("missing compact swarm await summary");
     assert_eq!(last.title.as_deref(), Some("🐝 Swarm await"));
-    assert_eq!(last.content, "✓ 1/1");
+    assert_eq!(last.content, "1/1 matched · 1 completed");
     assert!(!last.content.contains("elephant"));
     assert!(!last.content.contains("Validation"));
 }
 
 #[test]
-fn test_background_task_markdown_is_suppressed_even_if_role_was_lost() {
+fn test_background_task_markdown_restores_delivery_role_if_role_was_lost() {
     with_temp_jcode_home(|| {
         let _render_lock = scroll_render_test_lock();
         let mut app = create_test_app();
         app.set_centered(true);
 
         app.push_display_message(DisplayMessage::user(
-            "**Background task** `594967sj63` · `Run jcode library tests afte` (`bash`) · ✗ failed · 1.0s · exit 124\n\n```text\n\n--- Command timed out after 1000ms ---\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"594967sj63\"`",
-        ));
+        "**Background task** `594967sj63` · `Run jcode library tests afte` (`bash`) · ✗ failed · 1.0s · exit 124\n\n```text\n\n--- Command timed out after 1000ms ---\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"594967sj63\"`",
+    ));
 
         let backend = ratatui::backend::TestBackend::new(80, 16);
         let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
         let text = render_and_snap(&app, &mut terminal);
 
-        // The card itself must not render: no task id, no bordered tool card, and
-        // no fragment of the background-task markdown.
-        //
-        // Deliberately not asserting the frame has no box-drawing characters at
-        // all. Info-widget overlays (overview/context) legitimately draw their own
-        // bordered box in the right margin, and whether they are docked yet
-        // depends on how many frames the process has already rendered, which makes
-        // that assertion order-dependent rather than a statement about this test.
-        assert!(!text.contains("594967sj63"), "task id leaked:\n{text}");
-        assert!(!text.contains("Background task"), "card leaked:\n{text}");
-        assert!(!text.contains("Full output"), "card body leaked:\n{text}");
-        assert!(app.display_messages().is_empty());
+        assert!(
+            text.contains("Run jcode"),
+            "delivery entry missing:\n{text}"
+        );
+        assert_eq!(app.display_messages().len(), 1);
+        assert_eq!(app.display_messages()[0].role, "background_task");
         assert_eq!(app.display_user_message_count(), 0);
     });
 }

@@ -16,6 +16,10 @@
 
 ## Development Workflow
 
+- **Commit and push as you go** - Make small, scoped commits and push them to
+  the current branch's remote as meaningful work is completed, rather than
+  waiting until the end of the task. Preserve unrelated changes and never
+  force-push unless the user explicitly authorizes it.
 - **Use the user's Git identity** - Create commits with the configured
   `user.name` and `user.email`. Do not override them with `Jcode`, `Jcode agent`,
   or a fabricated agent email. Preserve existing contributor attribution when
@@ -92,6 +96,21 @@ cd /sharedssd/git/orangehat/ohAgent
 git add jcode
 git commit -m "chore: update jcode submodule to <hash>"
 ```
+## Provider model discovery
+
+- Model arrays are offline fallbacks, not release allowlists. Providers with a
+  catalog must discover new model IDs without a Jcode release and expose them
+  through switching lists and structured model routes.
+- Implement both cached prefetch and explicit refresh. Explicit refresh must
+  bypass fresh caches. Preserve the last good catalog on network, authentication,
+  or malformed-response failures, and scope persistent caches to their endpoint.
+- Wire new providers into the shared refresh fanout and model-update publication,
+  including long-lived sessions, not only startup or login.
+- Regression tests must discover an arbitrary future model absent from all
+  fallback arrays, using the provider's actual response schema. Check picker
+  routes, forced refresh with a fresh cache, and last-good behavior on failure.
+- If a backend has no discovery API, document that limitation instead of
+  presenting a hardcoded list or a no-op refresh as live discovery.
 
 ## Install Notes
 - `~/.local/bin/jcode` is the launcher symlink used from `PATH`.
@@ -103,6 +122,14 @@ git commit -m "chore: update jcode submodule to <hash>"
 - Ensure `~/.local/bin` is **before** `~/.cargo/bin` in `PATH`.
 
 ## Verifying a change at runtime
+
+### Keep benchmark sessions out of user history
+
+For synthetic prompts and streaming/CPU/power benchmarks, set a dedicated
+`JCODE_HOME` and `JCODE_TEST_SESSION=1` for both the server and its clients,
+in addition to using a unique `--socket`. A private socket alone isolates the
+daemon, not persisted sessions. Never run synthetic benchmark prompts against
+the user's normal session storage.
 
 `cargo build` alone proves nothing about behavior. `jcode run` and interactive
 sessions are served by the long-lived daemon at

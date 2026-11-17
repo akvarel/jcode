@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use jcode_message_types::{ContentBlock, Message, Role, ToolCall};
+use jcode_message_types::{ContentBlock, Message, Role, SharedContent, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -76,6 +76,9 @@ pub struct ResponseStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedMessage {
+    /// Execution duration for a completed tool row, when recorded by the runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_duration_ms: Option<u64>,
     /// Present only on the final visible assistant row of a completed stored
     /// user turn. Tool-only intermediate rounds contribute to these totals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,7 +271,7 @@ pub struct StoredMemoryInjection {
 pub struct StoredMessage {
     pub id: String,
     pub role: Role,
-    pub content: Vec<ContentBlock>,
+    pub content: SharedContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_role: Option<StoredDisplayRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,6 +287,7 @@ pub struct StoredMessage {
 pub enum StoredDisplayRole {
     System,
     BackgroundTask,
+    FileActivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,7 +308,8 @@ pub struct StoredTokenUsage {
 pub struct StoredCompactionState {
     pub summary_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_encrypted_content: Option<String>,
+    // Shared with manager summaries and copy-on-write session snapshots.
+    pub openai_encrypted_content: Option<std::sync::Arc<str>>,
     pub covers_up_to_turn: usize,
     pub original_turn_count: usize,
     pub compacted_count: usize,

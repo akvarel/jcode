@@ -103,28 +103,6 @@ fn request_fixture(
 }
 
 #[test]
-fn build_lock_is_removed_on_drop_and_can_be_reacquired() {
-    let _env_lock = crate::storage::lock_test_env();
-    let temp = tempfile::tempdir().expect("temp jcode home");
-    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
-    let scope = format!("lock-drop-{}", std::process::id());
-    let path = SelfDevTool::build_lock_path(&scope).expect("lock path");
-
-    let first = SelfDevTool::try_acquire_build_lock(&scope)
-        .expect("first lock attempt")
-        .expect("first lock acquired");
-    assert!(path.exists(), "lock file should exist while held");
-    drop(first);
-    assert!(!path.exists(), "lock file should be removed on drop");
-
-    let second = SelfDevTool::try_acquire_build_lock(&scope)
-        .expect("second lock attempt")
-        .expect("lock should be reacquirable after drop");
-    drop(second);
-    assert!(!path.exists(), "reacquired lock should also clean up");
-}
-
-#[test]
 fn terminal_request_history_is_archived_without_touching_active_requests() {
     // One shared env lock only: `lock_test_env` is a plain non-reentrant mutex,
     // so taking a second env guard here would self-deadlock (issue #593).
@@ -328,7 +306,26 @@ fn test_recovery_directive_prefers_reload_context_when_present() {
         directive.reconnect_notice.as_deref(),
         Some("Reloaded with build new-build")
     );
-    assert!(directive.continuation_message.contains("Reload succeeded"));
+    assert!(
+        directive
+            .continuation_message
+            .starts_with("Reload complete. Resuming your task.\n\n")
+    );
+    assert!(
+        directive
+            .continuation_message
+            .contains("Build: old-build → new-build.")
+    );
+    assert!(
+        directive
+            .continuation_message
+            .contains("check whether it already completed or is still running")
+    );
+    assert!(
+        directive
+            .continuation_message
+            .contains("unless genuinely blocked")
+    );
     assert!(
         directive
             .continuation_message
@@ -359,34 +356,11 @@ fn test_recovery_directive_returns_none_when_no_reload_recovery_needed() {
     assert!(ReloadContext::recovery_directive(None, false, "", None).is_none());
 }
 
-#[test]
-fn reload_timeout_secs_defaults_to_15() {
-    let _storage_guard = crate::storage::lock_test_env();
-    let _guard = EnvVarGuard::remove("JCODE_SELFDEV_RELOAD_TIMEOUT_SECS");
-    assert_eq!(SelfDevTool::reload_timeout_secs(), 15);
-}
+#[path = "reload_manifest_tests.rs"]
+mod reload_manifest;
 
-#[test]
-fn reload_timeout_secs_honors_valid_env_override() {
-    let _storage_guard = crate::storage::lock_test_env();
-    let _guard = EnvVarGuard::set("JCODE_SELFDEV_RELOAD_TIMEOUT_SECS", "27");
-    assert_eq!(SelfDevTool::reload_timeout_secs(), 27);
-}
-
-#[test]
-fn reload_timeout_secs_ignores_empty_invalid_and_zero_values() {
-    let _storage_guard = crate::storage::lock_test_env();
-    let _guard = EnvVarGuard::set("JCODE_SELFDEV_RELOAD_TIMEOUT_SECS", "   ");
-    assert_eq!(SelfDevTool::reload_timeout_secs(), 15);
-    drop(_guard);
-
-    let _guard = EnvVarGuard::set("JCODE_SELFDEV_RELOAD_TIMEOUT_SECS", "abc");
-    assert_eq!(SelfDevTool::reload_timeout_secs(), 15);
-    drop(_guard);
-
-    let _guard = EnvVarGuard::set("JCODE_SELFDEV_RELOAD_TIMEOUT_SECS", "0");
-    assert_eq!(SelfDevTool::reload_timeout_secs(), 15);
-}
+#[path = "reload_timeout_tests.rs"]
+mod reload_timeout;
 
 #[test]
 fn schema_only_advertises_core_selfdev_fields() {
@@ -542,15 +516,8 @@ async fn do_reload_returns_after_ack_in_direct_mode() {
     assert_eq!(ack.hash, "direct-hash");
 }
 
-#[test]
-fn reload_repo_resolver_uses_working_dir_when_primary_detection_fails() {
-    let repo = create_repo_fixture();
-    let nested = repo.path().join("crates").join("jcode-build-support");
-    std::fs::create_dir_all(&nested).expect("nested dir");
-
-    let resolved = reload::resolve_selfdev_reload_repo_dir_from(None, Some(&nested));
-    assert_eq!(resolved.as_deref(), Some(repo.path()));
-}
+#[path = "working_dir_resolver_tests.rs"]
+mod working_dir_resolver;
 
 #[tokio::test]
 async fn enter_creates_selfdev_session_in_test_mode() {
@@ -572,13 +539,16 @@ async fn enter_creates_selfdev_session_in_test_mode() {
             cache_control: None,
         }],
     );
-    parent.compaction = Some(session::StoredCompactionState {
-        summary_text: "summary".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 1,
-        original_turn_count: 1,
-        compacted_count: 1,
-    });
+    parent.compaction = Some(
+        session::StoredCompactionState {
+            summary_text: "summary".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+            compacted_count: 1,
+        }
+        .into(),
+    );
     parent.record_replay_display_message("system", None, "remember this context");
     parent.save().expect("save parent session");
 
@@ -816,6 +786,10 @@ async fn build_queues_background_tasks_and_reports_queue_status() {
         .await
         .expect("second build should queue");
 
+    for output in [&first.output, &second.output] {
+        assert!(output.contains(crate::tool::BACKGROUND_WAIT_GUIDANCE));
+        assert!(!output.contains("Use `bg"));
+    }
     let first_meta = first.metadata.expect("first metadata");
     let second_meta = second.metadata.expect("second metadata");
     let first_task_id = first_meta["task_id"].as_str().expect("first task id");
@@ -1442,19 +1416,8 @@ fn reconcile_keeps_running_request_not_yet_registered_in_live_task_map() {
     assert!(reloaded.error.is_none());
 }
 
-/// The reload must publish from the same checkout the build used. A primary
-/// repo derived from the running binary's compile location (another worktree)
-/// used to win, which published a stale binary from that worktree.
-#[test]
-fn reload_repo_resolver_prefers_session_working_dir_over_binary_origin() {
-    let session_repo = create_repo_fixture();
-    let other_worktree = create_repo_fixture();
-    let nested = session_repo.path().join("crates");
-    std::fs::create_dir_all(&nested).expect("nested dir");
+#[path = "repo_resolver_tests.rs"]
+mod repo_resolver;
 
-    let resolved = reload::resolve_selfdev_reload_repo_dir_from(
-        Some(other_worktree.path().to_path_buf()),
-        Some(&nested),
-    );
-    assert_eq!(resolved.as_deref(), Some(session_repo.path()));
-}
+#[path = "tests_additional_tests.rs"]
+mod additional_build_lock_is_removed_on_drop_and_can_be_reacquired;
