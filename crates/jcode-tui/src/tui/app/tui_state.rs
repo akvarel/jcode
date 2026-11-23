@@ -218,20 +218,68 @@ impl App {
         (provider, model)
     }
 
+    /// Available reasoning efforts for the active remote provider/model.
+    ///
+    /// For Antigravity, uses the live remote catalog routes when available so
+    /// newly discovered models expose their exact sibling effort tiers, falling
+    /// back to static inference during the pre-catalog bootstrap window.
+    pub(super) fn remote_available_efforts(&self) -> Vec<&'static str> {
+        let (provider_name, provider_model) = self.remote_effort_identity();
+        if provider_name
+            .as_deref()
+            .is_some_and(|p| p.to_ascii_lowercase().contains("antigravity"))
+            && let Some(model) = provider_model.as_deref()
+            && !model.trim().is_empty()
+            && !model.trim().eq_ignore_ascii_case("default")
+        {
+            let catalog_models: Vec<&str> = self
+                .remote_model_options
+                .iter()
+                .filter(|route| {
+                    route.available && route.provider.eq_ignore_ascii_case("antigravity")
+                })
+                .map(|route| route.model.as_str())
+                .collect();
+            if !catalog_models.is_empty() {
+                return jcode_provider_core::antigravity_efforts_from_catalog(
+                    model,
+                    catalog_models,
+                );
+            }
+        }
+        inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref())
+    }
+
     /// Best-known current reasoning effort for the remote session. Falls back
     /// to the configured provider-family default when the server has not
     /// reported one yet, so pre-settle effort cycling starts from the value the
     /// session will actually use instead of assuming the maximum.
     pub(super) fn remote_reasoning_effort_hint(&self) -> Option<String> {
         if crate::tui::is_ssh_remote() {
-            return self.remote_reasoning_effort.clone();
+            return self.remote_reasoning_effort.clone().or_else(|| {
+                let (provider, model) = self.remote_effort_identity();
+                if provider
+                    .as_deref()
+                    .is_some_and(|p| p.to_ascii_lowercase().contains("antigravity"))
+                {
+                    model.as_deref().and_then(|m| {
+                        jcode_provider_core::split_antigravity_model_effort(m)
+                            .map(|(_, effort)| effort.to_string())
+                    })
+                } else {
+                    None
+                }
+            });
         }
         self.remote_reasoning_effort.clone().or_else(|| {
             let (provider, model) = self.remote_effort_identity();
             let provider = provider.unwrap_or_default().to_ascii_lowercase();
             let model = model.unwrap_or_default().to_ascii_lowercase();
             let cfg = &crate::config::config().provider;
-            if provider.contains("anthropic")
+            if provider.contains("antigravity") {
+                jcode_provider_core::split_antigravity_model_effort(&model)
+                    .map(|(_, effort)| effort.to_string())
+            } else if provider.contains("anthropic")
                 || provider.contains("claude")
                 || model.starts_with("claude-")
             {
@@ -648,6 +696,17 @@ impl crate::tui::TuiState for App {
             PendingLogin::Exchanging { .. } => {
                 Some("Login only: exchanging credentials · not sent to AI · please wait")
             }
+            PendingLogin::AutoApiKey => {
+                Some("Login only: paste any API key · not sent to AI · /cancel")
+            }
+            PendingLogin::ApiKeyChooseProvider { .. } => {
+                Some("Login only: enter provider number or name · not sent to AI · /cancel")
+            }
+            PendingLogin::ApiKeyProfile { .. }
+            | PendingLogin::CursorApiKey
+            | PendingLogin::AzureApiKey { .. } => {
+                Some("Login only: paste API key · not sent to AI · /cancel")
+            }
             PendingLogin::OpenAiAccount { .. }
             | PendingLogin::Gemini { .. }
             | PendingLogin::Antigravity { .. } => {
@@ -655,6 +714,18 @@ impl crate::tui::TuiState for App {
             }
             _ => Some("Login only: authentication input · not sent to AI · /cancel"),
         }
+    }
+
+    fn login_input_is_secret(&self) -> bool {
+        matches!(
+            self.pending_login.as_ref(),
+            Some(
+                PendingLogin::AutoApiKey
+                    | PendingLogin::ApiKeyProfile { .. }
+                    | PendingLogin::CursorApiKey
+                    | PendingLogin::AzureApiKey { .. }
+            )
+        )
     }
 
     fn input(&self) -> &str {
@@ -997,6 +1068,10 @@ impl crate::tui::TuiState for App {
 
     fn connected_clients(&self) -> Option<usize> {
         self.remote_client_count
+    }
+
+    fn jarvis_transcript(&self) -> Option<&std::collections::VecDeque<crate::tui::JarvisCaption>> {
+        Some(self.jarvis_listener.captions())
     }
 
     fn voice_input_status(&self) -> Option<(bool, String)> {
@@ -1865,14 +1940,29 @@ impl crate::tui::TuiState for App {
 
     fn inline_swarm_gallery_active(&self) -> bool {
         if self.debug_force_inline_gallery {
-            return !self.inline_swarm_members().is_empty();
+            return self.has_inline_swarm_members();
         }
         self.swarm_enabled
             && matches!(
                 crate::config::config().agents.swarm_spawn_mode,
                 crate::config::SwarmSpawnMode::Inline
             )
-            && !self.inline_swarm_members().is_empty()
+            && self.has_inline_swarm_members()
+    }
+
+    fn has_inline_swarm_members(&self) -> bool {
+        if self.debug_force_inline_gallery {
+            return !self.remote_swarm_members.is_empty();
+        }
+        if !self.swarm_enabled {
+            return false;
+        }
+        let self_id = if self.is_remote {
+            self.remote_session_id.as_deref()
+        } else {
+            Some(self.session.id.as_str())
+        };
+        self_id.is_some_and(|id| has_inline_swarm_descendants(&self.remote_swarm_members, id))
     }
 
     fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
@@ -2191,16 +2281,15 @@ impl crate::tui::TuiState for App {
     }
 }
 
-/// The three Alt+N swarm views. Repeated presses cycle in declaration order.
+/// The two Alt+N swarm views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwarmPanelView {
     Chat,
-    Controls,
     FullPage,
 }
 
 impl App {
-    /// Cycle chat → inline controls → full live swarm page → chat.
+    /// Cycle chat → full live swarm page → chat.
     pub(crate) fn cycle_swarm_panel_view(&mut self) -> SwarmPanelView {
         if !self.inline_swarm_gallery_active() {
             self.swarm_panel_focused = false;
@@ -2208,18 +2297,14 @@ impl App {
             return SwarmPanelView::Chat;
         }
 
-        let next = match (self.swarm_panel_focused, self.swarm_panel_full_page) {
-            (false, _) => SwarmPanelView::Controls,
-            (true, false) => SwarmPanelView::FullPage,
-            (true, true) => SwarmPanelView::Chat,
+        let next = if self.swarm_panel_full_page {
+            SwarmPanelView::Chat
+        } else {
+            SwarmPanelView::FullPage
         };
         match next {
             SwarmPanelView::Chat => {
                 self.swarm_panel_focused = false;
-                self.swarm_panel_full_page = false;
-            }
-            SwarmPanelView::Controls => {
-                self.swarm_panel_focused = true;
                 self.swarm_panel_full_page = false;
             }
             SwarmPanelView::FullPage => {
@@ -2641,35 +2726,20 @@ pub(crate) fn filter_inline_swarm_subtree(
         .collect()
 }
 
-impl App {
-    fn inline_swarm_members_unticked(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
-        if self.debug_force_inline_gallery {
-            return self.remote_swarm_members.clone();
-        }
-        if !self.swarm_enabled {
-            return Vec::new();
-        }
-        // Scope the inline gallery to the subtree this session actually spawned.
-        // Other sessions can share the same swarm (e.g. same repo) without this
-        // session having spawned them; showing those would be noise. The spawn
-        // tree is reconstructed from each member's `report_back_to_session_id`
-        // parent edge.
-        let self_id = if self.is_remote {
-            self.remote_session_id.as_deref()
-        } else {
-            Some(self.session.id.as_str())
-        };
-        match self_id {
-            Some(self_id) => filter_inline_swarm_subtree(&self.remote_swarm_members, self_id),
-            // Session identity is not known yet (e.g. right after connect,
-            // before the History event sets `remote_session_id`). Showing all
-            // swarm members here caused the inline strip to flash on startup
-            // and then disappear once the subtree filter kicked in. Hide the
-            // strip until we know who we are.
-            None => Vec::new(),
-        }
-    }
+/// A nonempty descendant traversal must start with a non-self direct child.
+/// Conversely that child's own record is in the result, even with duplicate
+/// IDs or cycles. No indexing, cloning, or elapsed-time updates are needed.
+fn has_inline_swarm_descendants(
+    members: &[crate::protocol::SwarmMemberStatus],
+    self_id: &str,
+) -> bool {
+    members.iter().any(|member| {
+        member.session_id != self_id && member.report_back_to_session_id.as_deref() == Some(self_id)
+    })
 }
+
+#[path = "tui_state_inline_swarm.rs"]
+mod inline_swarm;
 
 #[cfg(test)]
 #[path = "tui_state_context_cache_tests.rs"]
@@ -2684,106 +2754,5 @@ mod sidebar_usage_tests;
 mod swarm_panel_key_tests;
 
 #[cfg(test)]
-mod inline_swarm_subtree_tests {
-    use super::filter_inline_swarm_subtree;
-    use crate::protocol::SwarmMemberStatus;
-
-    fn member(id: &str, parent: Option<&str>) -> SwarmMemberStatus {
-        SwarmMemberStatus {
-            session_id: id.to_string(),
-            friendly_name: Some(id.to_string()),
-            status: "running".to_string(),
-            detail: None,
-            task_label: None,
-            role: None,
-            is_headless: Some(true),
-            live_attachments: None,
-            status_age_secs: Some(1),
-            output_tail: None,
-            report_back_to_session_id: parent.map(str::to_string),
-            todo_progress: None,
-            todo_items: Vec::new(),
-            runtime: crate::protocol::SwarmMemberRuntime::default(),
-        }
-    }
-
-    fn ids(members: Vec<SwarmMemberStatus>) -> Vec<String> {
-        let mut v: Vec<String> = members.into_iter().map(|m| m.session_id).collect();
-        v.sort();
-        v
-    }
-
-    #[test]
-    fn includes_direct_children_but_not_self() {
-        let members = vec![
-            member("me", None),
-            member("child_a", Some("me")),
-            member("child_b", Some("me")),
-            member("stranger", None),
-        ];
-        // The viewing session ("me") is excluded; only its spawned children show.
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "me")),
-            vec!["child_a", "child_b"]
-        );
-    }
-
-    #[test]
-    fn includes_transitive_descendants() {
-        let members = vec![
-            member("me", None),
-            member("child", Some("me")),
-            member("grandchild", Some("child")),
-        ];
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "me")),
-            vec!["child", "grandchild"]
-        );
-    }
-
-    #[test]
-    fn excludes_siblings_and_unrelated_sessions() {
-        // Two coordinators sharing one swarm. Each should only see its own kids.
-        let members = vec![
-            member("coord_a", None),
-            member("a_child", Some("coord_a")),
-            member("coord_b", None),
-            member("b_child", Some("coord_b")),
-        ];
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "coord_a")),
-            vec!["a_child"]
-        );
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "coord_b")),
-            vec!["b_child"]
-        );
-    }
-
-    #[test]
-    fn session_with_no_children_shows_nothing() {
-        // A session that spawned no one (even if it is itself a swarm member)
-        // produces an empty list so the strip is hidden entirely.
-        let members = vec![
-            member("me", None),
-            member("stranger", None),
-            member("other", None),
-        ];
-        assert!(filter_inline_swarm_subtree(&members, "me").is_empty());
-    }
-
-    #[test]
-    fn cycle_is_guarded() {
-        // Pathological parent cycle must not loop forever.
-        let members = vec![
-            member("a", Some("b")),
-            member("b", Some("a")),
-            member("me", None),
-            member("child", Some("me")),
-        ];
-        assert_eq!(
-            ids(filter_inline_swarm_subtree(&members, "me")),
-            vec!["child"]
-        );
-    }
-}
+#[path = "tui_state_inline_swarm_tests.rs"]
+mod inline_swarm_subtree_tests;

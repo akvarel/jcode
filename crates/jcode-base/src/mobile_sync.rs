@@ -574,6 +574,40 @@ fn bounded_tool_input(input: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+// Use the same serializer as the wire representation without allocating and
+// copying a JSON buffer that would immediately be discarded.
+fn serialized_byte_len(value: &impl Serialize) -> serde_json::Result<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            // This sink always consumes a complete slice and cannot return
+            // Interrupted or WriteZero. Avoid the generic partial-write loop.
+            self.0 += bytes.len();
+            Ok(())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+#[cfg(test)]
+#[path = "mobile_sync_byte_count_tests.rs"]
+mod byte_count_tests;
+
+#[cfg(test)]
+#[path = "mobile_sync_direct_count_tests.rs"]
+mod direct_count_tests;
+
 fn structured_tools(
     blocks: &[ContentBlock],
 ) -> Option<(String, Vec<WireToolCall>, Vec<WireToolResult>)> {
@@ -648,8 +682,8 @@ fn structured_tools(
     if prose.text.encode_utf16().count() > 200_000 {
         return None;
     }
-    let structured_bytes = match serde_json::to_vec(&(&calls, &results)) {
-        Ok(bytes) => bytes.len(),
+    let structured_bytes = match serialized_byte_len(&(&calls, &results)) {
+        Ok(bytes) => bytes,
         Err(error) => {
             crate::logging::debug(&format!("Cannot serialize mobile tool metadata: {error}"));
             return None;
@@ -1126,28 +1160,21 @@ pub fn spawn_background_sync() {
     tokio::spawn(background_sync());
 }
 
-async fn background_sync() {
-    let client = reqwest::Client::new();
-    let mut ticks = tokio::time::interval(SYNC_INTERVAL);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        let reconcile = tokio::select! {
-            _ = ticks.tick() => true,
-            _ = PERSISTED.notified() => {
-                // A bounded coalescing window, not a trailing debounce:
-                // continuous token saves cannot postpone sync forever.
-                let mut debounce = SyncTiming::new("debounce_wait");
-                tokio::time::sleep(SYNC_DEBOUNCE).await;
-                debounce.outcome = "success";
-                false
-            }
-        };
-        // sync_pass records failures and disabled skips without error text.
-        if sync_pass(&client, reconcile).await.is_err() {
-            crate::logging::debug("mobile sync pass failed (see stage timing)");
-        }
-    }
+/// The two daemon mobile loops use exactly reqwest's default configuration.
+/// Share their TLS configuration and connection pool, not request credentials.
+/// Initialization stays eager at loop startup even when mobile sync is disabled.
+/// Do not substitute the provider client: its defaults are intentionally different.
+pub(crate) fn daemon_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
 }
+
+#[cfg(test)]
+#[path = "mobile_http_tests.rs"]
+mod mobile_http_tests;
+
+mod background;
+use background::background_sync;
 
 #[path = "mobile_sync_progress.rs"]
 mod progress;

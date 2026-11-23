@@ -21,64 +21,9 @@ const MEMORY_CRITICAL_GROWTH_BYTES: u64 = 1024 * 1024 * 1024;
 const MEMORY_WARNING_LIVE_SESSIONS: usize = 128;
 const MEMORY_CRITICAL_LIVE_SESSIONS: usize = 512;
 
-#[derive(Default)]
-struct CompactionMemoryTotals {
-    summary_text_bytes: u64,
-    encrypted_content_bytes: u64,
-    retained_payload_capacity_bytes: u64,
-    persisted_metadata_payload_capacity_bytes: u64,
-    sessions: Vec<serde_json::Value>,
-}
-
-impl CompactionMemoryTotals {
-    fn observe(&mut self, session_id: &str, profile: &serde_json::Value) {
-        let compaction = &profile["compaction"];
-        let bytes = |field: &str| compaction[field].as_u64().unwrap_or(0);
-        let summary = bytes("summary_text_bytes");
-        let encrypted = bytes("encrypted_content_bytes");
-        let retained = bytes("retained_payload_capacity_bytes");
-        let metadata = bytes("persisted_metadata_payload_capacity_bytes");
-        self.summary_text_bytes = self.summary_text_bytes.saturating_add(summary);
-        self.encrypted_content_bytes = self.encrypted_content_bytes.saturating_add(encrypted);
-        self.retained_payload_capacity_bytes = self
-            .retained_payload_capacity_bytes
-            .saturating_add(retained);
-        self.persisted_metadata_payload_capacity_bytes = self
-            .persisted_metadata_payload_capacity_bytes
-            .saturating_add(metadata);
-        self.sessions.push(serde_json::json!({
-            "session_id": session_id,
-            "summary_text_bytes": summary,
-            "encrypted_content_bytes": encrypted,
-            "retained_payload_capacity_bytes": retained,
-            "persisted_metadata_payload_capacity_bytes": metadata,
-            "total_retained_payload_capacity_bytes": retained.saturating_add(metadata),
-        }));
-    }
-
-    fn into_json(mut self) -> serde_json::Value {
-        self.sessions.sort_by(|left, right| {
-            right["total_retained_payload_capacity_bytes"]
-                .as_u64()
-                .cmp(&left["total_retained_payload_capacity_bytes"].as_u64())
-                .then_with(|| {
-                    left["session_id"]
-                        .as_str()
-                        .cmp(&right["session_id"].as_str())
-                })
-        });
-        self.sessions.truncate(12);
-        serde_json::json!({
-            "summary_text_bytes": self.summary_text_bytes,
-            "encrypted_content_bytes": self.encrypted_content_bytes,
-            "retained_payload_capacity_bytes": self.retained_payload_capacity_bytes,
-            "persisted_metadata_payload_capacity_bytes": self.persisted_metadata_payload_capacity_bytes,
-            "total_retained_payload_capacity_bytes": self.retained_payload_capacity_bytes
-                .saturating_add(self.persisted_metadata_payload_capacity_bytes),
-            "top_by_retained_payload_capacity_bytes": self.sessions,
-        })
-    }
-}
+#[path = "debug_server_compaction.rs"]
+mod compaction;
+use compaction::CompactionMemoryTotals;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryIncidentDecision {
@@ -785,17 +730,16 @@ async fn build_server_memory_payload(
     for (session_id, agent_arc) in sessions_guard.iter() {
         if let Ok(agent) = agent_arc.try_lock() {
             locked_session_count += 1;
-            let profile = agent.debug_memory_profile();
-            let session_profile = profile.get("session").cloned().unwrap_or_default();
+            // The compact snapshot omits compaction capacity attribution. Read
+            // the same session profile as agent:memory without its discarded
+            // process, interrupt, and frozen-snapshot diagnostics.
+            let session_profile = agent.session_for_split().debug_memory_profile();
             // Only profiles obtained through try_lock contribute. Capacity is
             // attribution, not serialized length or an estimate of RSS savings.
             compaction_memory.observe(session_id, &session_profile);
-            let totals = session_profile.get("totals").cloned().unwrap_or_default();
-            let messages = session_profile.get("messages").cloned().unwrap_or_default();
-            let provider_cache = session_profile
-                .get("provider_messages_cache")
-                .cloned()
-                .unwrap_or_default();
+            let totals = &session_profile["totals"];
+            let messages = &session_profile["messages"];
+            let provider_cache = &session_profile["provider_messages_cache"];
             let json_bytes = totals
                 .get("json_bytes")
                 .and_then(|value| value.as_u64())
@@ -1243,7 +1187,25 @@ fn estimate_debug_job_bytes(job: &DebugJob) -> usize {
 }
 
 fn estimate_swarm_event_bytes(event: &SwarmEvent) -> usize {
-    format!("{:?}", event).len()
+    struct ByteCount(usize);
+    impl std::fmt::Write for ByteCount {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 += text.len();
+            Ok(())
+        }
+
+        fn write_char(&mut self, ch: char) -> std::fmt::Result {
+            self.0 += ch.len_utf8();
+            Ok(())
+        }
+    }
+
+    let mut count = ByteCount(0);
+    // A partial rendering is not comparable to a full event. Fall back to its inline size.
+    match std::fmt::write(&mut count, format_args!("{event:?}")) {
+        Ok(()) => count.0,
+        Err(_) => std::mem::size_of_val(event),
+    }
 }
 
 fn path_len(path: &std::path::Path) -> usize {
@@ -1253,3 +1215,7 @@ fn path_len(path: &std::path::Path) -> usize {
 #[cfg(test)]
 #[path = "debug_server_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "debug_server_memory_efficiency_tests.rs"]
+mod efficiency_tests;

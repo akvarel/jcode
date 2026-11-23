@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant as TokioInstant, MissedTickBehavior};
 
+mod elapsed_review;
 mod model;
 mod orchestration_watchdog;
 #[path = "background/stall_watchdog.rs"]
@@ -103,30 +104,27 @@ impl BackgroundTaskManager {
         use std::time::{SystemTime, UNIX_EPOCH};
         const TASK_ID_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
-        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_millis(),
-            Err(_) => 0,
-        };
-        // Use last 6 digits of timestamp + 4 random chars
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
         let rand_part: String = (0..4)
             .map(|_| {
                 let idx = (rand::random::<u8>() as usize) % TASK_ID_ALPHABET.len();
                 TASK_ID_ALPHABET[idx] as char
             })
             .collect();
-        format!(
-            "{}{}",
-            &timestamp.to_string()[timestamp.to_string().len().saturating_sub(6)..],
-            rand_part
-        )
+        let suffix = &timestamp[timestamp.len().saturating_sub(6)..];
+        format!("{suffix}{rand_part}")
     }
 
     pub fn output_path_for(&self, task_id: &str) -> PathBuf {
-        self.output_dir.join(format!("{}.output", task_id))
+        self.output_dir.join(format!("{task_id}.output"))
     }
 
     pub fn status_path_for(&self, task_id: &str) -> PathBuf {
-        self.output_dir.join(format!("{}.status.json", task_id))
+        self.output_dir.join(format!("{task_id}.status.json"))
     }
 
     fn publish_task_started_activity(
@@ -327,6 +325,7 @@ impl BackgroundTaskManager {
         };
         self.write_status_file(&info.status_file, &status).await;
         self.register_watch(&info.task_id, session_id, Some(pid));
+        self.arm_elapsed_review(tool_name, &info.task_id);
         Self::publish_task_started_activity(
             &info.task_id,
             tool_name,
@@ -547,6 +546,7 @@ impl BackgroundTaskManager {
             .await
             .insert(task_id.clone(), running_task);
         let _ = registered_tx.send(());
+        self.arm_elapsed_review(tool_name, &task_id);
 
         BackgroundTaskInfo {
             task_id,
@@ -766,6 +766,7 @@ impl BackgroundTaskManager {
             .await
             .insert(task_id.clone(), running_task);
         let _ = registered_tx.send(());
+        self.arm_elapsed_review(tool_name, &task_id);
 
         BackgroundTaskInfo {
             task_id,

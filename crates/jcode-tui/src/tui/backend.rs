@@ -5,9 +5,13 @@
 //!
 //! Also provides debug socket events for exposing full TUI state.
 
+mod debug_events;
+#[path = "backend_screen.rs"]
+mod screen;
 mod ssh_sessions;
 
-use crate::message::ToolCall;
+pub use debug_events::{DebugEvent, DebugMessage};
+
 #[path = "backend_protocol_io.rs"]
 mod protocol_io;
 
@@ -16,7 +20,6 @@ use crate::server;
 use crate::transport::{Stream, WriteHalf};
 use crate::tui::remote_diff::RemoteDiffTracker;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,112 +31,6 @@ fn subscribe_history_base(base: Option<HistoryBase>, ssh_remote: bool) -> Option
     } else {
         base
     }
-}
-
-/// Debug events broadcast by local harnesses via debug socket.
-/// These expose the full internal state for debugging/comparison.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum DebugEvent {
-    /// Full state snapshot (sent on connect)
-    StateSnapshot {
-        display_messages: Vec<DebugMessage>,
-        streaming_text: String,
-        streaming_tool_calls: Vec<ToolCall>,
-        input: String,
-        cursor_pos: usize,
-        is_processing: bool,
-        scroll_offset: usize,
-        status: String,
-        provider_name: String,
-        provider_model: String,
-        mcp_servers: Vec<String>,
-        skills: Vec<String>,
-        session_id: Option<String>,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_read_input_tokens: Option<u64>,
-        cache_creation_input_tokens: Option<u64>,
-        queued_messages: Vec<String>,
-    },
-
-    /// Text delta appended to streaming_text
-    TextDelta { text: String },
-
-    /// Tool started
-    ToolStart { id: String, name: String },
-
-    /// Tool input delta
-    ToolInput { delta: String },
-
-    /// Tool about to execute
-    ToolExec { id: String, name: String },
-
-    /// Tool completed
-    ToolDone {
-        id: String,
-        name: String,
-        output: String,
-        is_error: bool,
-    },
-
-    /// Message added to display_messages
-    MessageAdded { message: DebugMessage },
-
-    /// Streaming text cleared (turn complete)
-    StreamingCleared,
-
-    /// Processing state changed
-    ProcessingChanged { is_processing: bool },
-
-    /// Status changed
-    StatusChanged { status: String },
-
-    /// Token usage update
-    TokenUsage {
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_read_input_tokens: Option<u64>,
-        cache_creation_input_tokens: Option<u64>,
-    },
-
-    /// Input changed (user typing)
-    InputChanged { input: String, cursor_pos: usize },
-
-    /// Scroll offset changed
-    ScrollChanged { offset: usize },
-
-    /// Message queued
-    MessageQueued { content: String },
-
-    /// Queued message sent
-    QueuedMessageSent { index: usize },
-
-    /// Session ID set
-    SessionId { id: String },
-
-    /// Thinking started
-    ThinkingStart,
-
-    /// Thinking ended
-    ThinkingEnd,
-
-    /// Compaction occurred
-    Compaction { trigger: String, pre_tokens: u64 },
-
-    /// Error occurred
-    Error { message: String },
-}
-
-/// Simplified message for debug serialization
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DebugMessage {
-    pub role: String,
-    pub content: String,
-    pub tool_calls: Vec<String>,
-    pub duration_secs: Option<f32>,
-    pub title: Option<String>,
-    pub tool_data: Option<ToolCall>,
 }
 
 /// Events emitted by backends during message processing
@@ -259,6 +156,9 @@ pub struct RemoteConnection {
     _dummy_peer: Option<Stream>,
     session_id: Option<String>,
     cloud_authority: Option<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+    screen_feed: Option<screen::ScreenFeed>,
+    pub(crate) jarvis_tools_configured: bool,
+    pub(crate) local_tools_request: Option<u64>,
     cloud_callbacks: Vec<tokio::task::AbortHandle>,
     client_instance_id: Option<String>,
     next_request_id: u64,
@@ -344,6 +244,9 @@ fn remote_protocol_frame_exceeds_limit(buffered: usize, incoming: usize) -> bool
 }
 
 pub(crate) trait RemoteEventState {
+    fn finish_local_tools_request(&mut self, _id: u64, _accepted: bool) -> bool {
+        false
+    }
     /// Replay has no outstanding control requests. Live connections track IDs.
     fn finish_runtime_command(&mut self, _id: u64) -> bool {
         false
@@ -463,6 +366,9 @@ impl RemoteConnection {
             _dummy_peer: None,
             session_id: None,
             cloud_authority: None,
+            screen_feed: None,
+            jarvis_tools_configured: false,
+            local_tools_request: None,
             cloud_callbacks: Vec::new(),
             client_instance_id: client_instance_id.map(str::to_string),
             // Keep reattached turn Done distinct from bootstrap acknowledgments.
@@ -741,10 +647,12 @@ impl RemoteConnection {
 
     /// Clear the server-side conversation and replace it with a fresh session.
     pub async fn clear(&mut self) -> Result<u64> {
-        let had_cloud_authority = self.cloud_authority.is_some();
+        let had_cloud_authority = self.cloud_authority.is_some()
+            || self.jarvis_tools_configured
+            || self.local_tools_request.is_some();
         self.revoke_cloud_authority();
         if had_cloud_authority {
-            self.configure_cloud_tools(Default::default()).await?;
+            self.clear_local_tools().await?;
         }
         let id = self.next_request_id;
         self.next_request_id += 1;
@@ -779,6 +687,18 @@ impl RemoteConnection {
         system_reminder: Option<String>,
         active_skill: Option<String>,
     ) -> Result<u64> {
+        self.send_message_with_origin(content, images, system_reminder, active_skill, false)
+            .await
+    }
+
+    pub(crate) async fn send_message_with_origin(
+        &mut self,
+        content: String,
+        images: Vec<(String, String)>,
+        system_reminder: Option<String>,
+        active_skill: Option<String>,
+        jarvis_voice: bool,
+    ) -> Result<u64> {
         // Output token usage snapshots are cumulative within a single API call.
         // Reset per-call watermark before sending the next user request.
         self.reset_call_output_tokens_seen();
@@ -786,6 +706,7 @@ impl RemoteConnection {
         let id = self.next_request_id;
         let request = Request::Message {
             id,
+            jarvis_voice,
             content,
             images,
             system_reminder,
@@ -945,10 +866,12 @@ impl RemoteConnection {
     /// Resume a specific session by ID
     pub async fn resume_session(&mut self, session_id: &str) -> Result<()> {
         if self.session_id.as_deref() != Some(session_id) {
-            let had_cloud_authority = self.cloud_authority.is_some();
+            let had_cloud_authority = self.cloud_authority.is_some()
+                || self.jarvis_tools_configured
+                || self.local_tools_request.is_some();
             self.revoke_cloud_authority();
             if had_cloud_authority {
-                self.configure_cloud_tools(Default::default()).await?;
+                self.clear_local_tools().await?;
             }
         }
         let request = Request::ResumeSession {
@@ -1286,8 +1209,20 @@ impl RemoteConnection {
         images: Vec<(String, String)>,
         urgent: bool,
     ) -> Result<u64> {
+        self.soft_interrupt_with_origin(content, images, urgent, false)
+            .await
+    }
+
+    pub(crate) async fn soft_interrupt_with_origin(
+        &mut self,
+        content: String,
+        images: Vec<(String, String)>,
+        urgent: bool,
+        jarvis_voice: bool,
+    ) -> Result<u64> {
         let id = self.next_request_id;
         let request = Request::SoftInterrupt {
+            jarvis_voice,
             id,
             content,
             images,
@@ -1431,6 +1366,9 @@ impl RemoteConnection {
             _dummy_peer: Some(b),
             session_id: None,
             cloud_authority: None,
+            screen_feed: None,
+            jarvis_tools_configured: false,
+            local_tools_request: None,
             cloud_callbacks: Vec::new(),
             client_instance_id: None,
             next_request_id: 1,
@@ -1462,6 +1400,11 @@ impl RemoteConnection {
 
     /// Set session ID
     pub fn set_session_id(&mut self, id: String) {
+        if self.session_id.as_deref() != Some(id.as_str()) {
+            self.stop_screen_context();
+            self.jarvis_tools_configured = false;
+            self.local_tools_request = None;
+        }
         self.session_id = Some(id);
     }
 
