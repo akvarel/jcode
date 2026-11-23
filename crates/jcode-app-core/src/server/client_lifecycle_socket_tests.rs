@@ -875,7 +875,7 @@ async fn sdk_socket_cancel_workflow(
     until(&mut observer_reader, |e| {
         assert!(
             !matches!(e, ServerEvent::ToolCall { .. }),
-            "A callback must never reach B's owner connection"
+            "A callback must never reach B's owner connection: {e:?}"
         );
         matches!(e, ServerEvent::Tools { id: 25, .. })
     })

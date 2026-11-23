@@ -639,7 +639,7 @@ fn auto_initial_account_skips_known_quota_before_sending_in_both_modes() {
                 let (provider, attempts, _cleanup) = account_routing_fixture(&[]);
                 bind_fixture_account(&provider, &attempts, "unbound", &[]);
                 provider.openai_provider().unwrap().set_credential_mode(CredentialMode::Auto).unwrap();
-                let _quota_cleanup = RemoteQuotaCleanup;
+                let _quota_cleanup = crate::usage::TestRemoteUsageGuard::new();
                 crate::usage::set_remote_account_usage(vec![], vec![
                     exhausted_account_snapshot("openai-otter"),
                     exhausted_account_snapshot("openai-fox"),
@@ -697,7 +697,7 @@ fn auto_initial_anthropic_account_skips_weekly_quota_without_cooldown() {
             mode: Mutex::new(CredentialMode::Auto),
         });
         *provider.anthropic.write().unwrap() = Some(original.clone());
-        let _quota_cleanup = RemoteQuotaCleanup;
+        let _quota_cleanup = crate::usage::TestRemoteUsageGuard::new();
         crate::usage::set_remote_account_usage(
             vec![serde_json::from_value(serde_json::json!({
                 "label": "claude-otter", "exhausted": false,
@@ -745,7 +745,7 @@ fn auto_initial_quota_routing_preserves_pins_disabled_failover_and_pool_boundari
                     _ => CredentialMode::Auto,
                 })
                 .unwrap();
-            let _quota_cleanup = RemoteQuotaCleanup;
+            let _quota_cleanup = crate::usage::TestRemoteUsageGuard::new();
             let mut snapshots = vec![exhausted_account_snapshot("openai-otter")];
             if case == "no-ready" {
                 snapshots.extend([

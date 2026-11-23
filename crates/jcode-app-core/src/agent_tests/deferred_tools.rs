@@ -32,7 +32,15 @@ async fn native_deferred_agent(mode: crate::config::McpToolsMode) -> Agent {
     let provider: Arc<dyn Provider> = Arc::new(NativeDeferredToolsProvider);
     let registry = Registry::new(provider.clone()).await;
     register_fake_deferred_mcp_surface(&registry).await;
-    let mut agent = Agent::new(provider, registry);
+    // Deferral is tested against the full built-in surface, independently of
+    // the developer's configured allowlist and disabled tools.
+    let mut agent = Agent::build_base(
+        provider,
+        registry,
+        Session::create(None, None),
+        None,
+        HashSet::new(),
+    );
     agent.mcp_tools_mode = mode;
     agent
 }
