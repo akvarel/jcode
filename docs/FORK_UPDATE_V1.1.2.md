@@ -29,3 +29,13 @@ Reconcile the combined fork and upstream inventories with the existing scanner u
 - Default-feature core test compilation exposed three newly imported account-failover tests referencing upstream's removed `RemoteQuotaCleanup` helper. Use the retained `TestRemoteUsageGuard::new()` in those tests, consistent with existing fork tests. This preserves scoped restoration of quota state rather than reintroducing cleanup that leaks daemon-only quota mode.
 - The first executable app-core suite passed 2091 tests, ignored 26 and failed the new native-deferral integration test because it inherited the developer's disabled browser policy. Initialize that fixture through the existing base constructor with an explicit unrestricted tool policy, retaining every deferral assertion and leaving production configuration unchanged.
 - Final whitespace review removed one upstream trailing blank line from the extracted legacy search fixture. No test assertions or production contracts were weakened.
+- One app-suite rerun intermittently failed the socket callback-owner assertion. Retain the assertion and include the actual event in its diagnostic. The isolated socket workflow and subsequent complete app suite passed without a production routing change. This remains a known nondeterministic test observation, not a claimed production bug fix.
+
+## Final acceptance before installation
+
+- Final full `scripts/check_guardrails.sh`: passed. Optional cargo-machete was unavailable.
+- Core library suites, serial execution with `umask 077`: app-core 2092 passed / 26 ignored, base 2387 passed / 42 ignored, config types 34 passed, swarm core 17 passed.
+- TUI library: 3787 passed / 45 ignored. Antigravity runtime library: 37 passed. These exercise upstream UI and provider changes, including the adopted streaming implementation.
+- ohAgent `cargo check --workspace --all-targets` and workspace formatting passed after synchronizing the repaired Jcode revision. Its lockfile adds the session-types crate's new libc dependency. Existing compiler warnings were not suppressed.
+- Review source and staged whitespace, preserve the pre-existing parent `TEAM_MEMORY/SESSION_LOG.md` edit, install from a clean committed revision using `scripts/install_release.sh --fast`, and verify the immutable installed binary separately from the shared daemon.
+- Live paid-provider calls and full parent E2E suites were not run. No production service was deployed or restarted.
