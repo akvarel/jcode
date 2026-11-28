@@ -484,22 +484,16 @@ fn default_delivery_poke_respects_stops_cancellation_and_opt_out() {
     assert!(FollowUpPolicy::new(true).decide(&s).follow_up.is_none());
     s.goals[0] = TodoGoal {
         iteration_maturity: Some(crate::IterationMaturity::PlateauConfirmed),
-        stopping_evidence: Some("one approach plateaued; next approach remains".into()),
+        stopping_evidence: Some("three approaches exhausted the user's evaluation budget".into()),
         ..goal.clone()
     };
-    assert_eq!(
-        kind(&FollowUpPolicy::new(true).decide(&s)),
-        Some(FollowUpKind::Ownership)
-    );
+    assert!(FollowUpPolicy::new(true).decide(&s).follow_up.is_none());
     s.goals[0] = TodoGoal {
         iteration_maturity: Some(crate::IterationMaturity::BudgetExhausted),
         stopping_evidence: Some("user's time limit reached".into()),
         ..goal
     };
-    assert_eq!(
-        kind(&FollowUpPolicy::new(true).decide(&s)),
-        Some(FollowUpKind::Ownership)
-    );
+    assert!(FollowUpPolicy::new(true).decide(&s).follow_up.is_none());
     s.goals[0].stopping_evidence = None;
     assert_eq!(
         kind(&FollowUpPolicy::new(true).decide(&s)),

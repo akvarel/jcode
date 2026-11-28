@@ -487,7 +487,7 @@ fn test_remote_escape_interrupt_disables_auto_poke_while_processing() {
     assert!(app.queued_messages.is_empty());
     assert_eq!(
         app.status_notice(),
-        Some("Interrupting... Auto-poke OFF".to_string())
+        Some("Interrupting... Auto-poke paused".to_string())
     );
 }
 

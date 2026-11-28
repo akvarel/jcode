@@ -52,7 +52,7 @@
     "crates/jcode-tui/src/tui/ui_tests/tools.rs": 1476,
     "crates/jcode-tui/src/tui/ui_todo_stages_tests.rs": 1220,
     "src/cli/args/tests.rs": 1243,
-    "src/cli/commands_tests.rs": 1805
+    "src/cli/commands_tests.rs": 1811
   },
   "version": 1
 }

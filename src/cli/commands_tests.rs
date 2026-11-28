@@ -611,8 +611,14 @@ async fn run_dependency_waits_any_but_does_not_resume_still_blocked_todo() {
         .await
         .unwrap();
     let message = resumed.unwrap();
-    assert!(message.contains(&a.task_id));
-    assert!(message.contains(&b.task_id));
+    assert!(
+        message.contains(&a.task_id),
+        "missing first dependency: {message}"
+    );
+    assert!(
+        message.contains(&b.task_id),
+        "missing second dependency: {message}"
+    );
 }
 
 #[tokio::test]
