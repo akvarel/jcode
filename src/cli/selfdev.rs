@@ -230,16 +230,11 @@ pub async fn run_self_dev(should_build: bool, resume_session: Option<String>) ->
 
     output::stderr_info("Starting self-dev TUI...");
 
-    super::tui_launch::run_tui_client(
-        Some(session_id),
-        None,
-        !server_running,
-        false,
-        None,
-        false,
-        false,
-        None,
-    )
+    super::tui_launch::run_tui_client(super::tui_launch::TuiLaunchOptions {
+        resume_session: Some(session_id),
+        server_spawning: !server_running,
+        ..Default::default()
+    })
     .await
 }
 #[cfg(test)]

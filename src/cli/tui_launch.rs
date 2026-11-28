@@ -134,16 +134,29 @@ mod turn_envelope_tests {
     }
 }
 
-pub async fn run_tui_client(
-    resume_session: Option<String>,
-    startup_hints: Option<setup_hints::StartupHints>,
-    server_spawning: bool,
-    fresh_spawn: bool,
-    remote_working_dir: Option<String>,
-    onboarding_sim: bool,
-    update_sim: bool,
-    initial_model_spec: Option<String>,
-) -> Result<()> {
+#[derive(Default)]
+pub struct TuiLaunchOptions {
+    pub resume_session: Option<String>,
+    pub startup_hints: Option<setup_hints::StartupHints>,
+    pub server_spawning: bool,
+    pub fresh_spawn: bool,
+    pub remote_working_dir: Option<String>,
+    pub onboarding_sim: bool,
+    pub update_sim: bool,
+    pub initial_model_spec: Option<String>,
+}
+
+pub async fn run_tui_client(options: TuiLaunchOptions) -> Result<()> {
+    let TuiLaunchOptions {
+        resume_session,
+        startup_hints,
+        server_spawning,
+        fresh_spawn,
+        remote_working_dir,
+        onboarding_sim,
+        update_sim,
+        initial_model_spec,
+    } = options;
     startup_profile::mark("tui_client_enter");
     let (terminal, tui_runtime) = init_tui_runtime()?;
     startup_profile::mark("tui_terminal_init");
