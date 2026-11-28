@@ -367,6 +367,41 @@ async fn ordinary_session_enables_real_followups_without_client_opt_in() {
 }
 
 #[tokio::test]
+async fn undelivered_goal_continues_once_after_last_attempt_finishes() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider = RecordingProvider::default();
+    let mut agent = Agent::new_with_initial_working_dir(
+        Arc::new(provider.clone()),
+        crate::tool::Registry::empty(),
+        home.path().to_str(),
+    );
+    let session = agent.session_id().to_owned();
+    let mut s = open_snapshot();
+    s.todos[0].status = "completed".into();
+    todo::save_todos(&session, &s.todos).unwrap();
+    todo::save_goals(
+        &session,
+        &[todo::TodoGoal {
+            delivery_state: Some(todo::DeliveryState::Undelivered),
+            verification_state: Some(todo::VerificationState::CheckedEndToEnd),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    run_followups(&mut agent, tx.clone()).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    initialize_remote_session(&session, true).unwrap();
+    run_followups(&mut agent, tx).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn ordinary_session_respects_host_default_off_and_explicit_on() {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::tempdir().unwrap();
@@ -590,4 +625,119 @@ async fn remote_loop_runtime_executes_turns_persists_controls_and_recovers_actua
     let (other_status, _) = control(other, "poke", &["status".into()]).unwrap().unwrap();
     assert_eq!(other_status["poke_enabled"], false);
     assert!(!state_path(other).unwrap().exists(), "status is read-only");
+}
+
+#[test]
+fn poke_pause_rearms_on_next_user_turn_while_explicit_off_stays_off() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let session_id = "session_escape_rearm_test";
+    initialize_remote_session(session_id, true).unwrap();
+    todo::save_todos(session_id, &open_snapshot().todos).unwrap();
+    assert!(
+        read_state(&state_path(session_id).unwrap())
+            .unwrap()
+            .poke_enabled
+    );
+
+    // Escape pauses auto-poke for the cancelled turn and records pause metadata.
+    let (paused, _) = control(session_id, "poke", &["pause".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused["poke_enabled"], false);
+    let state = read_state(&state_path(session_id).unwrap()).unwrap();
+    let paused_at = state.paused_at_unix_secs.unwrap();
+    let initial_fp = state.paused_todo_fingerprint.clone();
+    assert!(!state.poke_enabled);
+    assert!(state.rearm_on_user_turn);
+    assert!(!state.user_prompt_since_pause);
+
+    // Timeout alone without a user prompt does NOT re-arm.
+    let mut no_prompt_state = state.clone();
+    assert!(
+        maybe_rearm_paused_state(
+            session_id,
+            &mut no_prompt_state,
+            paused_at + INTERRUPT_PAUSE_REARM_SECS,
+            initial_fp.as_deref()
+        )
+        .is_none()
+    );
+    assert!(!no_prompt_state.poke_enabled);
+
+    // A user prompt alone before the 5-minute timeout does NOT re-arm yet,
+    // but marks user_prompt_since_pause = true.
+    assert!(!rearm_on_user_turn(session_id).unwrap());
+    let mut state = read_state(&state_path(session_id).unwrap()).unwrap();
+    assert!(!state.poke_enabled);
+    assert!(state.user_prompt_since_pause);
+
+    // Once 5 minutes have elapsed AND a user prompt has been sent, it re-arms.
+    assert!(
+        maybe_rearm_paused_state(
+            session_id,
+            &mut state,
+            paused_at + 10,
+            initial_fp.as_deref()
+        )
+        .is_none()
+    );
+    assert_eq!(
+        maybe_rearm_paused_state(
+            session_id,
+            &mut state,
+            paused_at + INTERRUPT_PAUSE_REARM_SECS,
+            initial_fp.as_deref()
+        ),
+        Some("pause_timeout_and_user_turn")
+    );
+    assert!(state.poke_enabled);
+    assert!(!state.rearm_on_user_turn);
+    assert!(!state.user_prompt_since_pause);
+
+    // Explicit /poke off stays off even after user prompt and timeout.
+    control(session_id, "poke", &["on".into()])
+        .unwrap()
+        .unwrap();
+    let (stopped, _) = control(session_id, "poke", &["off".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped["poke_enabled"], false);
+    assert!(!rearm_on_user_turn(session_id).unwrap());
+    let state = read_state(&state_path(session_id).unwrap()).unwrap();
+    assert!(!state.poke_enabled);
+    assert!(!state.rearm_on_user_turn);
+
+    // Pausing when already off does not arm re-enable.
+    control(session_id, "poke", &["pause".into()])
+        .unwrap()
+        .unwrap();
+    assert!(!rearm_on_user_turn(session_id).unwrap());
+    assert!(
+        !read_state(&state_path(session_id).unwrap())
+            .unwrap()
+            .poke_enabled
+    );
+
+    // Todo update after Escape re-arms immediately regardless of timeout.
+    control(session_id, "poke", &["on".into()])
+        .unwrap()
+        .unwrap();
+    control(session_id, "poke", &["pause".into()])
+        .unwrap()
+        .unwrap();
+    let mut state = read_state(&state_path(session_id).unwrap()).unwrap();
+    assert_eq!(
+        maybe_rearm_paused_state(
+            session_id,
+            &mut state,
+            paused_at + 1,
+            Some("[{\"changed\":true}]")
+        ),
+        Some("todos_updated_after_interrupt")
+    );
+    assert!(state.poke_enabled);
 }

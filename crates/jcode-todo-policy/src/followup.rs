@@ -200,6 +200,8 @@ pub struct FollowUpPolicy {
     gate_attempts: u8,
     spike_challenged: bool,
     last_ownership_fingerprint: Option<String>,
+    #[serde(default)]
+    last_ownership_work: Option<Vec<(String, String, Option<String>, String)>>,
     incomplete_budget: IncompleteTodoBudget,
     gate_digest_enabled: bool,
     gate_digest_delivered: bool,
@@ -207,6 +209,22 @@ pub struct FollowUpPolicy {
 
 pub fn is_incomplete_todo(todo: &TodoItem) -> bool {
     !todo_status_is_completed(&todo.status) && !todo_status_is_cancelled(&todo.status)
+}
+
+fn canonical_todo_work(todos: &[TodoItem]) -> Vec<(String, String, Option<String>, String)> {
+    let mut items: Vec<_> = todos
+        .iter()
+        .map(|todo| {
+            (
+                todo.id.clone(),
+                todo.content.clone(),
+                crate::normalized_group(todo.group.as_deref()),
+                todo.status.clone(),
+            )
+        })
+        .collect();
+    items.sort();
+    items
 }
 
 impl FollowUpPolicy {
@@ -294,6 +312,7 @@ impl FollowUpPolicy {
             self.spike_challenged = false;
             self.gate_digest_delivered = false;
             self.last_ownership_fingerprint = None;
+            self.last_ownership_work = None;
         }
 
         let incomplete: Vec<&TodoItem> = todos.iter().filter(|t| is_incomplete_todo(t)).collect();
@@ -315,7 +334,12 @@ impl FollowUpPolicy {
                     })
             })
             .collect();
-        if !incomplete.is_empty() && actionable.is_empty() {
+        let delivery_message = if actionable.is_empty() {
+            crate::undelivered_goal_message(todos, goals)
+        } else {
+            None
+        };
+        if !incomplete.is_empty() && actionable.is_empty() && delivery_message.is_none() {
             // Waiting is not resistance or completion. A completion wake will
             // re-enter the policy with fresh runtime facts and a fresh budget.
             self.incomplete_budget = IncompleteTodoBudget::default();
@@ -334,17 +358,19 @@ impl FollowUpPolicy {
             });
         }
 
-        if !incomplete.is_empty() {
+        if !actionable.is_empty() {
             return self.poke_incomplete(&actionable);
         }
 
         // Completing or removing the list ends the prior poke cycle.
         self.incomplete_budget = IncompleteTodoBudget::default();
-        if todos.is_empty() {
+        if todos.is_empty() && delivery_message.is_none() {
             // Stay armed: a todo-free turn must not disable poking for later
             // turns that do leave work open.
             self.final_response_requested = false;
+            self.gate_attempts = 0;
             self.last_ownership_fingerprint = None;
+            self.last_ownership_work = None;
             self.gate_digest_delivered = false;
             return Decision::default();
         }
@@ -369,10 +395,23 @@ impl FollowUpPolicy {
             .with_effects(effects);
         }
 
-        let ownership_needs_followup =
-            self.gate_digest_enabled && !completed_groups_have_sufficient_delivery(todos, goals);
+        let ownership_needs_followup = delivery_message.is_some()
+            || (self.gate_digest_enabled
+                && !completed_groups_have_sufficient_delivery(todos, goals));
+        let ownership_work = canonical_todo_work(todos);
+        let todo_work_progressed = self
+            .last_ownership_work
+            .as_ref()
+            .is_some_and(|previous| previous != &ownership_work);
+        if ownership_needs_followup && todo_work_progressed {
+            // New todo work was completed since the last ownership poke; treat
+            // this as forward progress rather than a stall on the same gap.
+            self.last_ownership_fingerprint = None;
+            self.gate_attempts = 0;
+        }
         let gate_budget_left = self.gate_attempts < MAX_GATE_ATTEMPTS;
-        let ownership_message = build_todo_ownership_continuation_message(todos, goals);
+        let ownership_message = delivery_message
+            .unwrap_or_else(|| build_todo_ownership_continuation_message(todos, goals));
         let ownership_fingerprint = Some(ownership_message.clone());
         if ownership_needs_followup && self.last_ownership_fingerprint == ownership_fingerprint {
             // Already asked about this exact gap: keep the honest assessment
@@ -381,6 +420,7 @@ impl FollowUpPolicy {
         }
         if ownership_needs_followup && gate_budget_left {
             self.last_ownership_fingerprint = ownership_fingerprint;
+            self.last_ownership_work = Some(ownership_work);
             self.gate_attempts = self.gate_attempts.saturating_add(1);
             return Decision::send(
                 FollowUpKind::Ownership,
@@ -461,6 +501,7 @@ impl FollowUpPolicy {
         self.gate_digest_delivered = false;
         self.spike_challenged = false;
         self.last_ownership_fingerprint = None;
+        self.last_ownership_work = None;
         let todos: Vec<_> = incomplete.iter().map(|todo| (*todo).clone()).collect();
         let message = build_actionable_poke_message(&todos);
         if !self.incomplete_budget.allow_follow_up(&todos) {
@@ -486,8 +527,8 @@ impl FollowUpPolicy {
 /// Completion-confidence summary over the completed todos.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfidenceSummary {
-    /// Priority-weighted average of recorded completion confidence (0-100).
-    pub average: Option<u8>,
+    /// Priority-weighted average of recorded completion confidence.
+    pub average: Option<ConfidenceState>,
     pub needs_validation: bool,
     pub spike_detected: bool,
 }
@@ -510,11 +551,12 @@ impl ConfidenceSummary {
         for todo in &completed {
             if let Some(state) = todo.completion_confidence {
                 let w = priority_weight(&todo.priority);
-                sum += u32::from(state.legacy_score()) * w;
+                sum += u32::from(state.level()) * w;
                 weight += w;
             }
         }
-        let average = (weight > 0).then(|| ((sum + weight / 2) / weight) as u8);
+        let average =
+            (weight > 0).then(|| ConfidenceState::from_level(((sum + weight / 2) / weight) as u8));
         let needs_validation = !completed.is_empty()
             && completed.iter().any(|todo| {
                 todo.completion_confidence.is_none()
@@ -529,7 +571,6 @@ impl ConfidenceSummary {
 
     pub fn label(&self) -> String {
         self.average
-            .map(ConfidenceState::from_legacy_score)
             .map(|state| state.as_str().to_string())
             .unwrap_or_else(|| "unknown".to_string())
     }

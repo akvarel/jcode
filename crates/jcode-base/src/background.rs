@@ -1220,6 +1220,20 @@ impl BackgroundTaskManager {
                 terminal_event_record(event_status, event_exit_code, event_error.as_deref()),
             );
             persist_status(&task.status_path, &final_status);
+            let output_path = self.output_path_for(&final_status.task_id);
+            Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+                task_id: final_status.task_id,
+                tool_name: final_status.tool_name,
+                display_name: final_status.display_name,
+                session_id: final_status.session_id,
+                status: final_status.status,
+                exit_code: final_status.exit_code,
+                output_preview: "Cancelled by user".to_string(),
+                output_file: output_path,
+                duration_secs: final_status.duration_secs.unwrap_or_default(),
+                notify: notify_flag,
+                wake: wake_flag,
+            }));
 
             Ok(true)
         } else {
@@ -1267,6 +1281,20 @@ impl BackgroundTaskManager {
                 terminal_event_record(event_status, event_exit_code, event_error.as_deref()),
             );
             self.write_status_file(&status_path, &status).await;
+            let output_path = self.output_path_for(&status.task_id);
+            Bus::global().publish(BusEvent::BackgroundTaskCompleted(BackgroundTaskCompleted {
+                task_id: status.task_id,
+                tool_name: status.tool_name,
+                display_name: status.display_name,
+                session_id: status.session_id,
+                status: status.status,
+                exit_code: status.exit_code,
+                output_preview: "Cancelled by user".to_string(),
+                output_file: output_path,
+                duration_secs: status.duration_secs.unwrap_or_default(),
+                notify: status.notify,
+                wake: status.wake,
+            }));
             Ok(true)
         }
     }
@@ -1289,6 +1317,7 @@ impl BackgroundTaskManager {
             map.drain().map(|(_, task)| task).collect()
         };
         let mut finalized = 0;
+        let mut pending_completions = Vec::new();
 
         for task in tasks {
             task.handle.abort();
@@ -1341,10 +1370,68 @@ impl BackgroundTaskManager {
             );
             self.write_status_file(&task.status_path, &final_status)
                 .await;
+            if notify_flag || wake_flag {
+                pending_completions.push(BackgroundTaskCompleted {
+                    task_id: final_status.task_id.clone(),
+                    tool_name: final_status.tool_name.clone(),
+                    display_name: final_status.display_name.clone(),
+                    session_id: final_status.session_id.clone(),
+                    status: BackgroundTaskStatus::Failed,
+                    exit_code: None,
+                    output_preview: error.clone(),
+                    output_file: self
+                        .output_dir
+                        .join(format!("{}.output", final_status.task_id)),
+                    duration_secs: final_status.duration_secs.unwrap_or(0.0),
+                    notify: notify_flag,
+                    wake: wake_flag,
+                });
+            }
             finalized += 1;
         }
 
+        if !pending_completions.is_empty() {
+            let pending_path = self.output_dir.join("reload-pending-completions.json");
+            let mut existing: Vec<BackgroundTaskCompleted> = tokio::fs::read(&pending_path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            existing.extend(pending_completions);
+            if let Ok(bytes) = serde_json::to_vec(&existing) {
+                let _ = tokio::fs::write(&pending_path, bytes).await;
+            }
+        }
+
         finalized
+    }
+
+    /// Drain any reload-interrupted background task completions persisted for
+    /// `session_id` before `exec` replaced the previous server process.
+    pub async fn take_reload_pending_completions(
+        &self,
+        session_id: &str,
+    ) -> Vec<BackgroundTaskCompleted> {
+        let pending_path = self.output_dir.join("reload-pending-completions.json");
+        let Ok(bytes) = tokio::fs::read(&pending_path).await else {
+            return Vec::new();
+        };
+        let Ok(entries) = serde_json::from_slice::<Vec<BackgroundTaskCompleted>>(&bytes) else {
+            let _ = tokio::fs::remove_file(&pending_path).await;
+            return Vec::new();
+        };
+        let (matched, remaining): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.session_id == session_id);
+        if matched.is_empty() {
+            return Vec::new();
+        }
+        if remaining.is_empty() {
+            let _ = tokio::fs::remove_file(&pending_path).await;
+        } else if let Ok(updated) = serde_json::to_vec(&remaining) {
+            let _ = tokio::fs::write(&pending_path, updated).await;
+        }
+        matched
     }
 
     /// Best-effort synchronous snapshot of currently running tasks.

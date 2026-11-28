@@ -343,6 +343,7 @@ fn handle_server_event_inner(
                 app.insert_thought_line(thought_line);
                 return eager_stream_redraw;
             }
+            app.stream_message_ended = false;
             app.streaming.response_output.text(&text);
             let mut needs_redraw = false;
             if matches!(
@@ -392,6 +393,7 @@ fn handle_server_event_inner(
             // client TPS timer), so the status arrives here as `Streaming`; flip it
             // to `Thinking` while reasoning deltas flow. The next `TextDelta` moves
             // it back to `Streaming`.
+            app.stream_message_ended = false;
             if !matches!(app.status, ProcessingStatus::RunningTool(_)) {
                 let thinking_start = *app.thinking_start.get_or_insert_with(Instant::now);
                 if !matches!(app.status, ProcessingStatus::Thinking(_)) {
@@ -744,6 +746,7 @@ fn handle_server_event_inner(
                 }
                 _ => crate::message::ConnectionPhase::Connecting,
             };
+            app.stream_message_ended = false;
             app.status = if matches!(cp, crate::message::ConnectionPhase::Streaming) {
                 app.resume_streaming_tps();
                 app.connection_phase_started = None;
@@ -997,14 +1000,6 @@ fn handle_server_event_inner(
             let completes_resumed_turn =
                 app.current_message_id.is_none() && app.is_processing && has_resumed_turn_evidence;
             if app.current_message_id == Some(id) || completes_resumed_turn {
-                if !app.stream_buffer.is_empty() {
-                    crate::logging::info(&format!(
-                        "Deferring Done id={} until paced stream backlog drains",
-                        id
-                    ));
-                    app.deferred_stream_done_id = Some(id);
-                    return true;
-                }
                 app.deferred_stream_done_id = None;
                 // A delivery acknowledgement is not proof that an AI turn ran.
                 // This catches hidden continuation dedup/no-op completions at
@@ -2843,10 +2838,12 @@ fn handle_server_event_inner(
                     .as_deref()
                     .map(app_mod::effort_display_label)
                     .unwrap_or("default");
-                app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Reasoning effort → {}",
-                    label
-                )));
+                if !std::mem::take(&mut app.suppress_next_reasoning_effort_message) {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "✓ Reasoning effort → {}",
+                        label
+                    )));
+                }
                 app.set_status_notice(format!("Effort: {}", label));
                 true
             }
@@ -2965,7 +2962,7 @@ fn handle_server_event_inner(
                 }
                 app.push_turn_footer(duration);
             }
-            app.mark_soft_interrupt_injected(&content);
+            let injected_images = app.mark_soft_interrupt_injected(&content);
             let role = display_role.unwrap_or_else(|| "user".to_string());
             if role == "background_task" {
                 if let Some(completed) =
@@ -3025,9 +3022,13 @@ fn handle_server_event_inner(
                 }
             } else if role == jcode_tui_messages::jarvis::JARVIS_USER_ROLE {
                 app.push_display_message(DisplayMessage::jarvis_user(content.clone()));
+                if !injected_images.is_empty() {
+                    app.publish_user_image_previews(&injected_images);
+                }
             } else {
                 // Do not coalesce repeated system injections: each delivery is
                 // its own event in the conversation timeline.
+                let is_user = role == "user";
                 let title = (role == "system").then(|| "Context notification".to_string());
                 app.push_display_message(DisplayMessage {
                     role,
@@ -3037,6 +3038,9 @@ fn handle_server_event_inner(
                     title,
                     tool_data: None,
                 });
+                if is_user && !injected_images.is_empty() {
+                    app.publish_user_image_previews(&injected_images);
+                }
             }
             if let Some(n) = tools_skipped {
                 app.set_status_notice(format!("⚡ {} tool(s) skipped", n));

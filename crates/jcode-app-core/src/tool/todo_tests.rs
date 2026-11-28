@@ -173,7 +173,7 @@ fn hierarchy_open_items_validate_fields_and_types() {
     }
     // Legacy storage fields and the bare waiting ID list remain accepted.
     let legacy = json!({"id":"legacy","content":"Legacy","details":"Brief",
-        "status":"pending","priority":"high","confidence":80,
+        "status":"pending","priority":"high","confidence":"plausible",
         "confidence_history":[],"blocked_by":[],"assigned_to":"@self",
         "waiting_on":["background_1"],"waiting_reason":"Building"});
     assert!(parse_todo_input(wrap(legacy)).is_ok());
@@ -325,7 +325,7 @@ fn model_facing_descriptions_stay_compact() {
     // Item-field guidance is written once, on add. Other routes are open.
     assert!(bytes < 2_600, "todo descriptions grew to {bytes} bytes");
     assert!(
-        schema.to_string().len() < 6_500,
+        schema.to_string().len() < 6_680,
         "todo schema grew to {} bytes",
         schema.to_string().len()
     );
@@ -492,7 +492,7 @@ fn schema_advertises_intent_and_todos() {
     assert!(!goal_props.contains_key("alignment_score"));
     assert!(!goal_props.contains_key("objective"));
     assert!(goal_props.contains_key("cannot_complete"));
-    assert_eq!(goal_props.len(), 12);
+    assert_eq!(goal_props.len(), 13);
     assert_eq!(
         goal_props["feedback_loop_relevance"]["enum"],
         json!([
@@ -524,6 +524,14 @@ fn schema_advertises_intent_and_todos() {
             .any(|value| value == "closed_feedback_loop")
     );
     assert!(goal_required.iter().any(|value| value == "feedback_loop"));
+    assert!(goal_required.iter().any(|value| value == "delivery_state"));
+    assert_eq!(goal_props["delivery_state"]["type"], "string");
+    assert!(
+        goal_props["delivery_state"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("undelivered"))
+    );
     assert!(
         goal_required
             .iter()
@@ -578,7 +586,19 @@ fn schema_advertises_intent_and_todos() {
             "feedback gate message omitted {required_concept}"
         );
     }
-    assert!(goal_props["delivery_state"].get("description").is_none());
+    assert_eq!(
+        goal_props["delivery_state"]["enum"],
+        json!(["undelivered", "partially_delivered", "delivered"])
+    );
+    assert_eq!(
+        goal_props["verification_state"]["enum"],
+        json!(["unchecked", "checked_in_isolation", "checked_end_to_end"])
+    );
+    assert!(
+        !goal_required
+            .iter()
+            .any(|value| value == "verification_state")
+    );
 
     let loop_description = goal_props["closed_feedback_loop"]
         .get("description")
@@ -633,7 +653,7 @@ fn parse(input: Value) -> Result<TodoInput> {
 #[test]
 fn accepts_stringified_todos_array() {
     let input = json!({
-        "todos": "[{\"content\":\"a\",\"status\":\"pending\",\"priority\":\"high\",\"id\":\"1\",\"confidence\":90}]"
+        "todos": "[{\"content\":\"a\",\"status\":\"pending\",\"priority\":\"high\",\"id\":\"1\",\"confidence\":\"plausible\"}]"
     });
     let parsed = parse(input).expect("stringified todos array should parse");
     let todos = parsed.todos.expect("todos present");
@@ -649,8 +669,8 @@ fn accepts_stringified_todos_array() {
 fn accepts_stringified_todo_items_and_string_confidence() {
     let input = json!({
         "todos": [
-            "{\"content\":\"b\",\"status\":\"completed\",\"priority\":\"low\",\"id\":\"2\",\"confidence\":\"85\",\"completion_confidence\":\"95\"}",
-            {"content": "c", "status": "pending", "priority": "high", "id": "3", "confidence": "70"}
+            "{\"content\":\"b\",\"status\":\"completed\",\"priority\":\"low\",\"id\":\"2\",\"confidence\":\"plausible\",\"completion_confidence\":\"plausible\"}",
+            {"content": "c", "status": "pending", "priority": "high", "id": "3", "confidence": "plausible"}
         ]
     });
     let parsed = parse(input).expect("string-coerced items should parse");
@@ -704,13 +724,13 @@ fn rejects_unknown_todo_statuses_with_valid_vocabulary() {
 }
 
 #[test]
-fn accepts_float_confidence_and_empty_string_as_none() {
+fn accepts_empty_string_completion_confidence_as_none() {
     let input = json!({
         "todos": [
-            {"content": "d", "status": "pending", "priority": "high", "id": "4", "confidence": 90.0, "completion_confidence": ""}
+            {"content": "d", "status": "pending", "priority": "high", "id": "4", "confidence": "plausible", "completion_confidence": ""}
         ]
     });
-    let parsed = parse(input).expect("float confidence should parse");
+    let parsed = parse(input).expect("empty string completion_confidence should parse");
     let todos = parsed.todos.expect("todos present");
     assert_eq!(
         todos[0].confidence,
@@ -729,7 +749,7 @@ fn empty_string_todos_means_read() {
 fn native_input_still_parses() {
     let input = json!({
         "todos": [
-            {"content": "e", "status": "pending", "priority": "high", "id": "5", "confidence": 80}
+            {"content": "e", "status": "pending", "priority": "high", "id": "5", "confidence": "plausible"}
         ]
     });
     let parsed = parse(input).expect("native input should parse");
@@ -740,12 +760,44 @@ fn native_input_still_parses() {
 }
 
 #[test]
+fn submitted_goals_require_an_explicit_delivery_state_after_normalization() {
+    let valid = json!({"delivery_state": "not_started"});
+    for invalid in [
+        json!({}),
+        json!({"delivery_state": null}),
+        json!({"delivery_state": "  "}),
+        json!({"end_to_end_ownership": "change_made"}),
+    ] {
+        let goals = json!([valid, invalid]);
+        for input in [
+            goals.clone(),
+            json!(goals.to_string()),
+            json!([valid, invalid.to_string()]),
+        ] {
+            let error = parse(json!({"goals": input}))
+                .err()
+                .expect("missing delivery state accepted");
+            assert!(error.to_string().contains("goals[1].delivery_state"));
+        }
+    }
+    let goals = json!([valid.to_string()]);
+    assert!(parse(json!({"goals": goals.to_string()})).is_ok());
+    for input in [
+        json!({"plan": {}}),
+        json!({"goals": null}),
+        json!({"goals": []}),
+    ] {
+        assert!(parse(input).is_ok());
+    }
+}
+
+#[test]
 fn accepts_goals_and_plan_including_string_coercion() {
     let input = json!({
-        "plan": {"user_intention": "make repository search feel instant", "understands_user_intent": "97"},
+        "plan": {"user_intention": "make repository search feel instant", "understands_user_intent": "clear"},
         "goals": [
-            {"group": "optimize grep", "closed_feedback_loop": "95", "feedback_loop": "run the grep benchmark and compare p50"},
-            {"closed_feedback_loop": 20}
+            {"delivery_state": "change_made", "group": "optimize grep", "closed_feedback_loop": "strong", "feedback_loop": "run the grep benchmark and compare p50"},
+            {"delivery_state": "not_started", "closed_feedback_loop": "weak"}
         ]
     });
     let parsed = parse(input).expect("goals and plan should parse");
@@ -776,7 +828,7 @@ fn accepts_goals_and_plan_including_string_coercion() {
 #[test]
 fn stringified_plan_object_is_accepted() {
     let parsed = parse(json!({
-        "plan": "{\"user_intention\":\"ship it\",\"understands_user_intent\":\"96\"}"
+        "plan": "{\"user_intention\":\"ship it\",\"understands_user_intent\":\"clear\"}"
     }))
     .expect("stringified plan should parse");
     let plan = parsed.plan.expect("plan present");
@@ -790,7 +842,7 @@ fn stringified_plan_object_is_accepted() {
 #[test]
 fn accepts_legacy_plan_alignment_key_but_serializes_the_new_name() {
     let parsed = parse(json!({
-        "plan": {"user_intention_alignment": "97"}
+        "plan": {"user_intention_alignment": "clear"}
     }))
     .expect("legacy alignment key should remain readable");
     let plan = parsed.plan.expect("plan present");
@@ -829,8 +881,8 @@ fn aligned_plan() -> TodoPlan {
     TodoPlan {
         title: None,
         user_intention: Some("understood".to_string()),
-        understands_user_intent: Some(crate::todo::IntentUnderstanding::Complete),
-        understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Complete],
+        understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
+        understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Clear],
     }
 }
 
@@ -865,7 +917,7 @@ fn todo_telemetry_derives_lifecycle_groups_and_score_summaries() {
             closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
             feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
             feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-            delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
+            delivery_state: Some(crate::todo::DeliveryState::Delivered),
             ..Default::default()
         },
         TodoGoal {
@@ -875,7 +927,7 @@ fn todo_telemetry_derives_lifecycle_groups_and_score_summaries() {
             feedback_loop_coverage: Some(
                 crate::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths,
             ),
-            delivery_state: Some(crate::todo::DeliveryState::OutcomeDelivered),
+            delivery_state: Some(crate::todo::DeliveryState::Delivered),
             ..Default::default()
         },
     ];
@@ -966,6 +1018,49 @@ fn prune_orphaned_goals_keeps_everything_when_todo_list_is_empty() {
         goal(None, crate::todo::FeedbackLoopState::Weak),
     ];
     assert_eq!(prune_orphaned_goals(goals, &[]).len(), 2);
+}
+
+#[test]
+fn verification_updates_are_independent_and_histories_are_tool_owned() {
+    use crate::todo::{DeliveryState as D, VerificationState as V};
+    let update = |stored: &[TodoGoal], goal: Value| {
+        merge_goals(stored, parse(json!({"goals": [goal]})).unwrap().goals)
+    };
+    let first = update(
+        &[],
+        json!({"delivery_state":"undelivered", "verification_state":"checked_in_isolation", "verification_state_history":["checked_end_to_end"]}),
+    );
+    assert_eq!(first[0].verification_state_history, [V::CheckedInIsolation]);
+    let second = update(&first, json!({"delivery_state":"partially_delivered"}));
+    assert_eq!(second[0].verification_state, Some(V::CheckedInIsolation));
+    assert_eq!(
+        second[0].verification_state_history,
+        first[0].verification_state_history
+    );
+    assert_eq!(
+        changed_goal_fields(first.first(), second.first()),
+        [TodoGoalField::DeliveryState]
+    );
+    let third = update(
+        &second,
+        json!({"delivery_state":"partially_delivered", "verification_state":"checked_end_to_end"}),
+    );
+    assert_eq!(
+        third[0].verification_state_history,
+        [V::CheckedInIsolation, V::CheckedEndToEnd]
+    );
+    assert_eq!(
+        third[0].delivery_state_history,
+        [D::Undelivered, D::PartiallyDelivered]
+    );
+    assert_eq!(
+        changed_goal_fields(second.first(), third.first()),
+        [TodoGoalField::VerificationState]
+    );
+    assert!(
+        parse(json!({"goals":[{"delivery_state":"delivered", "verification_state":"delivered"}]}))
+            .is_err()
+    );
 }
 
 #[test]

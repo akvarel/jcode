@@ -277,6 +277,11 @@ impl App {
             false,
         );
 
+        let initial_last_response_at = session
+            .messages
+            .iter()
+            .any(|m| m.role == crate::message::Role::Assistant)
+            .then(|| std::time::SystemTime::from(session.updated_at));
         let mut app = Self {
             provider,
             registry,
@@ -324,6 +329,7 @@ impl App {
             context_info: crate::prompt::ContextInfo::default(),
             context_revision: 0,
             last_stream_activity: None,
+            last_response_at: initial_last_response_at,
             last_user_interaction: None,
             stream_message_ended: false,
             deferred_stream_done_id: None,
@@ -447,6 +453,7 @@ impl App {
             startup_display_snapshot: None,
             advertised_history_base: None,
             model_catalog_after_history: false,
+            pending_initial_model_spec: None,
             remote_reasoning_effort: None,
             remote_service_tier: None,
             remote_available_service_tiers: None,
@@ -592,6 +599,7 @@ impl App {
             pending_automatic_failover_request_id: None,
             pending_automatic_failover_started: None,
             pending_reasoning_effort: None,
+            suppress_next_reasoning_effort_message: false,
             remote_model_switch_in_flight: false,
             pending_prompt_after_model_switch: None,
             pending_prompt_before_history: None,
@@ -640,6 +648,7 @@ impl App {
             interleave_message: None,
             interleave_images: Vec::new(),
             pending_soft_interrupts: Vec::new(),
+            pending_soft_interrupt_images: Vec::new(),
             pending_soft_interrupt_requests: Vec::new(),
             sent_soft_interrupts: Vec::new(),
             soft_interrupt_recovery: None,
@@ -800,6 +809,11 @@ impl App {
             false,
         );
 
+        let initial_last_response_at = session
+            .messages
+            .iter()
+            .any(|m| m.role == crate::message::Role::Assistant)
+            .then(|| std::time::SystemTime::from(session.updated_at));
         let mut app = Self {
             provider,
             registry,
@@ -847,6 +861,7 @@ impl App {
             context_info,
             context_revision: 0,
             last_stream_activity: None,
+            last_response_at: initial_last_response_at,
             last_user_interaction: None,
             stream_message_ended: false,
             deferred_stream_done_id: None,
@@ -970,6 +985,7 @@ impl App {
             startup_display_snapshot: None,
             advertised_history_base: None,
             model_catalog_after_history: false,
+            pending_initial_model_spec: None,
             remote_reasoning_effort: None,
             remote_service_tier: None,
             remote_available_service_tiers: None,
@@ -1115,6 +1131,7 @@ impl App {
             pending_automatic_failover_request_id: None,
             pending_automatic_failover_started: None,
             pending_reasoning_effort: None,
+            suppress_next_reasoning_effort_message: false,
             remote_model_switch_in_flight: false,
             pending_prompt_after_model_switch: None,
             pending_prompt_before_history: None,
@@ -1163,6 +1180,7 @@ impl App {
             interleave_message: None,
             interleave_images: Vec::new(),
             pending_soft_interrupts: Vec::new(),
+            pending_soft_interrupt_images: Vec::new(),
             pending_soft_interrupt_requests: Vec::new(),
             sent_soft_interrupts: Vec::new(),
             soft_interrupt_recovery: None,
@@ -1473,5 +1491,15 @@ impl App {
         self.server_spawning = true;
         self.remote_startup_phase = Some(super::RemoteStartupPhase::StartingServer);
         self.remote_startup_phase_started = Some(Instant::now());
+    }
+
+    /// Stage a CLI-requested model spec (`--provider`/`--model`) to apply once
+    /// after connecting to an already-running shared server.
+    pub fn set_initial_model_spec(&mut self, model_spec: String) {
+        self.pending_initial_model_spec = Some(model_spec);
+    }
+
+    pub(in crate::tui::app) fn take_pending_initial_model_spec(&mut self) -> Option<String> {
+        self.pending_initial_model_spec.take()
     }
 }

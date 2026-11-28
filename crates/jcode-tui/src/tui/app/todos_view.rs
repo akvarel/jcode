@@ -715,7 +715,7 @@ fn build_todos_view_markdown(
     _session_id: Option<&str>,
     todos: &[TodoItem],
     _plan: &crate::todo::TodoPlan,
-    _goals: &[crate::todo::TodoGoal],
+    goals: &[crate::todo::TodoGoal],
 ) -> String {
     if todos.is_empty() {
         return "# Todos\n\nNo todos saved yet for this session.\n".to_string();
@@ -754,6 +754,17 @@ fn build_todos_view_markdown(
             String::new()
         },
     );
+
+    for goal in goals {
+        let mut states = Vec::new();
+        if let Some(state) = goal.delivery_state {
+            states.push(format!("Delivery {}", state.as_str()));
+        }
+        if !states.is_empty() {
+            let group = goal.group.as_deref().unwrap_or("Goal");
+            markdown.push_str(&format!("\n{group}: {}\n", states.join(" · ")));
+        }
+    }
 
     let sections = [
         ("in_progress", "In progress"),
@@ -888,6 +899,7 @@ fn hash_todos_payload(
         goal.feedback_loop_coverage.hash(&mut hasher);
         goal.feedback_loop_traceability.hash(&mut hasher);
         goal.delivery_state.hash(&mut hasher);
+        goal.verification_state.hash(&mut hasher);
         goal.difficulty.hash(&mut hasher);
         goal.autonomy.hash(&mut hasher);
         goal.cannot_complete.hash(&mut hasher);
@@ -976,7 +988,7 @@ mod tests {
     fn plan() -> crate::todo::TodoPlan {
         crate::todo::TodoPlan {
             user_intention: Some("make navigation feel immediate".to_string()),
-            understands_user_intent: Some(crate::todo::IntentUnderstanding::from_legacy_score(96)),
+            understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
             ..Default::default()
         }
     }
@@ -986,8 +998,8 @@ mod tests {
         content: &str,
         status: &str,
         priority: &str,
-        confidence: Option<u8>,
-        completion_confidence: Option<u8>,
+        confidence: Option<crate::todo::ConfidenceState>,
+        completion_confidence: Option<crate::todo::ConfidenceState>,
     ) -> TodoItem {
         TodoItem {
             id: id.to_string(),
@@ -997,9 +1009,8 @@ mod tests {
             group: None,
             lane_after: None,
             lane_owner: None,
-            confidence: confidence.map(crate::todo::ConfidenceState::from_legacy_score),
-            completion_confidence: completion_confidence
-                .map(crate::todo::ConfidenceState::from_legacy_score),
+            confidence,
+            completion_confidence,
             confidence_history: Vec::new(),
             waiting_reason: None,
             requires_user_auth: None,
@@ -1045,7 +1056,7 @@ mod tests {
                 "Validate confidence side panel",
                 "in_progress",
                 "high",
-                Some(80),
+                Some(crate::todo::ConfidenceState::Plausible),
                 None,
             ),
             todo(
@@ -1053,8 +1064,8 @@ mod tests {
                 "Finish completed item",
                 "completed",
                 "medium",
-                Some(70),
-                Some(95),
+                Some(crate::todo::ConfidenceState::Plausible),
+                Some(crate::todo::ConfidenceState::Plausible),
             ),
         ];
 
@@ -1076,7 +1087,7 @@ mod tests {
             "Track confidence hash",
             "pending",
             "high",
-            Some(80),
+            Some(crate::todo::ConfidenceState::Plausible),
             None,
         )];
         let before = hash_todos_payload(Some("session_test"), &todos, &plan(), &[]);
@@ -1093,7 +1104,7 @@ mod tests {
             "Cut frame allocs",
             "in_progress",
             "high",
-            Some(80),
+            Some(crate::todo::ConfidenceState::Plausible),
             None,
         );
         grouped_a.group = Some("optimize rendering".to_string());
@@ -1102,13 +1113,27 @@ mod tests {
             "Batch draw calls",
             "completed",
             "medium",
-            Some(70),
-            Some(90),
+            Some(crate::todo::ConfidenceState::Plausible),
+            Some(crate::todo::ConfidenceState::Plausible),
         );
         grouped_b.group = Some("optimize rendering".to_string());
-        let mut other = todo("o1", "Fix scrollback", "pending", "low", Some(60), None);
+        let mut other = todo(
+            "o1",
+            "Fix scrollback",
+            "pending",
+            "low",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        );
         other.group = Some("scrollback".to_string());
-        let ungrouped = todo("u1", "Misc cleanup", "pending", "low", Some(60), None);
+        let ungrouped = todo(
+            "u1",
+            "Misc cleanup",
+            "pending",
+            "low",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        );
 
         let mut todos = vec![grouped_a, grouped_b, other, ungrouped];
         for index in 0..8 {
@@ -1117,7 +1142,7 @@ mod tests {
                 &format!("Extra item {index}"),
                 "pending",
                 "low",
-                Some(60),
+                Some(crate::todo::ConfidenceState::Plausible),
                 None,
             ));
         }
@@ -1127,18 +1152,24 @@ mod tests {
             &plan(),
             &[crate::todo::TodoGoal {
                 group: Some("optimize rendering".to_string()),
-                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(90)),
+                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Strong),
                 feedback_loop: Some(
                     "run the frame benchmark and compare p95 frame time".to_string(),
                 ),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
-                delivery_state: Some(crate::todo::DeliveryState::from_legacy_score(85)),
+                delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
+                verification_state: Some(crate::todo::VerificationState::CheckedEndToEnd),
                 ..Default::default()
             }],
         );
 
         assert!(markdown.contains("_(optimize rendering)_"), "{markdown}");
+        assert!(
+            markdown.contains("Delivery partially_delivered")
+                && !markdown.contains("checked_end_to_end"),
+            "{markdown}"
+        );
         assert!(!markdown.contains("Feedback loop:"), "{markdown}");
         assert!(markdown.contains("_… and 4 more._"), "{markdown}");
         assert_eq!(markdown.matches("- [").count(), 8, "{markdown}");
@@ -1146,7 +1177,14 @@ mod tests {
 
     #[test]
     fn todos_view_hash_changes_when_group_changes() {
-        let mut todos = vec![todo("g", "Group hash", "pending", "high", Some(80), None)];
+        let mut todos = vec![todo(
+            "g",
+            "Group hash",
+            "pending",
+            "high",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        )];
         let before = hash_todos_payload(Some("session_test"), &todos, &plan(), &[]);
         todos[0].group = Some("rendering".to_string());
         let after = hash_todos_payload(Some("session_test"), &todos, &plan(), &[]);
@@ -1155,10 +1193,17 @@ mod tests {
 
     #[test]
     fn todos_view_hash_changes_when_goals_change() {
-        let todos = vec![todo("g", "Goal hash", "pending", "high", Some(80), None)];
+        let todos = vec![todo(
+            "g",
+            "Goal hash",
+            "pending",
+            "high",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        )];
         let before = hash_todos_payload(Some("session_test"), &todos, &plan(), &[]);
         let goals = vec![crate::todo::TodoGoal {
-            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(30)),
+            closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Weak),
             ..Default::default()
         }];
         let after = hash_todos_payload(Some("session_test"), &todos, &plan(), &goals);
@@ -1166,8 +1211,29 @@ mod tests {
     }
 
     #[test]
+    fn todos_view_hash_changes_when_only_verification_changes() {
+        let mut goal = crate::todo::TodoGoal {
+            delivery_state: Some(crate::todo::DeliveryState::Delivered),
+            ..Default::default()
+        };
+        let hash = |goal: &crate::todo::TodoGoal| {
+            hash_todos_payload(None, &[], &plan(), std::slice::from_ref(goal))
+        };
+        let before = hash(&goal);
+        goal.verification_state = Some(crate::todo::VerificationState::CheckedInIsolation);
+        assert_ne!(before, hash(&goal));
+    }
+
+    #[test]
     fn todos_view_hash_changes_when_feedback_loop_changes() {
-        let todos = vec![todo("g", "Goal hash", "pending", "high", Some(80), None)];
+        let todos = vec![todo(
+            "g",
+            "Goal hash",
+            "pending",
+            "high",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        )];
         let mut goals = vec![crate::todo::TodoGoal {
             feedback_loop: Some("run test A".to_string()),
             ..Default::default()
@@ -1180,7 +1246,14 @@ mod tests {
 
     #[test]
     fn todos_view_hash_changes_when_user_intention_changes() {
-        let todos = vec![todo("g", "Goal hash", "pending", "high", Some(80), None)];
+        let todos = vec![todo(
+            "g",
+            "Goal hash",
+            "pending",
+            "high",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        )];
         let mut current = plan();
         let before = hash_todos_payload(Some("session_test"), &todos, &current, &[]);
         current.user_intention = Some("increase clarity".to_string());
@@ -1190,10 +1263,17 @@ mod tests {
 
     #[test]
     fn todos_view_hash_changes_when_intent_understanding_changes() {
-        let todos = vec![todo("g", "Goal hash", "pending", "high", Some(80), None)];
+        let todos = vec![todo(
+            "g",
+            "Goal hash",
+            "pending",
+            "high",
+            Some(crate::todo::ConfidenceState::Plausible),
+            None,
+        )];
         let mut current = plan();
         let before = hash_todos_payload(Some("session_test"), &todos, &current, &[]);
-        current.understands_user_intent = Some(crate::todo::IntentUnderstanding::Complete);
+        current.understands_user_intent = Some(crate::todo::IntentUnderstanding::Partial);
         let after = hash_todos_payload(Some("session_test"), &todos, &current, &[]);
         assert_ne!(before, after);
     }

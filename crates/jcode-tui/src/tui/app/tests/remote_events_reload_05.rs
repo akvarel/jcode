@@ -290,14 +290,14 @@ fn test_reload_preserves_completed_confidence_spike_challenge() {
                 content: "Validate release result".to_string(),
                 status: "completed".to_string(),
                 priority: "high".to_string(),
-                confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+                confidence: Some(crate::todo::ConfidenceState::Verified),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
                 waiting_reason: None,
                 requires_user_auth: None,
                 waiting_on: Vec::new(),
                 confidence_history: vec![
                     crate::todo::ConfidenceState::Speculative,
-                    crate::todo::ConfidenceState::from_legacy_score(100),
+                    crate::todo::ConfidenceState::Verified,
                 ],
                 ..Default::default()
             }],
@@ -307,7 +307,7 @@ fn test_reload_preserves_completed_confidence_spike_challenge() {
         crate::todo::save_goals(
             &reloaded_app.session.id,
             &[crate::todo::TodoGoal {
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                delivery_state: Some(crate::todo::DeliveryState::Delivered),
                 autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
                 iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
@@ -349,12 +349,12 @@ fn test_completion_gate_nudges_stop_after_budget_exhausted() {
                 content: "Ship the fix".to_string(),
                 status: "completed".to_string(),
                 priority: "high".to_string(),
-                confidence: Some(crate::todo::ConfidenceState::from_legacy_score(50)),
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(50)),
+                confidence: Some(crate::todo::ConfidenceState::Speculative),
+                completion_confidence: Some(crate::todo::ConfidenceState::Speculative),
                 waiting_reason: None,
                 requires_user_auth: None,
                 waiting_on: Vec::new(),
-                confidence_history: vec![crate::todo::ConfidenceState::from_legacy_score(50)],
+                confidence_history: vec![crate::todo::ConfidenceState::Speculative],
                 ..Default::default()
             }],
         )
@@ -364,7 +364,7 @@ fn test_completion_gate_nudges_stop_after_budget_exhausted() {
         crate::todo::save_goals(
             &app.session.id,
             &[crate::todo::TodoGoal {
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                delivery_state: Some(crate::todo::DeliveryState::Delivered),
                 autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
                 iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
@@ -416,12 +416,12 @@ fn low_ownership_is_gated_after_the_completed_todo_was_saved() {
                 status: "completed".to_string(),
                 priority: "high".to_string(),
                 group: Some("release".to_string()),
-                confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+                confidence: Some(crate::todo::ConfidenceState::Verified),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
                 waiting_reason: None,
                 requires_user_auth: None,
                 waiting_on: Vec::new(),
-                confidence_history: vec![crate::todo::ConfidenceState::from_legacy_score(100)],
+                confidence_history: vec![crate::todo::ConfidenceState::Verified],
                 ..Default::default()
             }],
         )
@@ -431,8 +431,8 @@ fn low_ownership_is_gated_after_the_completed_todo_was_saved() {
             &app.session.id,
             &[crate::todo::TodoGoal {
                 group: Some("release".to_string()),
-                delivery_state: Some(crate::todo::DeliveryState::Integrated),
-                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::from_legacy_score(100)),
+                delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
+                closed_feedback_loop: Some(crate::todo::FeedbackLoopState::Closed),
                 feedback_loop: Some("run the end-to-end release check".to_string()),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
                 feedback_loop_coverage: Some(crate::todo::FeedbackLoopCoverage::MainPaths),
@@ -447,7 +447,7 @@ fn low_ownership_is_gated_after_the_completed_todo_was_saved() {
         assert!(app.schedule_auto_poke_followup_if_needed());
         assert!(app.pending_queued_dispatch);
         assert_eq!(app.queued_messages.len(), 1);
-        assert!(app.queued_messages[0].contains("complete workflow"));
+        assert!(app.queued_messages[0].contains("still undelivered"));
 
         let saved = crate::todo::load_todos(&app.session.id).expect("load saved todo");
         assert_eq!(saved[0].status, "completed");
@@ -486,7 +486,7 @@ fn remote_ownership_gate_is_not_evaluated_by_client() {
             &remote_session_id,
             &[crate::todo::TodoGoal {
                 group: Some("release".to_string()),
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                delivery_state: Some(crate::todo::DeliveryState::Delivered),
                 autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
                 iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
@@ -525,7 +525,7 @@ fn save_unfinished_ownership_fixture(session_id: &str) {
         session_id,
         &[crate::todo::TodoGoal {
             difficulty: Some(crate::todo::Difficulty::Involved),
-            delivery_state: Some(crate::todo::DeliveryState::Integrated),
+            delivery_state: Some(crate::todo::DeliveryState::PartiallyDelivered),
             autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
             iteration_maturity: Some(crate::todo::IterationMaturity::Improving),
             stopping_evidence: None,
@@ -603,9 +603,9 @@ fn ownership_gate_rechecks_actual_gap_changes_and_respects_budget() {
             // Alternate a delivery gap with an iteration gap, not just wording.
             let delivery_gap = attempt % 2 == 0;
             goals[0].delivery_state = Some(if delivery_gap {
-                crate::todo::DeliveryState::Integrated
+                crate::todo::DeliveryState::PartiallyDelivered
             } else {
-                crate::todo::DeliveryState::WorkflowValidated
+                crate::todo::DeliveryState::Delivered
             });
             goals[0].iteration_maturity = Some(if delivery_gap {
                 crate::todo::IterationMaturity::OutcomeReached
@@ -663,7 +663,7 @@ fn scheduling_and_remote_done_accept_documented_stops_and_requested_only_results
                 // Documented stops may retain delivery and check limitations.
                 // Requested-only success needs no additional ownership work.
                 if maturity == crate::todo::IterationMaturity::OutcomeReached {
-                    goals[0].delivery_state = Some(crate::todo::DeliveryState::WorkflowValidated);
+                    goals[0].delivery_state = Some(crate::todo::DeliveryState::Delivered);
                     goals[0].stopping_evidence = None;
                 }
                 goals[0].difficulty = Some(crate::todo::Difficulty::Complex);
@@ -951,14 +951,14 @@ fn test_gate_digest_is_disabled_at_turn_end() {
                 content: "Speed up the parser".to_string(),
                 status: "completed".to_string(),
                 priority: "high".to_string(),
-                confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
-                completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+                confidence: Some(crate::todo::ConfidenceState::Verified),
+                completion_confidence: Some(crate::todo::ConfidenceState::Verified),
                 waiting_reason: None,
                 requires_user_auth: None,
                 waiting_on: Vec::new(),
                 confidence_history: vec![
-                    crate::todo::ConfidenceState::from_legacy_score(97),
-                    crate::todo::ConfidenceState::from_legacy_score(100),
+                    crate::todo::ConfidenceState::Validated,
+                    crate::todo::ConfidenceState::Verified,
                 ],
                 ..Default::default()
             }],
@@ -968,7 +968,7 @@ fn test_gate_digest_is_disabled_at_turn_end() {
         crate::todo::save_goals(
             &app.session.id,
             &[crate::todo::TodoGoal {
-                delivery_state: Some(crate::todo::DeliveryState::WorkflowValidated),
+                delivery_state: Some(crate::todo::DeliveryState::Delivered),
                 autonomy: Some(crate::todo::Autonomy::NecessaryFollowthrough),
                 iteration_maturity: Some(crate::todo::IterationMaturity::OutcomeReached),
                 feedback_loop_relevance: Some(crate::todo::FeedbackLoopRelevance::Representative),
@@ -986,7 +986,7 @@ fn test_gate_digest_is_disabled_at_turn_end() {
                 kind: crate::todo::GateObservationKind::IntentUnderstanding,
                 group: None,
                 state: Some(
-                    crate::todo::IntentUnderstanding::from_legacy_score(70)
+                    crate::todo::IntentUnderstanding::Partial
                         .as_str()
                         .to_string(),
                 ),

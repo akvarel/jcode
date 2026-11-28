@@ -1039,6 +1039,8 @@ pub struct App {
     context_revision: u64,
     // Track last streaming activity for "stale" detection
     last_stream_activity: Option<Instant>,
+    // Wall-clock time when the last assistant response was completed/pushed
+    last_response_at: Option<std::time::SystemTime>,
     // When the user last pressed a key, mouse-scrolled, or pasted.
     //
     // Distinct from `last_stream_activity`, which tracks *provider* output: a
@@ -1369,6 +1371,9 @@ pub struct App {
     /// the conversation appears without waiting for the server's History.
     /// Send GetModelCatalog once bootstrap History has arrived.
     model_catalog_after_history: bool,
+    /// CLI-requested `--provider`/`--model` spec to apply once after connecting
+    /// to an already-running shared server.
+    pending_initial_model_spec: Option<String>,
     pending_startup_transcript: Option<std::sync::mpsc::Receiver<StartupTranscript>>,
     /// Fingerprint of the locally rendered startup transcript, delivered by
     /// the startup transcript thread before display conversion so the
@@ -1670,6 +1675,10 @@ pub struct App {
     // default effort (low by default) and silently runs the newly selected
     // model at the wrong effort (issue #427).
     pending_reasoning_effort: Option<String>,
+    // Companion SetReasoningEffort forwarded right after a model-picker switch:
+    // suppress the separate "✓ Reasoning effort → ..." transcript line since
+    // the model switch already confirmed the selection.
+    suppress_next_reasoning_effort_message: bool,
     // Remote SetModel has been sent but ModelChanged has not arrived yet. User
     // prompts submitted in this window are held so the first request cannot race
     // the model switch and use stale provider/model state.
@@ -1780,6 +1789,7 @@ pub struct App {
     interleave_images: Vec<(String, String)>,
     // Message sent as soft interrupt but not yet injected (shown in queue preview until injected)
     pending_soft_interrupts: Vec<String>,
+    pending_soft_interrupt_images: Vec<(String, Vec<(String, String)>)>,
     // Soft interrupts written to the socket but not yet acknowledged by the server.
     pending_soft_interrupt_requests: Vec<(u64, String)>,
     // Every soft interrupt still shown as pending, by request id. Unlike the

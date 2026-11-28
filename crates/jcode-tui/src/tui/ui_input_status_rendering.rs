@@ -2,6 +2,32 @@
 
 use super::*;
 
+pub(crate) fn format_last_response_age(elapsed: std::time::Duration) -> Option<String> {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        return None;
+    }
+    if secs < 3600 {
+        return Some(format!("last response {}m ago", secs / 60));
+    }
+    if secs < 86_400 {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        return if mins == 0 {
+            Some(format!("last response {}h ago", hours))
+        } else {
+            Some(format!("last response {}h {}m ago", hours, mins))
+        };
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3600;
+    if hours == 0 {
+        Some(format!("last response {}d ago", days))
+    } else {
+        Some(format!("last response {}d {}h ago", days, hours))
+    }
+}
+
 pub(in super::super) fn draw_status(
     frame: &mut Frame,
     app: &dyn TuiState,
@@ -128,7 +154,16 @@ pub(in super::super) fn draw_status(
             ProcessingStatus::Streaming => {
                 let mut snapshot = live_status_snapshot(app, elapsed);
                 snapshot.phase = "streaming".into();
-                let mut spans = live_processing_status_line(&snapshot, stale_secs, spinner).spans;
+                if app.stream_reveal_pending() {
+                    snapshot.stream_message_ended = false;
+                }
+                let effective_stale_secs = if app.stream_message_ended() {
+                    None
+                } else {
+                    stale_secs
+                };
+                let mut spans =
+                    live_processing_status_line(&snapshot, effective_stale_secs, spinner).spans;
                 if let Some(upstream) = app.upstream_provider() {
                     spans.push(Span::styled(
                         format!(" · via {upstream}"),
@@ -282,6 +317,11 @@ pub(in super::super) fn draw_status(
                 Span::styled("⚠ ", Style::default().fg(warning_color)),
                 Span::styled(warning, Style::default().fg(warning_color)),
             ])
+        } else if let Some(age) = app
+            .time_since_last_response()
+            .and_then(format_last_response_age)
+        {
+            Line::from(vec![Span::styled(age, Style::default().fg(dim_color()))])
         } else if let Some(tip) =
             occasional_status_tip(area.width as usize, app.animation_elapsed() as u64)
         {
@@ -289,6 +329,11 @@ pub(in super::super) fn draw_status(
         } else {
             Line::from("")
         }
+    } else if let Some(age) = app
+        .time_since_last_response()
+        .and_then(format_last_response_age)
+    {
+        Line::from(vec![Span::styled(age, Style::default().fg(dim_color()))])
     } else {
         if let Some(tip) =
             occasional_status_tip(area.width as usize, app.animation_elapsed() as u64)

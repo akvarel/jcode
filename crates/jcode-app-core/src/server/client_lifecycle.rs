@@ -974,9 +974,18 @@ pub(super) async fn handle_client(
                             let result = crate::tool::sdk::configure(locked.session_id(), &client_connection_id, tools, client_event_tx.clone());
                             if result.is_ok() {
                                 locked.invalidate_sdk_tools();
+                                let jarvis_effort = locked.apply_jarvis_default_reasoning_effort();
                                 // Queue the acknowledgment before releasing the session lock,
                                 // so a second client cannot start a new-policy call first.
                                 let _ = client_event_tx.send(ServerEvent::Ack { id });
+                                if let Some(effort) = jarvis_effort {
+                                    let _ = client_event_tx.send(ServerEvent::ReasoningEffortChanged {
+                                        id: 0,
+                                        effort,
+                                        model: None,
+                                        error: None,
+                                    });
+                                }
                                 continue;
                             }
                             result.map(|()| ServerEvent::Ack { id })
@@ -1941,6 +1950,16 @@ pub(super) async fn handle_client(
                 if let Some(snapshot) = try_available_models_snapshot(&agent).await {
                     last_available_models_snapshot = Some(snapshot);
                 }
+                let resumed_id = client_session_id.clone();
+                tokio::spawn(async move {
+                    let pending = crate::background::global()
+                        .take_reload_pending_completions(&resumed_id)
+                        .await;
+                    for completed in pending {
+                        crate::bus::Bus::global()
+                            .publish(crate::bus::BusEvent::BackgroundTaskCompleted(completed));
+                    }
+                });
             }
 
             Request::ResumeAllSessions { id } => {

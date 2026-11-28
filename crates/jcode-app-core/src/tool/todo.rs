@@ -532,7 +532,16 @@ fn parse_todo_input(input: Value) -> Result<TodoInput> {
     names::normalize_public_input(&mut input, &[])?;
     flatten_phases(&mut input)?;
     normalize_item_pauses(&mut input)?;
-    let params: TodoInput = serde_json::from_value(normalize_todo_input(input))?;
+    let input = normalize_todo_input(input);
+    // Validate submissions here, not on TodoGoal, which also reads legacy storage.
+    if let Some(goals) = input.get("goals").and_then(Value::as_array) {
+        for (index, goal) in goals.iter().enumerate() {
+            if goal.get("delivery_state").is_none_or(Value::is_null) {
+                bail!("goals[{index}].delivery_state is required and must not be null");
+            }
+        }
+    }
+    let params: TodoInput = serde_json::from_value(input)?;
     if let Some(todos) = &params.todos {
         let mut ids = std::collections::HashSet::new();
         for todo in todos {
@@ -748,6 +757,9 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
         goal.delivery_state_history = previous
             .map(|prev| prev.delivery_state_history.clone())
             .unwrap_or_default();
+        goal.verification_state_history = previous
+            .map(|prev| prev.verification_state_history.clone())
+            .unwrap_or_default();
         // Field-level merge, matching `merge_plan`: a write that revises one
         // assessment must not silently erase the others. Without this the
         // turn-end digest would read a stale `None` and re-raise a point the
@@ -755,6 +767,9 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
         if let Some(prev) = previous {
             if goal.closed_feedback_loop.is_none() {
                 goal.closed_feedback_loop = prev.closed_feedback_loop;
+            }
+            if goal.verification_state.is_none() {
+                goal.verification_state = prev.verification_state;
             }
             if goal.delivery_state.is_none() {
                 goal.delivery_state = prev.delivery_state;
@@ -810,6 +825,10 @@ fn merge_goals(stored: &[TodoGoal], incoming: Option<Vec<TodoGoal>>) -> Vec<Todo
             goal.feedback_loop_traceability,
         );
         record_score_observation(&mut goal.delivery_state_history, goal.delivery_state);
+        record_score_observation(
+            &mut goal.verification_state_history,
+            goal.verification_state,
+        );
         if let Some(slot) = merged
             .iter_mut()
             .find(|existing| existing.group == goal.group)
@@ -925,6 +944,11 @@ fn changed_goal_fields(before: Option<&TodoGoal>, after: Option<&TodoGoal>) -> V
     }
     if before.and_then(|goal| goal.delivery_state) != after.and_then(|goal| goal.delivery_state) {
         fields.push(TodoGoalField::DeliveryState);
+    }
+    if before.and_then(|goal| goal.verification_state)
+        != after.and_then(|goal| goal.verification_state)
+    {
+        fields.push(TodoGoalField::VerificationState);
     }
     if before.and_then(|goal| goal.autonomy) != after.and_then(|goal| goal.autonomy) {
         fields.push(TodoGoalField::Autonomy);
@@ -1294,7 +1318,7 @@ impl Tool for TodoTool {
                         },
                         "understands_user_intent": {
                             "type": "string",
-                            "enum": ["uncertain", "partial", "clear", "complete"]
+                            "enum": ["uncertain", "partial", "clear"]
                         }
                     }
                 },
@@ -1303,7 +1327,7 @@ impl Tool for TodoTool {
                     "description": "Assess honestly by group; omitted groups are retained.",
                     "items": {
                         "type": "object",
-                        "required": ["closed_feedback_loop", "feedback_loop", "feedback_loop_relevance", "feedback_loop_coverage", "feedback_loop_traceability"],
+                        "required": ["closed_feedback_loop", "feedback_loop", "feedback_loop_relevance", "feedback_loop_coverage", "feedback_loop_traceability", "delivery_state"],
                         "properties": {
                             "group": {
                                 "type": "string",
@@ -1334,7 +1358,12 @@ impl Tool for TodoTool {
                             },
                             "delivery_state": {
                                 "type": "string",
-                                "enum": ["change_made", "integrated", "workflow_validated", "outcome_delivered"]
+                                "enum": ["undelivered", "partially_delivered", "delivered"],
+                                "description": "Requested outcome delivered to the user, not internal progress or tests."
+                            },
+                            "verification_state": {
+                                "type": "string",
+                                "enum": ["unchecked", "checked_in_isolation", "checked_end_to_end"]
                             },
                             "difficulty": {
                                 "type": "string",

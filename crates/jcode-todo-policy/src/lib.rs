@@ -35,7 +35,7 @@ pub use jcode_task_types::{
     Autonomy, ConfidenceState, DeliveryState, Difficulty, FeedbackLoopCoverage,
     FeedbackLoopRelevance, FeedbackLoopState, FeedbackLoopTraceability, IntentUnderstanding,
     IterationMaturity, LANE_OWNER_WORKER, TodoGoal, TodoGoalChange, TodoGoalField, TodoItem,
-    TodoPlan, TodoPlanChange, TodoPlanField, TodoUserAuth,
+    TodoPlan, TodoPlanChange, TodoPlanField, TodoUserAuth, VerificationState,
 };
 
 /// Return the canonical todo status for model-written status vocabulary.
@@ -135,11 +135,10 @@ pub fn completion_confidence_passes(state: Option<ConfidenceState>) -> bool {
     state.is_some_and(|state| state >= ConfidenceState::Validated)
 }
 
-/// The minimum delivery state for a completed goal. Outcome delivery is only
-/// appropriate when the request itself includes operational delivery, so it
-/// must not be inferred from difficulty.
+/// Only delivery of the requested outcome clears the delivery gap, regardless
+/// of difficulty or verification.
 pub fn required_delivery_state(_difficulty: Option<Difficulty>) -> DeliveryState {
-    DeliveryState::WorkflowValidated
+    DeliveryState::Delivered
 }
 
 /// Whether a completed goal's delivery and validation clear their
@@ -263,7 +262,7 @@ fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
     // More autonomous work cannot remove an explicitly documented constraint
     // or exhausted budget. Preserve the honest assessment instead of demanding
     // a higher score or repeatedly asking for the unavailable acceptance path.
-    if goal_has_documented_stop(goal) {
+    if goal_has_documented_stop(goal) || goal_cannot_complete(goal).is_some() {
         return Vec::new();
     }
 
@@ -272,7 +271,7 @@ fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
         .delivery_state
         .is_some_and(|state| state < required_delivery_state(goal.difficulty))
     {
-        reasons.push("carry the work through the complete workflow.");
+        reasons.push("deliver the requested outcome.");
     }
     if goal
         .iteration_maturity
@@ -293,6 +292,42 @@ fn ownership_followup_reasons(goal: &TodoGoal) -> Vec<&'static str> {
         reasons.push("gather more evidence about whether the work should stop.");
     }
     reasons
+}
+
+/// An explicit undelivered goal is actionable without opting into quality
+/// reviews. A goal may precede its first todo or outlive its last attempt.
+pub fn undelivered_goal_message(todos: &[TodoItem], goals: &[TodoGoal]) -> Option<String> {
+    let mut gaps = Vec::new();
+    for goal in goals {
+        let Some(state) = goal.delivery_state else {
+            continue;
+        };
+        if state == DeliveryState::Delivered || goal_cannot_complete(goal).is_some() {
+            continue;
+        }
+        let group = normalized_group(goal.group.as_deref());
+        let matching = todos
+            .iter()
+            .filter(|t| normalized_group(t.group.as_deref()) == group);
+        // Respect live/paused todos and deliberate cancellation. A mixture
+        // of finished and cancelled attempts does not retire a live goal.
+        if matching.clone().any(is_incomplete_todo)
+            || (matching.clone().next().is_some()
+                && matching
+                    .into_iter()
+                    .all(|t| todo_status_is_cancelled(&t.status)))
+        {
+            continue;
+        }
+        gaps.push(format!(
+            "\n- Goal \"{}\" ({}): the requested outcome is still undelivered. Add or reopen a concrete next action within the user's request. If the requested outcome is already delivered, record the evidence instead.",
+            group.as_deref().unwrap_or("ungrouped goal"),
+            state.as_str()
+        ));
+    }
+    gaps.sort_unstable();
+    gaps.dedup();
+    (!gaps.is_empty()).then(|| format!("{TODO_OWNERSHIP_CONTINUATION_MESSAGE}{}", gaps.concat()))
 }
 
 /// Build an ownership continuation that directs work toward each affected goal
@@ -713,7 +748,15 @@ pub fn build_actionable_poke_message(actionable: &[TodoItem]) -> String {
     for todo in actionable.iter().take(GATE_NAMED_TODO_LIMIT) {
         // Names are the public lookup key. Keep the full, escaped name rather
         // than an internal ID or a truncated label the model cannot reference.
-        message.push_str(&format!("\n- {}", serde_json::json!(todo.content)));
+        if todo.waiting_on.is_empty() {
+            message.push_str(&format!("\n- {}", serde_json::json!(todo.content)));
+        } else {
+            message.push_str(&format!(
+                "\n- {} (waiting_on: {}, no longer running)",
+                serde_json::json!(todo.content),
+                todo.waiting_on.join(", ")
+            ));
+        }
     }
     if actionable.len() > GATE_NAMED_TODO_LIMIT {
         message.push_str(&format!(
